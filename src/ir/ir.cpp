@@ -633,6 +633,185 @@ bool hugeFunction(const Function &function) {
     return function.blocks.size() > 1000 || instructions > 30000;
 }
 
+std::size_t instructionCount(const Function &function) {
+    std::size_t count = 0;
+    for (const auto &block : function.blocks) {
+        count += block.instructions.size();
+    }
+    return count;
+}
+
+bool canInlineSingleBlock(const Function &caller, const Function &callee) {
+    if (caller.name == callee.name || callee.blocks.size() != 1) {
+        return false;
+    }
+    const std::size_t size = instructionCount(callee);
+    if (size == 0 || size > 24) {
+        return false;
+    }
+    const auto &body = callee.blocks.front().instructions;
+    if (body.empty() || body.back().opcode != Opcode::Ret) {
+        return false;
+    }
+    for (std::size_t i = 0; i + 1 < body.size(); ++i) {
+        if (isTerminator(body[i].opcode)) {
+            return false;
+        }
+        if (body[i].opcode == Opcode::Call) {
+            return false;
+        }
+        if (body[i].opcode == Opcode::Load && !body[i].operands.empty() && body[i].operands[0].constant) {
+            return false;
+        }
+        if (body[i].opcode == Opcode::Store && body[i].operands.size() == 2 && body[i].operands[1].constant) {
+            return false;
+        }
+        if (body[i].opcode == Opcode::Alloca && allocaBytes(body[i].text) != 4) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Value remapValue(Value value, const std::unordered_map<int, Value> &valueMap) {
+    if (value.constant || value.id < 0) {
+        return value;
+    }
+    const auto found = valueMap.find(value.id);
+    return found == valueMap.end() ? value : found->second;
+}
+
+bool inlineSmallFunctions(Module &module) {
+    std::unordered_map<std::string, const Function *> functions;
+    functions.reserve(module.functions.size());
+    for (const auto &function : module.functions) {
+        functions[function.name] = &function;
+    }
+
+    bool changed = false;
+    for (auto &caller : module.functions) {
+        if (hugeFunction(caller)) {
+            continue;
+        }
+        int nextId = nextValueId(caller);
+        std::unordered_map<int, Value> replacements;
+
+        for (auto &block : caller.blocks) {
+            std::vector<Instruction> kept;
+            kept.reserve(block.instructions.size());
+
+            for (auto inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+
+                const auto found = functions.find(inst.text);
+                if (inst.opcode != Opcode::Call || found == functions.end() ||
+                    !canInlineSingleBlock(caller, *found->second)) {
+                    kept.push_back(std::move(inst));
+                    continue;
+                }
+
+                const Function &callee = *found->second;
+                std::unordered_map<int, Value> valueMap;
+                for (std::size_t i = 0; i < callee.params.size(); ++i) {
+                    if (i < inst.operands.size()) {
+                        valueMap[callee.params[i].id] = inst.operands[i];
+                    }
+                }
+
+                Value returnValue;
+                bool hasReturnValue = false;
+                const auto &body = callee.blocks.front().instructions;
+                for (std::size_t i = 0; i < body.size(); ++i) {
+                    Instruction cloned = body[i];
+                    if (cloned.opcode == Opcode::Ret) {
+                        if (!cloned.operands.empty()) {
+                            returnValue = remapValue(resolve(cloned.operands[0], replacements), valueMap);
+                            hasReturnValue = true;
+                        }
+                        break;
+                    }
+
+                    for (auto &operand : cloned.operands) {
+                        operand = remapValue(operand, valueMap);
+                    }
+                    if (cloned.result >= 0) {
+                        const int oldResult = cloned.result;
+                        cloned.result = nextId++;
+                        valueMap[oldResult] = Value{cloned.result, cloned.resultType, {}, false};
+                    }
+                    kept.push_back(std::move(cloned));
+                }
+
+                if (inst.result >= 0 && hasReturnValue) {
+                    replacements[inst.result] = returnValue;
+                }
+                changed = true;
+            }
+
+            block.instructions = std::move(kept);
+        }
+
+        if (!replacements.empty()) {
+            for (auto &block : caller.blocks) {
+                for (auto &inst : block.instructions) {
+                    for (auto &operand : inst.operands) {
+                        operand = resolve(operand, replacements);
+                    }
+                }
+            }
+        }
+    }
+
+    return changed;
+}
+
+bool removeUnreachableFunctions(Module &module) {
+    std::unordered_set<std::string> defined;
+    defined.reserve(module.functions.size());
+    for (const auto &function : module.functions) {
+        defined.insert(function.name);
+    }
+    if (!defined.count("main")) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::vector<std::string>> calls;
+    calls.reserve(module.functions.size());
+    for (const auto &function : module.functions) {
+        auto &edges = calls[function.name];
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == Opcode::Call && defined.count(inst.text)) {
+                    edges.push_back(inst.text);
+                }
+            }
+        }
+    }
+
+    std::unordered_set<std::string> reachable;
+    std::vector<std::string> worklist{"main"};
+    reachable.insert("main");
+    while (!worklist.empty()) {
+        std::string current = std::move(worklist.back());
+        worklist.pop_back();
+        for (const auto &callee : calls[current]) {
+            if (reachable.insert(callee).second) {
+                worklist.push_back(callee);
+            }
+        }
+    }
+
+    const std::size_t oldSize = module.functions.size();
+    module.functions.erase(std::remove_if(module.functions.begin(), module.functions.end(),
+                                          [&](const Function &function) {
+                                              return !reachable.count(function.name);
+                                          }),
+                           module.functions.end());
+    return module.functions.size() != oldSize;
+}
+
 std::unordered_map<int, Type> scalarAllocaTypes(const Function &function, const std::unordered_set<int> &allocas) {
     std::unordered_map<int, Type> types;
     for (int id : allocas) {
@@ -1268,6 +1447,59 @@ bool foldConstants(Function &function) {
     return changed;
 }
 
+bool simplifyTrivialPhis(Function &function) {
+    bool changed = false;
+    std::unordered_map<int, Value> replacements;
+
+    for (auto &block : function.blocks) {
+        std::vector<Instruction> kept;
+        kept.reserve(block.instructions.size());
+        for (auto inst : block.instructions) {
+            for (auto &operand : inst.operands) {
+                operand = resolve(operand, replacements);
+            }
+
+            if (inst.opcode == Opcode::Phi && inst.result >= 0) {
+                Value merged;
+                bool haveMerged = false;
+                bool allSame = true;
+
+                for (const auto &operand : inst.operands) {
+                    const Value value = operand;
+                    if (!haveMerged) {
+                        merged = value;
+                        haveMerged = true;
+                    } else if (!sameValue(merged, value)) {
+                        allSame = false;
+                        break;
+                    }
+                }
+
+                if (allSame && haveMerged) {
+                    replacements[inst.result] = merged;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            kept.push_back(std::move(inst));
+        }
+        block.instructions = std::move(kept);
+    }
+
+    if (changed) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+
+    return changed;
+}
+
 bool eliminateCommonSubexpressions(Function &function) {
     bool changed = false;
     std::unordered_map<int, Value> replacements;
@@ -1317,6 +1549,19 @@ bool eliminateCommonSubexpressions(Function &function) {
         }
     }
     return changed;
+}
+
+std::string memoryAddressKey(const Value &address) {
+    if (address.constant) {
+        if (!address.name.empty() && address.name[0] == '@') {
+            return "global:" + address.name;
+        }
+        return {};
+    }
+    if (address.id >= 0) {
+        return "value:" + std::to_string(address.id);
+    }
+    return {};
 }
 
 bool simplifyBranches(Function &function) {
@@ -1427,7 +1672,7 @@ bool forwardLocalMemory(Function &function) {
     std::unordered_map<int, Value> replacements;
 
     for (auto &block : function.blocks) {
-        std::unordered_map<int, Value> knownMemory;
+        std::unordered_map<std::string, Value> knownMemory;
         std::vector<Instruction> kept;
         kept.reserve(block.instructions.size());
 
@@ -1438,8 +1683,9 @@ bool forwardLocalMemory(Function &function) {
 
             if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
                 const Value &address = inst.operands[1];
-                if (!address.constant && address.id >= 0) {
-                    knownMemory[address.id] = inst.operands[0];
+                const std::string key = memoryAddressKey(address);
+                if (!key.empty()) {
+                    knownMemory[key] = inst.operands[0];
                 }
                 kept.push_back(std::move(inst));
                 continue;
@@ -1447,8 +1693,9 @@ bool forwardLocalMemory(Function &function) {
 
             if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
                 const Value &address = inst.operands[0];
-                if (!address.constant && address.id >= 0) {
-                    const auto found = knownMemory.find(address.id);
+                const std::string key = memoryAddressKey(address);
+                if (!key.empty()) {
+                    const auto found = knownMemory.find(key);
                     if (found != knownMemory.end()) {
                         replacements[inst.result] = found->second;
                         changed = true;
@@ -1551,6 +1798,14 @@ bool optimize(Module &module) {
     bool again = true;
     while (again) {
         again = false;
+        if (inlineSmallFunctions(module)) {
+            changed = true;
+            again = true;
+        }
+        if (removeUnreachableFunctions(module)) {
+            changed = true;
+            again = true;
+        }
         for (auto &function : module.functions) {
             if (truncateAfterTerminators(function)) {
                 changed = true;
@@ -1569,6 +1824,10 @@ bool optimize(Module &module) {
                 again = true;
             }
             if (foldConstants(function)) {
+                changed = true;
+                again = true;
+            }
+            if (simplifyTrivialPhis(function)) {
                 changed = true;
                 again = true;
             }
@@ -1610,7 +1869,15 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
+            if (simplifyTrivialPhis(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
             if (foldConstants(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (simplifyTrivialPhis(function)) {
                 changed = true;
                 ssaAgain = true;
             }

@@ -1400,6 +1400,7 @@ private:
         int weight = 0;
         bool crossBlock = false;
         bool phi = false;
+        bool param = false;
     };
 
     void emitGlobals() {
@@ -1452,6 +1453,7 @@ private:
         scalarFloatAllocas_.clear();
         globalValueRegs_.clear();
         globalValueFRegs_.clear();
+        valueUseCounts_.clear();
         activeSavedIntRegs_.clear();
         activeSavedFloatRegs_.clear();
         blockLocalValues_.clear();
@@ -1461,8 +1463,11 @@ private:
         nextIntReg_ = 0;
         nextFloatReg_ = 0;
         nextPhiEdgeLabel_ = 0;
+        elideResultStoreId_ = -1;
         useLongJumps_ = needsLongJumps(function);
         epilogueLabel_ = ".L" + function.name + ".ret";
+        const bool saveReturnAddress = functionHasRealCall(function);
+        countValueUses(function);
         analyzeRegisterAllocas(function);
         buildPhiCopies(function);
         analyzeGlobalValueRegisters(function);
@@ -1482,7 +1487,9 @@ private:
         out_ << "\tli t0, " << frameSize_ << "\n";
         out_ << "\tsub sp, sp, t0\n";
         out_ << "\tadd t1, sp, t0\n";
-        out_ << "\tsd ra, -8(t1)\n";
+        if (saveReturnAddress) {
+            out_ << "\tsd ra, -8(t1)\n";
+        }
         out_ << "\tsd s0, -16(t1)\n";
         for (std::size_t i = 0; i < activeSavedIntRegs_.size(); ++i) {
             out_ << "\tsd " << activeSavedIntRegs_[i] << ", " << savedIntOffset(i) << "(t1)\n";
@@ -1527,7 +1534,47 @@ private:
             currentBlockName_ = block.name;
             nextBlockName_ = blockIndex + 1 < function.blocks.size() ? function.blocks[blockIndex + 1].name : std::string{};
             out_ << blockLabel(block.name) << ":\n";
-            for (const auto &inst : block.instructions) {
+            for (std::size_t instIndex = 0; instIndex < block.instructions.size(); ++instIndex) {
+                const auto &inst = block.instructions[instIndex];
+                if ((inst.opcode == ir::Opcode::ICmp || inst.opcode == ir::Opcode::FCmp) &&
+                    inst.result >= 0 && valueUseCounts_[inst.result] == 1 &&
+                    instIndex + 1 < block.instructions.size() &&
+                    block.instructions[instIndex + 1].opcode == ir::Opcode::CondBr &&
+                    !block.instructions[instIndex + 1].operands.empty() &&
+                    !block.instructions[instIndex + 1].operands[0].constant &&
+                    block.instructions[instIndex + 1].operands[0].id == inst.result) {
+                    emitCompareCondBranchWithPhi(inst, block.instructions[instIndex + 1].text);
+                    ++instIndex;
+                    continue;
+                }
+                if (inst.opcode == ir::Opcode::Not && inst.result >= 0 && valueUseCounts_[inst.result] == 1 &&
+                    instIndex + 1 < block.instructions.size() &&
+                    block.instructions[instIndex + 1].opcode == ir::Opcode::CondBr &&
+                    !block.instructions[instIndex + 1].operands.empty() &&
+                    !block.instructions[instIndex + 1].operands[0].constant &&
+                    block.instructions[instIndex + 1].operands[0].id == inst.result) {
+                    emitNotCondBranchWithPhi(inst, block.instructions[instIndex + 1].text);
+                    ++instIndex;
+                    continue;
+                }
+                if (canReturnInstructionResult(block.instructions, instIndex)) {
+                    elideResultStoreId_ = inst.result;
+                    emitInst(inst);
+                    elideResultStoreId_ = -1;
+                    emitJump(epilogueLabel_);
+                    ++instIndex;
+                    continue;
+                }
+                if (canFoldGepStore(block.instructions, instIndex)) {
+                    emitFoldedGepStore(inst, block.instructions[instIndex + 1]);
+                    ++instIndex;
+                    continue;
+                }
+                if (canFoldGepLoad(block.instructions, instIndex)) {
+                    emitFoldedGepLoad(inst, block.instructions[instIndex + 1]);
+                    ++instIndex;
+                    continue;
+                }
                 emitInst(inst);
             }
         }
@@ -1540,7 +1587,9 @@ private:
         for (std::size_t i = 0; i < activeSavedIntRegs_.size(); ++i) {
             out_ << "\tld " << activeSavedIntRegs_[i] << ", " << savedIntOffset(i) << "(t1)\n";
         }
-        out_ << "\tld ra, -8(t1)\n";
+        if (saveReturnAddress) {
+            out_ << "\tld ra, -8(t1)\n";
+        }
         out_ << "\tld s0, -16(t1)\n";
         out_ << "\tmv sp, t1\n";
         out_ << "\tret\n";
@@ -1578,6 +1627,75 @@ private:
             start = comma + 1;
         }
         return labels;
+    }
+
+    static bool functionHasRealCall(const ir::Function &function) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call && inst.text != "starttime" && inst.text != "stoptime") {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool canReturnInstructionResult(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
+        if (index + 1 >= instructions.size()) {
+            return false;
+        }
+        const ir::Instruction &inst = instructions[index];
+        const ir::Instruction &ret = instructions[index + 1];
+        if (inst.result < 0 || inst.resultType.kind == ir::TypeKind::Void ||
+            inst.opcode == ir::Opcode::Phi || inst.opcode == ir::Opcode::Alloca ||
+            ret.opcode != ir::Opcode::Ret || ret.operands.size() != 1 ||
+            ret.operands[0].constant || ret.operands[0].id != inst.result) {
+            return false;
+        }
+        const auto uses = valueUseCounts_.find(inst.result);
+        return uses != valueUseCounts_.end() && uses->second == 1;
+    }
+
+    bool canFoldGepStore(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
+        if (index + 1 >= instructions.size()) {
+            return false;
+        }
+        const ir::Instruction &gep = instructions[index];
+        const ir::Instruction &store = instructions[index + 1];
+        if (gep.opcode != ir::Opcode::Gep || gep.result < 0 ||
+            store.opcode != ir::Opcode::Store || store.operands.size() < 2 ||
+            store.operands[1].constant || store.operands[1].id != gep.result) {
+            return false;
+        }
+        const auto uses = valueUseCounts_.find(gep.result);
+        return uses != valueUseCounts_.end() && uses->second == 1;
+    }
+
+    bool canFoldGepLoad(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
+        if (index + 1 >= instructions.size()) {
+            return false;
+        }
+        const ir::Instruction &gep = instructions[index];
+        const ir::Instruction &load = instructions[index + 1];
+        if (gep.opcode != ir::Opcode::Gep || gep.result < 0 ||
+            load.opcode != ir::Opcode::Load || load.operands.empty() ||
+            load.operands[0].constant || load.operands[0].id != gep.result) {
+            return false;
+        }
+        const auto uses = valueUseCounts_.find(gep.result);
+        return uses != valueUseCounts_.end() && uses->second == 1;
+    }
+
+    void countValueUses(const ir::Function &function) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    if (!operand.constant && operand.id >= 0) {
+                        ++valueUseCounts_[operand.id];
+                    }
+                }
+            }
+        }
     }
 
     void buildPhiCopies(const ir::Function &function) {
@@ -1661,7 +1779,8 @@ private:
         for (const auto &param : function.params) {
             addInterval(param.id, param.type, function.blocks.empty() ? "entry" : function.blocks.front().name, 0, false);
             intervals[param.id].crossBlock = true;
-            intervals[param.id].weight += 4;
+            intervals[param.id].weight += 8;
+            intervals[param.id].param = true;
         }
         for (const auto &block : function.blocks) {
             int instPos = blockStart[block.name];
@@ -1885,7 +2004,8 @@ private:
                     }
                 }
             }
-            if (!interval.phi || !dominatesUses || !interval.crossBlock || interval.weight < 2 || interval.end <= interval.start) {
+            if ((!interval.phi && !interval.param) || !dominatesUses || !interval.crossBlock ||
+                interval.weight < 2 || interval.end <= interval.start) {
                 continue;
             }
             interval.weight += interval.phi ? 120 : 0;
@@ -2139,27 +2259,17 @@ private:
                 emitAddressOperand(inst.operands[1]);
                 out_ << "\tfsw fa0, 0(a0)\n";
             } else {
-                emitValueOperandTo("t2", inst.operands[0]);
+                std::string sourceReg = existingIntRegister(inst.operands[0]);
+                if (sourceReg.empty() || sourceReg == "a0") {
+                    emitValueOperandTo("t2", inst.operands[0]);
+                    sourceReg = "t2";
+                }
                 emitAddressOperand(inst.operands[1]);
-                out_ << "\tsw t2, 0(a0)\n";
+                out_ << "\tsw " << sourceReg << ", 0(a0)\n";
             }
             break;
         case ir::Opcode::Gep:
-            emitAddressOperandTo("t2", inst.operands[0]);
-            if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32) {
-                const long long index = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
-                const long long offset = index * 4;
-                if (fitsI12IR(static_cast<int>(offset))) {
-                    out_ << "\taddi a0, t2, " << offset << "\n";
-                } else {
-                    out_ << "\tli a0, " << offset << "\n";
-                    out_ << "\tadd a0, t2, a0\n";
-                }
-            } else {
-                emitValueOperand(inst.operands[1]);
-                out_ << "\tslli a0, a0, 2\n";
-                out_ << "\tadd a0, t2, a0\n";
-            }
+            emitGepAddress(inst);
             storeResult(inst);
             break;
         case ir::Opcode::Add:
@@ -2219,6 +2329,56 @@ private:
         }
     }
 
+    void emitGepAddress(const ir::Instruction &inst) {
+        emitAddressOperandTo("t2", inst.operands[0]);
+        if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32) {
+            const long long index = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
+            const long long offset = index * 4;
+            if (fitsI12IR(static_cast<int>(offset))) {
+                out_ << "\taddi a0, t2, " << offset << "\n";
+            } else {
+                out_ << "\tli a0, " << offset << "\n";
+                out_ << "\tadd a0, t2, a0\n";
+            }
+        } else {
+            const std::string indexReg = existingIntRegister(inst.operands[1]);
+            if (!indexReg.empty()) {
+                out_ << "\tslli a0, " << indexReg << ", 2\n";
+            } else {
+                emitValueOperand(inst.operands[1]);
+                out_ << "\tslli a0, a0, 2\n";
+            }
+            out_ << "\tadd a0, t2, a0\n";
+        }
+    }
+
+    void emitFoldedGepStore(const ir::Instruction &gep, const ir::Instruction &store) {
+        if (store.operands[0].type.kind == ir::TypeKind::F32) {
+            emitValueOperand(store.operands[0]);
+            emitGepAddress(gep);
+            out_ << "\tfsw fa0, 0(a0)\n";
+            return;
+        }
+        std::string sourceReg = existingIntRegister(store.operands[0]);
+        if (sourceReg.empty() || sourceReg == "a0" || sourceReg == "t2") {
+            emitValueOperandTo("t3", store.operands[0]);
+            sourceReg = "t3";
+        }
+        emitGepAddress(gep);
+        out_ << "\tsw " << sourceReg << ", 0(a0)\n";
+    }
+
+    void emitFoldedGepLoad(const ir::Instruction &gep, const ir::Instruction &load) {
+        emitGepAddress(gep);
+        if (load.resultType.kind == ir::TypeKind::F32) {
+            out_ << "\tflw fa0, 0(a0)\n";
+            storeFResult(load);
+        } else {
+            out_ << "\tlw a0, 0(a0)\n";
+            storeResult(load);
+        }
+    }
+
     void emitBinary(const ir::Instruction &inst) {
         if (inst.opcode == ir::Opcode::FCmp ||
             inst.resultType.kind == ir::TypeKind::F32 ||
@@ -2228,6 +2388,9 @@ private:
             return;
         }
         if (emitImmediateBinary(inst)) {
+            return;
+        }
+        if (emitRegisterOperandBinary(inst)) {
             return;
         }
         emitValueOperandTo("t0", inst.operands[0]);
@@ -2250,6 +2413,50 @@ private:
             break;
         }
         storeResult(inst);
+    }
+
+    bool emitRegisterOperandBinary(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+        if (inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub &&
+            inst.opcode != ir::Opcode::Mul && inst.opcode != ir::Opcode::Div &&
+            inst.opcode != ir::Opcode::Mod) {
+            return false;
+        }
+
+        std::string lhs = existingIntRegister(inst.operands[0]);
+        if (lhs.empty()) {
+            emitValueOperandTo("t0", inst.operands[0]);
+            lhs = "t0";
+        }
+
+        std::string rhs;
+        if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32 &&
+            std::strtoll(inst.operands[1].name.c_str(), nullptr, 0) == 0) {
+            rhs = "zero";
+        } else {
+            rhs = existingIntRegister(inst.operands[1]);
+        }
+        if (rhs.empty()) {
+            if (lhs == "a0") {
+                out_ << "\tmv t0, a0\n";
+                lhs = "t0";
+            }
+            emitValueOperand(inst.operands[1]);
+            rhs = "a0";
+        }
+
+        switch (inst.opcode) {
+        case ir::Opcode::Add: out_ << "\taddw a0, " << lhs << ", " << rhs << "\n"; break;
+        case ir::Opcode::Sub: out_ << "\tsubw a0, " << lhs << ", " << rhs << "\n"; break;
+        case ir::Opcode::Mul: out_ << "\tmulw a0, " << lhs << ", " << rhs << "\n"; break;
+        case ir::Opcode::Div: out_ << "\tdivw a0, " << lhs << ", " << rhs << "\n"; break;
+        case ir::Opcode::Mod: out_ << "\tremw a0, " << lhs << ", " << rhs << "\n"; break;
+        default: return false;
+        }
+        storeResult(inst);
+        return true;
     }
 
     void emitCondBranch(const std::string &text) {
@@ -2300,6 +2507,180 @@ private:
         out_ << falseEdge << ":\n";
         emitPhiCopies(currentBlockName_, falseLabel);
         emitJump(blockLabel(falseLabel));
+    }
+
+    static std::string inverseBranchOp(const std::string &op) {
+        if (op == "beq") return "bne";
+        if (op == "bne") return "beq";
+        if (op == "blt") return "bge";
+        if (op == "bge") return "blt";
+        return {};
+    }
+
+    void emitRawBranch(const std::string &op, const std::string &lhs, const std::string &rhs, const std::string &label) {
+        out_ << '\t' << op << ' ' << lhs << ", " << rhs << ", " << label << "\n";
+    }
+
+    void emitSelectedCondBranch(const std::string &op, const std::string &lhs, const std::string &rhs,
+                                const std::string &trueLabel, const std::string &falseLabel) {
+        if (!useLongJumps_) {
+            if (trueLabel == nextBlockName_) {
+                emitRawBranch(inverseBranchOp(op), lhs, rhs, blockLabel(falseLabel));
+                return;
+            }
+            if (falseLabel == nextBlockName_) {
+                emitRawBranch(op, lhs, rhs, blockLabel(trueLabel));
+                return;
+            }
+            emitRawBranch(op, lhs, rhs, blockLabel(trueLabel));
+            emitJump(blockLabel(falseLabel));
+            return;
+        }
+        const std::string trueLocal = newPhiEdgeLabel();
+        emitRawBranch(op, lhs, rhs, trueLocal);
+        emitJump(blockLabel(falseLabel));
+        out_ << trueLocal << ":\n";
+        emitJump(blockLabel(trueLabel));
+    }
+
+    bool selectIntegerCompareBranch(const ir::Instruction &cmp, std::string &op, std::string &lhs, std::string &rhs) {
+        if (cmp.opcode != ir::Opcode::ICmp || cmp.operands.size() != 2) {
+            return false;
+        }
+        const auto selectOperand = [&](const ir::Value &value, const std::string &fallback) {
+            if (value.constant && value.type.kind == ir::TypeKind::I32 &&
+                std::strtoll(value.name.c_str(), nullptr, 0) == 0) {
+                return std::string("zero");
+            }
+            const std::string existing = existingIntRegister(value);
+            if (!existing.empty()) {
+                return existing;
+            }
+            emitValueOperandTo(fallback, value);
+            return fallback;
+        };
+
+        lhs = selectOperand(cmp.operands[0], "t0");
+        rhs = selectOperand(cmp.operands[1], "a0");
+
+        const std::string originalLhs = lhs;
+        if (cmp.operands[0].constant && cmp.operands[0].type.kind == ir::TypeKind::I32 &&
+            std::strtoll(cmp.operands[0].name.c_str(), nullptr, 0) == 0) {
+            lhs = "zero";
+        }
+        if (cmp.text == "eq") {
+            op = "beq";
+        } else if (cmp.text == "ne") {
+            op = "bne";
+        } else if (cmp.text == "lt") {
+            op = "blt";
+        } else if (cmp.text == "ge") {
+            op = "bge";
+        } else if (cmp.text == "gt") {
+            op = "blt";
+            lhs = rhs;
+            rhs = originalLhs;
+        } else if (cmp.text == "le") {
+            op = "bge";
+            lhs = rhs;
+            rhs = originalLhs;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void emitFloatCompareResult(const ir::Instruction &cmp) {
+        emitValueOperand(cmp.operands[0]);
+        out_ << "\tfmv.s ft0, fa0\n";
+        emitValueOperand(cmp.operands[1]);
+        if (cmp.text == "lt") out_ << "\tflt.s a0, ft0, fa0\n";
+        else if (cmp.text == "gt") out_ << "\tflt.s a0, fa0, ft0\n";
+        else if (cmp.text == "le") out_ << "\tfle.s a0, ft0, fa0\n";
+        else if (cmp.text == "ge") out_ << "\tfle.s a0, fa0, ft0\n";
+        else if (cmp.text == "eq") out_ << "\tfeq.s a0, ft0, fa0\n";
+        else if (cmp.text == "ne") { out_ << "\tfeq.s a0, ft0, fa0\n"; out_ << "\txori a0, a0, 1\n"; }
+    }
+
+    void emitCompareCondBranchWithPhi(const ir::Instruction &cmp, const std::string &text) {
+        const std::size_t comma = text.find(',');
+        const std::string trueLabel = trimLabel(text.substr(0, comma));
+        const std::string falseLabel = comma == std::string::npos ? std::string{} : trimLabel(text.substr(comma + 1));
+        if (!hasPhiCopies(currentBlockName_, trueLabel) && !hasPhiCopies(currentBlockName_, falseLabel)) {
+            if (cmp.opcode == ir::Opcode::ICmp) {
+                std::string op;
+                std::string lhs;
+                std::string rhs;
+                if (selectIntegerCompareBranch(cmp, op, lhs, rhs)) {
+                    emitSelectedCondBranch(op, lhs, rhs, trueLabel, falseLabel);
+                    return;
+                }
+                emitBinary(cmp);
+                emitValueOperand(ir::Value{cmp.result, cmp.resultType, {}, false});
+                emitCondBranch(text);
+                return;
+            }
+            emitFloatCompareResult(cmp);
+            emitCondBranch(text);
+            return;
+        }
+
+        const std::string trueEdge = newPhiEdgeLabel();
+        const std::string falseEdge = newPhiEdgeLabel();
+        const std::string trueLocal = newPhiEdgeLabel();
+        if (cmp.opcode == ir::Opcode::ICmp) {
+            std::string op;
+            std::string lhs;
+            std::string rhs;
+            if (selectIntegerCompareBranch(cmp, op, lhs, rhs)) {
+                emitRawBranch(op, lhs, rhs, trueLocal);
+            } else {
+                emitBinary(cmp);
+                emitValueOperand(ir::Value{cmp.result, cmp.resultType, {}, false});
+                out_ << "\tbnez a0, " << trueLocal << "\n";
+            }
+        } else {
+            emitFloatCompareResult(cmp);
+            out_ << "\tbnez a0, " << trueLocal << "\n";
+        }
+        emitJump(falseEdge);
+        out_ << trueLocal << ":\n";
+        emitJump(trueEdge);
+
+        out_ << trueEdge << ":\n";
+        emitPhiCopies(currentBlockName_, trueLabel);
+        emitJump(blockLabel(trueLabel));
+
+        out_ << falseEdge << ":\n";
+        emitPhiCopies(currentBlockName_, falseLabel);
+        emitJump(blockLabel(falseLabel));
+    }
+
+    static std::string swappedBranchText(const std::string &text) {
+        const std::size_t comma = text.find(',');
+        if (comma == std::string::npos) {
+            return text;
+        }
+        const std::string trueLabel = trimLabel(text.substr(0, comma));
+        const std::string falseLabel = trimLabel(text.substr(comma + 1));
+        return falseLabel + ", " + trueLabel;
+    }
+
+    void emitNotCondBranchWithPhi(const ir::Instruction &inst, const std::string &text) {
+        if (inst.operands.empty()) {
+            emitValueOperand(ir::Value{-1, ir::Type{ir::TypeKind::I32}, "0", true});
+            emitCondBranchWithPhi(text);
+            return;
+        }
+        if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+            emitValueOperand(inst.operands[0]);
+            out_ << "\tfmv.w.x ft0, zero\n";
+            out_ << "\tfeq.s a0, fa0, ft0\n";
+            emitCondBranchWithPhi(text);
+            return;
+        }
+        emitValueOperand(inst.operands[0]);
+        emitCondBranchWithPhi(swappedBranchText(text));
     }
 
     bool hasPhiCopies(const std::string &pred, const std::string &succ) const {
@@ -2453,6 +2834,34 @@ private:
         if (inst.text == "starttime" || inst.text == "stoptime") {
             return;
         }
+        if (inst.operands.empty()) {
+            out_ << "\tcall " << inst.text << "\n";
+            if (inst.result >= 0) {
+                if (inst.resultType.kind == ir::TypeKind::F32) {
+                    storeFResult(inst);
+                } else {
+                    storeResult(inst);
+                }
+            }
+            return;
+        }
+        if (inst.operands.size() == 1) {
+            const auto &arg = inst.operands[0];
+            if (arg.type.kind == ir::TypeKind::F32) {
+                emitFloatOperandTo("fa0", arg);
+            } else {
+                emitValueOperandTo("a0", arg);
+            }
+            out_ << "\tcall " << inst.text << "\n";
+            if (inst.result >= 0) {
+                if (inst.resultType.kind == ir::TypeKind::F32) {
+                    storeFResult(inst);
+                } else {
+                    storeResult(inst);
+                }
+            }
+            return;
+        }
         int intArgs = 0;
         int floatArgs = 0;
         for (const auto &operand : inst.operands) {
@@ -2464,6 +2873,26 @@ private:
         }
         const std::size_t stackArgs = static_cast<std::size_t>((intArgs > 8 ? intArgs - 8 : 0) + (floatArgs > 8 ? floatArgs - 8 : 0));
         const int stackBytes = alignTo(static_cast<int>(stackArgs) * 8, 16);
+        if (stackArgs == 0) {
+            int intIndex = 0;
+            int floatIndex = 0;
+            for (const auto &operand : inst.operands) {
+                if (operand.type.kind == ir::TypeKind::F32) {
+                    emitFloatOperandTo("fa" + std::to_string(floatIndex++), operand);
+                } else {
+                    emitValueOperandTo("a" + std::to_string(intIndex++), operand);
+                }
+            }
+            out_ << "\tcall " << inst.text << "\n";
+            if (inst.result >= 0) {
+                if (inst.resultType.kind == ir::TypeKind::F32) {
+                    storeFResult(inst);
+                } else {
+                    storeResult(inst);
+                }
+            }
+            return;
+        }
         if (stackBytes != 0) {
             out_ << "\tli t6, " << stackBytes << "\n";
             out_ << "\tsub sp, sp, t6\n";
@@ -2595,6 +3024,21 @@ private:
         }
     }
 
+    std::string existingIntRegister(const ir::Value &value) const {
+        if (value.constant || value.id < 0) {
+            return {};
+        }
+        const auto globalInt = globalValueRegs_.find(value.id);
+        if (globalInt != globalValueRegs_.end()) {
+            return globalInt->second;
+        }
+        const auto intReg = valueRegs_.find(value.id);
+        if (intReg != valueRegs_.end()) {
+            return intReg->second;
+        }
+        return {};
+    }
+
     void emitValueOperandTo(const std::string &reg, const ir::Value &value) {
         if (reg == "a0") {
             emitValueOperand(value);
@@ -2713,6 +3157,9 @@ private:
     }
 
     void storeResult(const ir::Instruction &inst) {
+        if (inst.result == elideResultStoreId_) {
+            return;
+        }
         const auto global = globalValueRegs_.find(inst.result);
         if (global != globalValueRegs_.end()) {
             if (global->second != "a0") {
@@ -2727,6 +3174,9 @@ private:
     }
 
     void storeFResult(const ir::Instruction &inst) {
+        if (inst.result == elideResultStoreId_) {
+            return;
+        }
         const auto global = globalValueFRegs_.find(inst.result);
         if (global != globalValueFRegs_.end()) {
             if (global->second != "fa0") {
@@ -2757,7 +3207,7 @@ private:
             return true;
         }
         if (type.kind == ir::TypeKind::I32 || type.kind == ir::TypeKind::Ptr) {
-            while (nextIntReg_ < intCacheRegs().size() && isGlobalIntReg(intCacheRegs()[nextIntReg_])) {
+            while (nextIntReg_ < intCacheRegs().size() && isReservedIntReg(intCacheRegs()[nextIntReg_])) {
                 ++nextIntReg_;
             }
             if (nextIntReg_ >= intCacheRegs().size()) {
@@ -2782,6 +3232,19 @@ private:
             }
         }
         return false;
+    }
+
+    bool isScalarIntReg(const std::string &reg) const {
+        for (const auto &[_, scalarReg] : scalarIntAllocas_) {
+            if (scalarReg == reg) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isReservedIntReg(const std::string &reg) const {
+        return isGlobalIntReg(reg) || isScalarIntReg(reg);
     }
 
     bool isGlobalFloatReg(const std::string &reg) const {
@@ -3005,6 +3468,7 @@ private:
     std::unordered_map<int, std::string> scalarFloatAllocas_;
     std::unordered_map<int, std::string> globalValueRegs_;
     std::unordered_map<int, std::string> globalValueFRegs_;
+    std::unordered_map<int, int> valueUseCounts_;
     std::vector<std::string> activeSavedIntRegs_;
     std::vector<std::string> activeSavedFloatRegs_;
     std::unordered_map<std::string, std::unordered_set<int>> blockLocalValues_;
@@ -3015,6 +3479,7 @@ private:
     std::size_t nextFloatReg_ = 0;
     int nextPhiEdgeLabel_ = 0;
     bool useLongJumps_ = false;
+    int elideResultStoreId_ = -1;
     int nextOffset_ = -24;
     int frameSize_ = 4096;
 };
