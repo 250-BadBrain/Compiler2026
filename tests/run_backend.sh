@@ -26,6 +26,6 @@ grep -q 'addi a0, t2, 4' "$tmp_dir/array1.s"
 
 "$root/compiler" "$root/tests/backend/global_array.sy" -S -o "$tmp_dir/global_array.s"
 grep -q '^g:' "$tmp_dir/global_array.s"
-grep -q 'la a0, g' "$tmp_dir/global_array.s"
+grep -q 'la t2, g' "$tmp_dir/global_array.s"
 
 echo "backend tests passed"

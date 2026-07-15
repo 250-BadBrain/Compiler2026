@@ -1384,6 +1384,12 @@ public:
     }
 
 private:
+    struct PhiCopy {
+        int target = -1;
+        ir::Type targetType;
+        ir::Value source;
+    };
+
     void emitGlobals() {
         if (module_.globals.empty()) {
             return;
@@ -1432,14 +1438,21 @@ private:
         valueFRegs_.clear();
         scalarIntAllocas_.clear();
         scalarFloatAllocas_.clear();
+        globalValueRegs_.clear();
+        globalValueFRegs_.clear();
         activeSavedIntRegs_.clear();
         activeSavedFloatRegs_.clear();
         blockLocalValues_.clear();
+        phiCopies_.clear();
         currentBlockLocalValues_ = nullptr;
+        currentBlockName_.clear();
         nextIntReg_ = 0;
         nextFloatReg_ = 0;
+        nextPhiEdgeLabel_ = 0;
         epilogueLabel_ = ".L" + function.name + ".ret";
         analyzeRegisterAllocas(function);
+        buildPhiCopies(function);
+        analyzeGlobalValueRegisters(function);
         prepareSavedRegisters(function);
         nextOffset_ = firstLocalOffset();
         collectValueSlots(function);
@@ -1470,34 +1483,36 @@ private:
         int floatParam = 0;
         int stackParam = 0;
         for (std::size_t i = 0; i < function.params.size(); ++i) {
-            valueOffsets_[function.params[i].id] = allocateSlot();
             if (function.params[i].type.kind == ir::TypeKind::F32) {
                 if (floatParam < 8) {
-                    storeFReg("fa" + std::to_string(floatParam), valueOffsets_[function.params[i].id]);
+                    storeParamFloat(function.params[i].id, "fa" + std::to_string(floatParam));
                 } else {
                     loadFReg("fa0", stackParam * 8);
-                    storeFReg("fa0", valueOffsets_[function.params[i].id]);
+                    storeParamFloat(function.params[i].id, "fa0");
                     ++stackParam;
                 }
                 ++floatParam;
             } else {
                 if (intParam < 8) {
-                    storeReg("a" + std::to_string(intParam), valueOffsets_[function.params[i].id]);
+                    storeParamInt(function.params[i].id, "a" + std::to_string(intParam));
                 } else {
                     loadReg("a0", stackParam * 8);
-                    storeReg("a0", valueOffsets_[function.params[i].id]);
+                    storeParamInt(function.params[i].id, "a0");
                     ++stackParam;
                 }
                 ++intParam;
             }
         }
 
-        for (const auto &block : function.blocks) {
+        for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+            const auto &block = function.blocks[blockIndex];
             valueRegs_.clear();
             valueFRegs_.clear();
             nextIntReg_ = 0;
             nextFloatReg_ = 0;
             currentBlockLocalValues_ = &blockLocalValues_[block.name];
+            currentBlockName_ = block.name;
+            nextBlockName_ = blockIndex + 1 < function.blocks.size() ? function.blocks[blockIndex + 1].name : std::string{};
             out_ << blockLabel(block.name) << ":\n";
             for (const auto &inst : block.instructions) {
                 emitInst(inst);
@@ -1520,12 +1535,66 @@ private:
         currentFunction_ = nullptr;
         currentFunctionName_.clear();
         currentBlockLocalValues_ = nullptr;
+        currentBlockName_.clear();
+        nextBlockName_.clear();
+    }
+
+    static std::string edgeKey(const std::string &pred, const std::string &succ) {
+        return pred + '\n' + succ;
+    }
+
+    static std::string trimLabel(std::string label) {
+        const std::size_t first = label.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return {};
+        }
+        const std::size_t last = label.find_last_not_of(" \t\r\n");
+        return label.substr(first, last - first + 1);
+    }
+
+    static std::vector<std::string> splitLabels(const std::string &text) {
+        std::vector<std::string> labels;
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            const std::size_t comma = text.find(',', start);
+            const std::size_t end = comma == std::string::npos ? text.size() : comma;
+            labels.push_back(trimLabel(text.substr(start, end - start)));
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        return labels;
+    }
+
+    void buildPhiCopies(const ir::Function &function) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Phi) {
+                    break;
+                }
+                const std::vector<std::string> preds = splitLabels(inst.text);
+                const std::size_t count = std::min(preds.size(), inst.operands.size());
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (preds[i].empty()) {
+                        continue;
+                    }
+                    phiCopies_[edgeKey(preds[i], block.name)].push_back(PhiCopy{inst.result, inst.resultType, inst.operands[i]});
+                }
+            }
+        }
     }
 
     void collectValueSlots(const ir::Function &function) {
+        for (const auto &param : function.params) {
+            if (!globalValueRegs_.count(param.id) && !globalValueFRegs_.count(param.id)) {
+                valueOffsets_[param.id] = allocateSlot();
+            }
+        }
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
-                if (inst.result >= 0 && inst.opcode != ir::Opcode::Alloca) {
+                if (inst.result >= 0 && inst.opcode != ir::Opcode::Alloca &&
+                    !globalValueRegs_.count(inst.result) && !globalValueFRegs_.count(inst.result)) {
                     valueOffsets_[inst.result] = allocateSlot();
                 }
                 if (inst.opcode == ir::Opcode::Alloca && inst.result >= 0) {
@@ -1535,6 +1604,127 @@ private:
                     allocaOffsets_[inst.result] = allocateBytes(allocaBytes(inst.text));
                 }
             }
+        }
+    }
+
+    void analyzeGlobalValueRegisters(const ir::Function &function) {
+        struct Candidate {
+            ir::TypeKind type = ir::TypeKind::I32;
+            int uses = 0;
+            bool crossBlock = false;
+            bool phi = false;
+        };
+
+        std::unordered_map<int, Candidate> candidates;
+        std::unordered_map<int, std::string> defBlock;
+        auto addCandidate = [&](int id, ir::Type type, const std::string &blockName, bool isPhi) {
+            if (id < 0 || type.kind == ir::TypeKind::Void) {
+                return;
+            }
+            Candidate &candidate = candidates[id];
+            candidate.type = type.kind;
+            candidate.phi = candidate.phi || isPhi;
+            defBlock[id] = blockName;
+        };
+
+        for (const auto &param : function.params) {
+            addCandidate(param.id, param.type, "entry", false);
+            candidates[param.id].crossBlock = true;
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Alloca) {
+                    addCandidate(inst.result, inst.resultType, block.name, inst.opcode == ir::Opcode::Phi);
+                }
+            }
+        }
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    if (operand.constant || operand.id < 0) {
+                        continue;
+                    }
+                    const auto found = candidates.find(operand.id);
+                    if (found == candidates.end()) {
+                        continue;
+                    }
+                    found->second.uses += inst.opcode == ir::Opcode::Phi ? 3 : 1;
+                    const auto def = defBlock.find(operand.id);
+                    if (def != defBlock.end() && def->second != block.name) {
+                        found->second.crossBlock = true;
+                    }
+                }
+            }
+        }
+        for (const auto &[_, copies] : phiCopies_) {
+            for (const PhiCopy &copy : copies) {
+                auto source = candidates.find(copy.source.id);
+                if (!copy.source.constant && source != candidates.end()) {
+                    source->second.uses += 2;
+                    source->second.crossBlock = true;
+                }
+                auto target = candidates.find(copy.target);
+                if (target != candidates.end()) {
+                    target->second.uses += 4;
+                    target->second.crossBlock = true;
+                    target->second.phi = true;
+                }
+            }
+        }
+
+        std::unordered_set<std::string> usedIntRegs;
+        std::unordered_set<std::string> usedFloatRegs;
+        for (const auto &[_, reg] : scalarIntAllocas_) {
+            usedIntRegs.insert(reg);
+        }
+        for (const auto &[_, reg] : scalarFloatAllocas_) {
+            usedFloatRegs.insert(reg);
+        }
+
+        std::vector<std::pair<int, Candidate>> ints;
+        std::vector<std::pair<int, Candidate>> floats;
+        for (const auto &[id, candidate] : candidates) {
+            if (!candidate.phi || !candidate.crossBlock || candidate.uses < 2) {
+                continue;
+            }
+            if (candidate.type == ir::TypeKind::F32) {
+                floats.push_back({id, candidate});
+            } else if (candidate.type == ir::TypeKind::I32 || candidate.type == ir::TypeKind::Ptr) {
+                ints.push_back({id, candidate});
+            }
+        }
+        const auto hotter = [](const auto &lhs, const auto &rhs) {
+            const int lhsScore = lhs.second.uses + (lhs.second.phi ? 100 : 0);
+            const int rhsScore = rhs.second.uses + (rhs.second.phi ? 100 : 0);
+            if (lhsScore != rhsScore) {
+                return lhsScore > rhsScore;
+            }
+            return lhs.first < rhs.first;
+        };
+        std::sort(ints.begin(), ints.end(), hotter);
+        std::sort(floats.begin(), floats.end(), hotter);
+
+        std::size_t intIndex = 0;
+        for (const auto &[id, _] : ints) {
+            while (intIndex < globalIntRegs().size() && usedIntRegs.count(globalIntRegs()[intIndex])) {
+                ++intIndex;
+            }
+            if (intIndex >= globalIntRegs().size()) {
+                break;
+            }
+            globalValueRegs_[id] = globalIntRegs()[intIndex++];
+        }
+
+        std::size_t floatIndex = 0;
+        for (const auto &[id, _] : floats) {
+            while (floatIndex < globalFloatRegs().size() && usedFloatRegs.count(globalFloatRegs()[floatIndex])) {
+                ++floatIndex;
+            }
+            if (floatIndex >= globalFloatRegs().size()) {
+                break;
+            }
+            globalValueFRegs_[id] = globalFloatRegs()[floatIndex++];
         }
     }
 
@@ -1619,6 +1809,12 @@ private:
             addInt(reg);
         }
         for (const auto &[_, reg] : scalarFloatAllocas_) {
+            addFloat(reg);
+        }
+        for (const auto &[_, reg] : globalValueRegs_) {
+            addInt(reg);
+        }
+        for (const auto &[_, reg] : globalValueFRegs_) {
             addFloat(reg);
         }
         for (const auto &reg : intCacheRegs()) {
@@ -1725,15 +1921,13 @@ private:
                 emitAddressOperand(inst.operands[1]);
                 out_ << "\tfsw fa0, 0(a0)\n";
             } else {
-                emitValueOperand(inst.operands[0]);
-                out_ << "\tmv t2, a0\n";
+                emitValueOperandTo("t2", inst.operands[0]);
                 emitAddressOperand(inst.operands[1]);
                 out_ << "\tsw t2, 0(a0)\n";
             }
             break;
         case ir::Opcode::Gep:
-            emitAddressOperand(inst.operands[0]);
-            out_ << "\tmv t2, a0\n";
+            emitAddressOperandTo("t2", inst.operands[0]);
             if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32) {
                 const long long index = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
                 const long long offset = index * 4;
@@ -1784,18 +1978,20 @@ private:
             storeResult(inst);
             break;
         case ir::Opcode::Br:
-            out_ << "\tj " << blockLabel(inst.text) << "\n";
+            emitPhiCopies(currentBlockName_, inst.text);
+            if (inst.text != nextBlockName_) {
+                emitJump(blockLabel(inst.text));
+            }
             break;
         case ir::Opcode::CondBr:
             emitValueOperand(inst.operands[0]);
-            out_ << "\tbnez a0, " << blockLabel(inst.text.substr(0, inst.text.find(','))) << "\n";
-            out_ << "\tj " << blockLabel(inst.text.substr(inst.text.find(',') + 2)) << "\n";
+            emitCondBranchWithPhi(inst.text);
             break;
         case ir::Opcode::Ret:
             if (!inst.operands.empty()) {
                 emitValueOperand(inst.operands[0]);
             }
-            out_ << "\tj " << epilogueLabel_ << "\n";
+            emitJump(epilogueLabel_);
             break;
         case ir::Opcode::Cast:
             emitCast(inst);
@@ -1816,8 +2012,7 @@ private:
         if (emitImmediateBinary(inst)) {
             return;
         }
-        emitValueOperand(inst.operands[0]);
-        out_ << "\tmv t0, a0\n";
+        emitValueOperandTo("t0", inst.operands[0]);
         emitValueOperand(inst.operands[1]);
         switch (inst.opcode) {
         case ir::Opcode::Add: out_ << "\taddw a0, t0, a0\n"; break;
@@ -1837,6 +2032,93 @@ private:
             break;
         }
         storeResult(inst);
+    }
+
+    void emitCondBranch(const std::string &text) {
+        const std::size_t comma = text.find(',');
+        const std::string trueLabel = trimLabel(text.substr(0, comma));
+        const std::string falseLabel = comma == std::string::npos ? std::string{} : trimLabel(text.substr(comma + 1));
+        const std::string trueLocal = newPhiEdgeLabel();
+        out_ << "\tbnez a0, " << trueLocal << "\n";
+        emitJump(blockLabel(falseLabel));
+        out_ << trueLocal << ":\n";
+        emitJump(blockLabel(trueLabel));
+    }
+
+    void emitCondBranchWithPhi(const std::string &text) {
+        const std::size_t comma = text.find(',');
+        const std::string trueLabel = trimLabel(text.substr(0, comma));
+        const std::string falseLabel = comma == std::string::npos ? std::string{} : trimLabel(text.substr(comma + 1));
+        if (!hasPhiCopies(currentBlockName_, trueLabel) && !hasPhiCopies(currentBlockName_, falseLabel)) {
+            emitCondBranch(text);
+            return;
+        }
+
+        const std::string trueEdge = newPhiEdgeLabel();
+        const std::string falseEdge = newPhiEdgeLabel();
+        const std::string trueLocal = newPhiEdgeLabel();
+        out_ << "\tbnez a0, " << trueLocal << "\n";
+        emitJump(falseEdge);
+        out_ << trueLocal << ":\n";
+        emitJump(trueEdge);
+
+        out_ << trueEdge << ":\n";
+        emitPhiCopies(currentBlockName_, trueLabel);
+        emitJump(blockLabel(trueLabel));
+
+        out_ << falseEdge << ":\n";
+        emitPhiCopies(currentBlockName_, falseLabel);
+        emitJump(blockLabel(falseLabel));
+    }
+
+    bool hasPhiCopies(const std::string &pred, const std::string &succ) const {
+        const auto found = phiCopies_.find(edgeKey(pred, succ));
+        return found != phiCopies_.end() && !found->second.empty();
+    }
+
+    void emitPhiCopies(const std::string &pred, const std::string &succ) {
+        const auto found = phiCopies_.find(edgeKey(pred, succ));
+        if (found == phiCopies_.end()) {
+            return;
+        }
+        for (const PhiCopy &copy : found->second) {
+            if (copy.targetType.kind == ir::TypeKind::F32) {
+                const auto targetReg = globalValueFRegs_.find(copy.target);
+                if (targetReg != globalValueFRegs_.end()) {
+                    emitFloatOperandTo(targetReg->second, copy.source);
+                } else {
+                    const auto sourceReg = !copy.source.constant ? globalValueFRegs_.find(copy.source.id) : globalValueFRegs_.end();
+                    if (sourceReg != globalValueFRegs_.end()) {
+                        storeFReg(sourceReg->second, valueOffsets_[copy.target]);
+                    } else {
+                        emitValueOperand(copy.source);
+                        storeFReg("fa0", valueOffsets_[copy.target]);
+                    }
+                }
+            } else {
+                const auto targetReg = globalValueRegs_.find(copy.target);
+                if (targetReg != globalValueRegs_.end()) {
+                    emitValueOperandTo(targetReg->second, copy.source);
+                } else {
+                    const auto sourceReg = !copy.source.constant ? globalValueRegs_.find(copy.source.id) : globalValueRegs_.end();
+                    if (sourceReg != globalValueRegs_.end()) {
+                        storeReg(sourceReg->second, valueOffsets_[copy.target]);
+                    } else {
+                        emitValueOperand(copy.source);
+                        storeReg("a0", valueOffsets_[copy.target]);
+                    }
+                }
+            }
+        }
+    }
+
+    std::string newPhiEdgeLabel() {
+        return ".Lir." + currentFunctionName_ + ".phi_edge." + std::to_string(nextPhiEdgeLabel_++);
+    }
+
+    void emitJump(const std::string &label) {
+        out_ << "\tlla t6, " << label << "\n";
+        out_ << "\tjr t6\n";
     }
 
     bool emitImmediateBinary(const ir::Instruction &inst) {
@@ -1990,6 +2272,36 @@ private:
         }
     }
 
+    void storeParamInt(int id, const std::string &reg) {
+        storeValueInt(id, reg);
+    }
+
+    void storeParamFloat(int id, const std::string &reg) {
+        storeValueFloat(id, reg);
+    }
+
+    void storeValueInt(int id, const std::string &reg) {
+        const auto global = globalValueRegs_.find(id);
+        if (global != globalValueRegs_.end()) {
+            if (global->second != reg) {
+                out_ << "\tmv " << global->second << ", " << reg << "\n";
+            }
+            return;
+        }
+        storeReg(reg, valueOffsets_[id]);
+    }
+
+    void storeValueFloat(int id, const std::string &reg) {
+        const auto global = globalValueFRegs_.find(id);
+        if (global != globalValueFRegs_.end()) {
+            if (global->second != reg) {
+                out_ << "\tfmv.s " << global->second << ", " << reg << "\n";
+            }
+            return;
+        }
+        storeFReg(reg, valueOffsets_[id]);
+    }
+
     void emitValueOperand(const ir::Value &value) {
         if (value.constant) {
             if (!value.name.empty() && value.name[0] == '@') {
@@ -2006,6 +2318,16 @@ private:
         const auto alloca = allocaOffsets_.find(value.id);
         if (alloca != allocaOffsets_.end()) {
             addressReg("a0", alloca->second);
+            return;
+        }
+        const auto globalInt = globalValueRegs_.find(value.id);
+        if (globalInt != globalValueRegs_.end()) {
+            out_ << "\tmv a0, " << globalInt->second << "\n";
+            return;
+        }
+        const auto globalFloat = globalValueFRegs_.find(value.id);
+        if (globalFloat != globalValueFRegs_.end()) {
+            out_ << "\tfmv.s fa0, " << globalFloat->second << "\n";
             return;
         }
         const auto intReg = valueRegs_.find(value.id);
@@ -2025,6 +2347,69 @@ private:
         }
     }
 
+    void emitValueOperandTo(const std::string &reg, const ir::Value &value) {
+        if (reg == "a0") {
+            emitValueOperand(value);
+            return;
+        }
+        if (value.constant) {
+            if (!value.name.empty() && value.name[0] == '@') {
+                out_ << "\tla " << reg << ", " << value.name.substr(1) << "\n";
+            } else {
+                out_ << "\tli " << reg << ", " << value.name << "\n";
+            }
+            return;
+        }
+        const auto alloca = allocaOffsets_.find(value.id);
+        if (alloca != allocaOffsets_.end()) {
+            addressReg(reg, alloca->second);
+            return;
+        }
+        const auto globalInt = globalValueRegs_.find(value.id);
+        if (globalInt != globalValueRegs_.end()) {
+            if (globalInt->second != reg) {
+                out_ << "\tmv " << reg << ", " << globalInt->second << "\n";
+            }
+            return;
+        }
+        const auto intReg = valueRegs_.find(value.id);
+        if (intReg != valueRegs_.end()) {
+            if (intReg->second != reg) {
+                out_ << "\tmv " << reg << ", " << intReg->second << "\n";
+            }
+            return;
+        }
+        loadReg(reg, valueOffsets_[value.id]);
+    }
+
+    void emitFloatOperandTo(const std::string &reg, const ir::Value &value) {
+        if (reg == "fa0") {
+            emitValueOperand(value);
+            return;
+        }
+        if (value.constant) {
+            const float f = static_cast<float>(std::strtof(value.name.c_str(), nullptr));
+            out_ << "\tli t0, " << irFloatBits(f) << "\n";
+            out_ << "\tfmv.w.x " << reg << ", t0\n";
+            return;
+        }
+        const auto globalFloat = globalValueFRegs_.find(value.id);
+        if (globalFloat != globalValueFRegs_.end()) {
+            if (globalFloat->second != reg) {
+                out_ << "\tfmv.s " << reg << ", " << globalFloat->second << "\n";
+            }
+            return;
+        }
+        const auto floatReg = valueFRegs_.find(value.id);
+        if (floatReg != valueFRegs_.end()) {
+            if (floatReg->second != reg) {
+                out_ << "\tfmv.s " << reg << ", " << floatReg->second << "\n";
+            }
+            return;
+        }
+        loadFReg(reg, valueOffsets_[value.id]);
+    }
+
     void emitAddressOperand(const ir::Value &value) {
         if (value.constant && !value.name.empty() && value.name[0] == '@') {
             out_ << "\tla a0, " << value.name.substr(1) << "\n";
@@ -2035,6 +2420,11 @@ private:
             addressReg("a0", alloca->second);
             return;
         }
+        const auto globalInt = globalValueRegs_.find(value.id);
+        if (globalInt != globalValueRegs_.end()) {
+            out_ << "\tmv a0, " << globalInt->second << "\n";
+            return;
+        }
         const auto intReg = valueRegs_.find(value.id);
         if (intReg != valueRegs_.end()) {
             out_ << "\tmv a0, " << intReg->second << "\n";
@@ -2043,7 +2433,45 @@ private:
         loadReg("a0", valueOffsets_[value.id]);
     }
 
+    void emitAddressOperandTo(const std::string &reg, const ir::Value &value) {
+        if (reg == "a0") {
+            emitAddressOperand(value);
+            return;
+        }
+        if (value.constant && !value.name.empty() && value.name[0] == '@') {
+            out_ << "\tla " << reg << ", " << value.name.substr(1) << "\n";
+            return;
+        }
+        const auto alloca = allocaOffsets_.find(value.id);
+        if (alloca != allocaOffsets_.end()) {
+            addressReg(reg, alloca->second);
+            return;
+        }
+        const auto globalInt = globalValueRegs_.find(value.id);
+        if (globalInt != globalValueRegs_.end()) {
+            if (globalInt->second != reg) {
+                out_ << "\tmv " << reg << ", " << globalInt->second << "\n";
+            }
+            return;
+        }
+        const auto intReg = valueRegs_.find(value.id);
+        if (intReg != valueRegs_.end()) {
+            if (intReg->second != reg) {
+                out_ << "\tmv " << reg << ", " << intReg->second << "\n";
+            }
+            return;
+        }
+        loadReg(reg, valueOffsets_[value.id]);
+    }
+
     void storeResult(const ir::Instruction &inst) {
+        const auto global = globalValueRegs_.find(inst.result);
+        if (global != globalValueRegs_.end()) {
+            if (global->second != "a0") {
+                out_ << "\tmv " << global->second << ", a0\n";
+            }
+            return;
+        }
         if (cacheResult(inst.result, inst.resultType) && isCurrentBlockLocal(inst.result)) {
             return;
         }
@@ -2051,6 +2479,13 @@ private:
     }
 
     void storeFResult(const ir::Instruction &inst) {
+        const auto global = globalValueFRegs_.find(inst.result);
+        if (global != globalValueFRegs_.end()) {
+            if (global->second != "fa0") {
+                out_ << "\tfmv.s " << global->second << ", fa0\n";
+            }
+            return;
+        }
         if (cacheResult(inst.result, inst.resultType) && isCurrentBlockLocal(inst.result)) {
             return;
         }
@@ -2220,6 +2655,16 @@ private:
         return regs;
     }
 
+    static const std::vector<std::string> &globalIntRegs() {
+        static const std::vector<std::string> regs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &globalFloatRegs() {
+        static const std::vector<std::string> regs = {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7"};
+        return regs;
+    }
+
     static const std::vector<std::string> &intCacheRegs() {
         static const std::vector<std::string> regs = {"s9", "s10", "s11"};
         return regs;
@@ -2252,19 +2697,25 @@ private:
     std::ostream &out_;
     const ir::Function *currentFunction_ = nullptr;
     std::string currentFunctionName_;
+    std::string currentBlockName_;
+    std::string nextBlockName_;
     std::unordered_map<int, int> valueOffsets_;
     std::unordered_map<int, int> allocaOffsets_;
     std::unordered_map<int, std::string> valueRegs_;
     std::unordered_map<int, std::string> valueFRegs_;
     std::unordered_map<int, std::string> scalarIntAllocas_;
     std::unordered_map<int, std::string> scalarFloatAllocas_;
+    std::unordered_map<int, std::string> globalValueRegs_;
+    std::unordered_map<int, std::string> globalValueFRegs_;
     std::vector<std::string> activeSavedIntRegs_;
     std::vector<std::string> activeSavedFloatRegs_;
     std::unordered_map<std::string, std::unordered_set<int>> blockLocalValues_;
+    std::unordered_map<std::string, std::vector<PhiCopy>> phiCopies_;
     const std::unordered_set<int> *currentBlockLocalValues_ = nullptr;
     std::string epilogueLabel_;
     std::size_t nextIntReg_ = 0;
     std::size_t nextFloatReg_ = 0;
+    int nextPhiEdgeLabel_ = 0;
     int nextOffset_ = -24;
     int frameSize_ = 4096;
 };

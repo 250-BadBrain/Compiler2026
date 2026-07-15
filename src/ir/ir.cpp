@@ -157,6 +157,27 @@ bool isPure(Opcode opcode) {
     return false;
 }
 
+bool isTerminator(Opcode opcode) {
+    return opcode == Opcode::Br || opcode == Opcode::CondBr || opcode == Opcode::Ret;
+}
+
+bool truncateAfterTerminators(Function &function) {
+    bool changed = false;
+    for (auto &block : function.blocks) {
+        for (std::size_t i = 0; i < block.instructions.size(); ++i) {
+            if (!isTerminator(block.instructions[i].opcode)) {
+                continue;
+            }
+            if (i + 1 < block.instructions.size()) {
+                block.instructions.resize(i + 1);
+                changed = true;
+            }
+            break;
+        }
+    }
+    return changed;
+}
+
 Value resolve(Value value, const std::unordered_map<int, Value> &replacements) {
     while (!value.constant && value.id >= 0) {
         const auto found = replacements.find(value.id);
@@ -507,6 +528,706 @@ bool promoteSingleBlockAllocas(Function &function) {
     return changed;
 }
 
+std::vector<std::vector<int>> computePredecessors(const Function &function) {
+    std::unordered_map<std::string, int> blockIndex;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        blockIndex[function.blocks[i].name] = static_cast<int>(i);
+    }
+    std::vector<std::vector<int>> predecessors(function.blocks.size());
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        if (function.blocks[i].instructions.empty()) {
+            continue;
+        }
+        const Instruction &term = function.blocks[i].instructions.back();
+        auto add = [&](const std::string &name) {
+            const auto found = blockIndex.find(name);
+            if (found != blockIndex.end()) {
+                predecessors[static_cast<std::size_t>(found->second)].push_back(static_cast<int>(i));
+            }
+        };
+        if (term.opcode == Opcode::Br) {
+            add(term.text);
+        } else if (term.opcode == Opcode::CondBr) {
+            const std::size_t comma = term.text.find(',');
+            if (comma != std::string::npos) {
+                add(term.text.substr(0, comma));
+                add(term.text.substr(comma + 2));
+            }
+        }
+    }
+    return predecessors;
+}
+
+bool sameValue(const Value &lhs, const Value &rhs) {
+    return lhs.id == rhs.id && lhs.type.kind == rhs.type.kind &&
+           lhs.name == rhs.name && lhs.constant == rhs.constant;
+}
+
+bool sameMap(const std::unordered_map<int, Value> &lhs, const std::unordered_map<int, Value> &rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (const auto &[key, value] : lhs) {
+        const auto found = rhs.find(key);
+        if (found == rhs.end() || !sameValue(value, found->second)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::unordered_set<int> promotableScalarAllocas(const Function &function) {
+    std::unordered_set<int> allocas;
+    std::unordered_set<int> escaped;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode == Opcode::Alloca && inst.result >= 0 && allocaBytes(inst.text) == 4) {
+                allocas.insert(inst.result);
+            }
+        }
+    }
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            for (std::size_t i = 0; i < inst.operands.size(); ++i) {
+                const Value &operand = inst.operands[i];
+                if (operand.constant || operand.id < 0 || !allocas.count(operand.id)) {
+                    continue;
+                }
+                const bool addressUse = (inst.opcode == Opcode::Load && i == 0) ||
+                                        (inst.opcode == Opcode::Store && i == 1);
+                if (!addressUse) {
+                    escaped.insert(operand.id);
+                }
+            }
+        }
+    }
+    for (int id : escaped) {
+        allocas.erase(id);
+    }
+    return allocas;
+}
+
+int nextValueId(const Function &function) {
+    int next = 0;
+    for (const auto &param : function.params) {
+        next = std::max(next, param.id + 1);
+    }
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            next = std::max(next, inst.result + 1);
+            for (const auto &operand : inst.operands) {
+                if (!operand.constant) {
+                    next = std::max(next, operand.id + 1);
+                }
+            }
+        }
+    }
+    return next;
+}
+
+std::unordered_map<int, Type> scalarAllocaTypes(const Function &function, const std::unordered_set<int> &allocas) {
+    std::unordered_map<int, Type> types;
+    for (int id : allocas) {
+        types[id] = Type{TypeKind::I32};
+    }
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode == Opcode::Load && inst.operands.size() == 1) {
+                const Value &addr = inst.operands[0];
+                if (!addr.constant && allocas.count(addr.id)) {
+                    types[addr.id] = inst.resultType;
+                }
+            } else if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const Value &addr = inst.operands[1];
+                if (!addr.constant && allocas.count(addr.id)) {
+                    types[addr.id] = inst.operands[0].type;
+                }
+            }
+        }
+    }
+    return types;
+}
+
+bool promoteScalarAllocasToSSA(Function &function) {
+    const std::unordered_set<int> allocas = promotableScalarAllocas(function);
+    if (allocas.empty() || function.blocks.empty()) {
+        return false;
+    }
+
+    const auto predecessors = computePredecessors(function);
+    const auto types = scalarAllocaTypes(function, allocas);
+    int nextId = nextValueId(function);
+    bool changed = false;
+
+    std::vector<std::unordered_map<int, int>> blockPhiResult(function.blocks.size());
+    std::vector<std::vector<int>> successors(function.blocks.size());
+    for (std::size_t blockIndex = 0; blockIndex < predecessors.size(); ++blockIndex) {
+        for (int pred : predecessors[blockIndex]) {
+            successors[static_cast<std::size_t>(pred)].push_back(static_cast<int>(blockIndex));
+        }
+    }
+
+    std::unordered_set<int> allBlocks;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        allBlocks.insert(static_cast<int>(i));
+    }
+    std::vector<std::unordered_set<int>> dominators(function.blocks.size());
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        dominators[i] = i == 0 ? std::unordered_set<int>{0} : allBlocks;
+    }
+    bool domChanged = true;
+    while (domChanged) {
+        domChanged = false;
+        for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+            std::unordered_set<int> next = allBlocks;
+            if (predecessors[blockIndex].empty()) {
+                next.clear();
+            }
+            for (int pred : predecessors[blockIndex]) {
+                std::unordered_set<int> intersection;
+                for (int candidate : next) {
+                    if (dominators[static_cast<std::size_t>(pred)].count(candidate)) {
+                        intersection.insert(candidate);
+                    }
+                }
+                next = std::move(intersection);
+            }
+            next.insert(static_cast<int>(blockIndex));
+            if (next != dominators[blockIndex]) {
+                dominators[blockIndex] = std::move(next);
+                domChanged = true;
+            }
+        }
+    }
+
+    std::vector<std::unordered_set<int>> dominanceFrontier(function.blocks.size());
+    for (std::size_t domBlock = 0; domBlock < function.blocks.size(); ++domBlock) {
+        for (std::size_t join = 0; join < function.blocks.size(); ++join) {
+            bool dominatesPred = false;
+            for (int pred : predecessors[join]) {
+                if (dominators[static_cast<std::size_t>(pred)].count(static_cast<int>(domBlock))) {
+                    dominatesPred = true;
+                    break;
+                }
+            }
+            const bool strictlyDominatesJoin = domBlock != join && dominators[join].count(static_cast<int>(domBlock));
+            if (dominatesPred && !strictlyDominatesJoin) {
+                dominanceFrontier[domBlock].insert(static_cast<int>(join));
+            }
+        }
+    }
+
+    std::unordered_map<int, std::unordered_set<int>> defBlocks;
+    for (int alloca : allocas) {
+        defBlocks[alloca].insert(0);
+    }
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        for (const auto &inst : function.blocks[blockIndex].instructions) {
+            if (inst.opcode != Opcode::Store || inst.operands.size() != 2) {
+                continue;
+            }
+            const Value &addr = inst.operands[1];
+            if (!addr.constant && allocas.count(addr.id)) {
+                defBlocks[addr.id].insert(static_cast<int>(blockIndex));
+            }
+        }
+    }
+
+    std::vector<std::unordered_set<int>> use(function.blocks.size());
+    std::vector<std::unordered_set<int>> def(function.blocks.size());
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_set<int> seenDef;
+        for (const auto &inst : function.blocks[blockIndex].instructions) {
+            if (inst.opcode == Opcode::Load && inst.operands.size() == 1) {
+                const Value &addr = inst.operands[0];
+                if (!addr.constant && allocas.count(addr.id) && !seenDef.count(addr.id)) {
+                    use[blockIndex].insert(addr.id);
+                }
+            } else if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const Value &addr = inst.operands[1];
+                if (!addr.constant && allocas.count(addr.id)) {
+                    def[blockIndex].insert(addr.id);
+                    seenDef.insert(addr.id);
+                }
+            }
+        }
+    }
+    std::vector<std::unordered_set<int>> liveIn(function.blocks.size());
+    std::vector<std::unordered_set<int>> liveOut(function.blocks.size());
+    bool liveChanged = true;
+    while (liveChanged) {
+        liveChanged = false;
+        for (std::size_t blockIndex = function.blocks.size(); blockIndex-- > 0;) {
+            std::unordered_set<int> nextOut;
+            for (int succ : successors[blockIndex]) {
+                nextOut.insert(liveIn[static_cast<std::size_t>(succ)].begin(), liveIn[static_cast<std::size_t>(succ)].end());
+            }
+            std::unordered_set<int> nextIn = use[blockIndex];
+            for (int id : nextOut) {
+                if (!def[blockIndex].count(id)) {
+                    nextIn.insert(id);
+                }
+            }
+            if (nextOut != liveOut[blockIndex]) {
+                liveOut[blockIndex] = std::move(nextOut);
+                liveChanged = true;
+            }
+            if (nextIn != liveIn[blockIndex]) {
+                liveIn[blockIndex] = std::move(nextIn);
+                liveChanged = true;
+            }
+        }
+    }
+
+    auto addPhi = [&](int alloca, int blockIndex) {
+        if (blockIndex == 0 || blockPhiResult[static_cast<std::size_t>(blockIndex)].count(alloca)) {
+            return false;
+        }
+        blockPhiResult[static_cast<std::size_t>(blockIndex)][alloca] = nextId++;
+        return true;
+    };
+
+    for (int alloca : allocas) {
+        std::vector<int> worklist(defBlocks[alloca].begin(), defBlocks[alloca].end());
+        std::unordered_set<int> seen(worklist.begin(), worklist.end());
+        while (!worklist.empty()) {
+            const int block = worklist.back();
+            worklist.pop_back();
+            for (int frontierBlock : dominanceFrontier[static_cast<std::size_t>(block)]) {
+                if (!liveIn[static_cast<std::size_t>(frontierBlock)].count(alloca)) {
+                    continue;
+                }
+                if (addPhi(alloca, frontierBlock) && !seen.count(frontierBlock)) {
+                    seen.insert(frontierBlock);
+                    worklist.push_back(frontierBlock);
+                }
+            }
+        }
+    }
+    for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+        if (predecessors[blockIndex].size() < 2) {
+            continue;
+        }
+        for (int alloca : liveIn[blockIndex]) {
+            if (allocas.count(alloca)) {
+                addPhi(alloca, static_cast<int>(blockIndex));
+            }
+        }
+    }
+
+    for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+        if (blockPhiResult[blockIndex].empty()) {
+            continue;
+        }
+        std::vector<Instruction> phis;
+        phis.reserve(blockPhiResult[blockIndex].size());
+        for (const auto &[alloca, result] : blockPhiResult[blockIndex]) {
+            const auto typeFound = types.find(alloca);
+            const Type type = typeFound == types.end() ? Type{TypeKind::I32} : typeFound->second;
+            std::string labels;
+            for (std::size_t i = 0; i < predecessors[blockIndex].size(); ++i) {
+                if (i != 0) {
+                    labels += ",";
+                }
+                labels += function.blocks[static_cast<std::size_t>(predecessors[blockIndex][i])].name;
+            }
+            phis.push_back(Instruction{result, type, Opcode::Phi, {}, labels});
+        }
+        auto &instructions = function.blocks[blockIndex].instructions;
+        instructions.insert(instructions.begin(), std::make_move_iterator(phis.begin()), std::make_move_iterator(phis.end()));
+    }
+
+    std::vector<std::unordered_map<int, Value>> in(function.blocks.size());
+    std::vector<std::unordered_map<int, Value>> out(function.blocks.size());
+
+    bool dataChanged = true;
+    while (dataChanged) {
+        dataChanged = false;
+        for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+            std::unordered_map<int, Value> current;
+            if (blockIndex == 0 || predecessors[blockIndex].empty()) {
+                for (int alloca : allocas) {
+                    const auto typeFound = types.find(alloca);
+                    current[alloca] = zeroValue(typeFound == types.end() ? Type{TypeKind::I32} : typeFound->second);
+                }
+            } else if (predecessors[blockIndex].size() == 1) {
+                current = out[static_cast<std::size_t>(predecessors[blockIndex].front())];
+            } else {
+                for (int alloca : allocas) {
+                    const auto typeFound = types.find(alloca);
+                    const Type type = typeFound == types.end() ? Type{TypeKind::I32} : typeFound->second;
+                    const auto phiFound = blockPhiResult[blockIndex].find(alloca);
+                    if (phiFound != blockPhiResult[blockIndex].end()) {
+                        current[alloca] = Value{phiFound->second, type, {}, false};
+                        continue;
+                    }
+                    Value merged = zeroValue(type);
+                    bool first = true;
+                    bool same = true;
+                    for (int pred : predecessors[blockIndex]) {
+                        const auto found = out[static_cast<std::size_t>(pred)].find(alloca);
+                        const Value value = found == out[static_cast<std::size_t>(pred)].end() ? zeroValue(type) : found->second;
+                        if (first) {
+                            merged = value;
+                            first = false;
+                        } else if (!sameValue(merged, value)) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    current[alloca] = same ? merged : zeroValue(type);
+                }
+            }
+
+            std::unordered_map<int, Value> nextOut = current;
+            for (const auto &inst : function.blocks[blockIndex].instructions) {
+                if (inst.opcode == Opcode::Phi) {
+                    continue;
+                }
+                if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                    const Value &addr = inst.operands[1];
+                    if (!addr.constant && allocas.count(addr.id)) {
+                        nextOut[addr.id] = inst.operands[0];
+                    }
+                }
+            }
+
+            if (!sameMap(in[blockIndex], current)) {
+                in[blockIndex] = std::move(current);
+                dataChanged = true;
+            }
+            if (!sameMap(out[blockIndex], nextOut)) {
+                out[blockIndex] = std::move(nextOut);
+                dataChanged = true;
+            }
+        }
+    }
+
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        for (auto &inst : function.blocks[blockIndex].instructions) {
+            if (inst.opcode != Opcode::Phi) {
+                continue;
+            }
+            int alloca = -1;
+            for (const auto &[candidate, result] : blockPhiResult[blockIndex]) {
+                if (result == inst.result) {
+                    alloca = candidate;
+                    break;
+                }
+            }
+            if (alloca < 0) {
+                continue;
+            }
+            inst.operands.clear();
+            for (int pred : predecessors[blockIndex]) {
+                auto found = out[static_cast<std::size_t>(pred)].find(alloca);
+                if (found == out[static_cast<std::size_t>(pred)].end()) {
+                    const auto typeFound = types.find(alloca);
+                    inst.operands.push_back(zeroValue(typeFound == types.end() ? Type{TypeKind::I32} : typeFound->second));
+                } else {
+                    inst.operands.push_back(found->second);
+                }
+            }
+        }
+    }
+
+    std::unordered_map<int, Value> replacements;
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_map<int, Value> current = in[blockIndex];
+        std::vector<Instruction> kept;
+        kept.reserve(function.blocks[blockIndex].instructions.size());
+        for (auto inst : function.blocks[blockIndex].instructions) {
+            for (auto &operand : inst.operands) {
+                operand = resolve(operand, replacements);
+            }
+            if (inst.opcode == Opcode::Alloca && allocas.count(inst.result)) {
+                changed = true;
+                continue;
+            }
+            if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
+                const Value &addr = inst.operands[0];
+                if (!addr.constant && allocas.count(addr.id)) {
+                    replacements[inst.result] = current[addr.id];
+                    changed = true;
+                    continue;
+                }
+            }
+            if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const Value &addr = inst.operands[1];
+                if (!addr.constant && allocas.count(addr.id)) {
+                    current[addr.id] = inst.operands[0];
+                    changed = true;
+                    continue;
+                }
+            }
+            kept.push_back(std::move(inst));
+        }
+        function.blocks[blockIndex].instructions = std::move(kept);
+    }
+
+    if (changed) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+bool forwardCrossBlockMemory(Function &function) {
+    const std::unordered_set<int> candidates = promotableScalarAllocas(function);
+    if (candidates.empty() || function.blocks.empty()) {
+        return false;
+    }
+
+    const auto predecessors = computePredecessors(function);
+    std::vector<std::unordered_map<int, Value>> in(function.blocks.size());
+    std::vector<std::unordered_map<int, Value>> out(function.blocks.size());
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+            std::unordered_map<int, Value> nextIn;
+            if (blockIndex != 0 && !predecessors[blockIndex].empty()) {
+                nextIn = out[static_cast<std::size_t>(predecessors[blockIndex].front())];
+                for (std::size_t i = 1; i < predecessors[blockIndex].size(); ++i) {
+                    const auto &predOut = out[static_cast<std::size_t>(predecessors[blockIndex][i])];
+                    for (auto it = nextIn.begin(); it != nextIn.end();) {
+                        const auto found = predOut.find(it->first);
+                        if (found == predOut.end() || !sameValue(it->second, found->second)) {
+                            it = nextIn.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+
+            std::unordered_map<int, Value> nextOut = nextIn;
+            for (const auto &inst : function.blocks[blockIndex].instructions) {
+                if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                    const Value &address = inst.operands[1];
+                    if (!address.constant && candidates.count(address.id)) {
+                        nextOut[address.id] = inst.operands[0];
+                    }
+                }
+            }
+
+            if (!sameMap(in[blockIndex], nextIn)) {
+                in[blockIndex] = std::move(nextIn);
+                changed = true;
+            }
+            if (!sameMap(out[blockIndex], nextOut)) {
+                out[blockIndex] = std::move(nextOut);
+                changed = true;
+            }
+        }
+    }
+
+    bool replaced = false;
+    std::unordered_map<int, Value> replacements;
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_map<int, Value> current = in[blockIndex];
+        std::vector<Instruction> kept;
+        kept.reserve(function.blocks[blockIndex].instructions.size());
+        for (auto inst : function.blocks[blockIndex].instructions) {
+            for (auto &operand : inst.operands) {
+                operand = resolve(operand, replacements);
+            }
+            if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
+                const Value &address = inst.operands[0];
+                if (!address.constant && candidates.count(address.id)) {
+                    const auto found = current.find(address.id);
+                    if (found != current.end()) {
+                        replacements[inst.result] = found->second;
+                        replaced = true;
+                        continue;
+                    }
+                }
+            }
+            if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const Value &address = inst.operands[1];
+                if (!address.constant && candidates.count(address.id)) {
+                    current[address.id] = inst.operands[0];
+                }
+            }
+            kept.push_back(std::move(inst));
+        }
+        function.blocks[blockIndex].instructions = std::move(kept);
+    }
+
+    if (replaced) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+    return replaced;
+}
+
+bool isHoistableOpcode(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::Gep:
+    case Opcode::Add:
+    case Opcode::Sub:
+    case Opcode::Mul:
+    case Opcode::Neg:
+    case Opcode::Not:
+    case Opcode::ICmp:
+    case Opcode::FCmp:
+    case Opcode::Cast:
+        return true;
+    case Opcode::Alloca:
+    case Opcode::Load:
+    case Opcode::Store:
+    case Opcode::Div:
+    case Opcode::Mod:
+    case Opcode::Phi:
+    case Opcode::Call:
+    case Opcode::Br:
+    case Opcode::CondBr:
+    case Opcode::Ret:
+        return false;
+    }
+    return false;
+}
+
+bool hoistLoopInvariants(Function &function) {
+    if (function.blocks.size() < 2) {
+        return false;
+    }
+
+    const auto predecessors = computePredecessors(function);
+    std::unordered_map<std::string, int> blockIndex;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        blockIndex[function.blocks[i].name] = static_cast<int>(i);
+    }
+
+    std::unordered_map<int, int> defBlock;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        for (const auto &inst : function.blocks[i].instructions) {
+            if (inst.result >= 0) {
+                defBlock[inst.result] = static_cast<int>(i);
+            }
+        }
+    }
+
+    bool changed = false;
+    for (std::size_t tail = 0; tail < function.blocks.size(); ++tail) {
+        if (function.blocks[tail].instructions.empty()) {
+            continue;
+        }
+        const Instruction &term = function.blocks[tail].instructions.back();
+        std::vector<int> targets;
+        auto addTarget = [&](const std::string &name) {
+            const auto found = blockIndex.find(name);
+            if (found != blockIndex.end()) {
+                targets.push_back(found->second);
+            }
+        };
+        if (term.opcode == Opcode::Br) {
+            addTarget(term.text);
+        } else if (term.opcode == Opcode::CondBr) {
+            const std::size_t comma = term.text.find(',');
+            if (comma != std::string::npos) {
+                addTarget(term.text.substr(0, comma));
+                addTarget(term.text.substr(comma + 2));
+            }
+        }
+
+        for (int header : targets) {
+            if (header < 0 || header > static_cast<int>(tail)) {
+                continue;
+            }
+
+            std::unordered_set<int> loopBlocks;
+            loopBlocks.insert(header);
+            loopBlocks.insert(static_cast<int>(tail));
+            std::vector<int> stack{static_cast<int>(tail)};
+            while (!stack.empty()) {
+                const int current = stack.back();
+                stack.pop_back();
+                for (int pred : predecessors[static_cast<std::size_t>(current)]) {
+                    if (!loopBlocks.count(pred)) {
+                        loopBlocks.insert(pred);
+                        stack.push_back(pred);
+                    }
+                }
+            }
+
+            int preheader = -1;
+            for (int pred : predecessors[static_cast<std::size_t>(header)]) {
+                if (!loopBlocks.count(pred)) {
+                    if (preheader != -1) {
+                        preheader = -2;
+                        break;
+                    }
+                    preheader = pred;
+                }
+            }
+            if (preheader < 0 || function.blocks[static_cast<std::size_t>(preheader)].instructions.empty()) {
+                continue;
+            }
+
+            std::unordered_set<int> hoistedValues;
+            std::vector<Instruction> hoisted;
+            bool loopChanged = true;
+            while (loopChanged) {
+                loopChanged = false;
+                for (int blockId : loopBlocks) {
+                    auto &instructions = function.blocks[static_cast<std::size_t>(blockId)].instructions;
+                    std::vector<Instruction> kept;
+                    kept.reserve(instructions.size());
+                    for (auto &inst : instructions) {
+                        if (inst.result < 0 || !isHoistableOpcode(inst.opcode)) {
+                            kept.push_back(std::move(inst));
+                            continue;
+                        }
+                        bool invariant = true;
+                        for (const auto &operand : inst.operands) {
+                            if (operand.constant || operand.id < 0) {
+                                continue;
+                            }
+                            const auto def = defBlock.find(operand.id);
+                            if (def != defBlock.end() && loopBlocks.count(def->second) && !hoistedValues.count(operand.id)) {
+                                invariant = false;
+                                break;
+                            }
+                        }
+                        if (!invariant) {
+                            kept.push_back(std::move(inst));
+                            continue;
+                        }
+                        hoistedValues.insert(inst.result);
+                        hoisted.push_back(std::move(inst));
+                        loopChanged = true;
+                        changed = true;
+                    }
+                    instructions = std::move(kept);
+                }
+            }
+
+            if (!hoisted.empty()) {
+                auto &pre = function.blocks[static_cast<std::size_t>(preheader)].instructions;
+                auto insertPos = pre.end();
+                if (!pre.empty()) {
+                    --insertPos;
+                }
+                pre.insert(insertPos, std::make_move_iterator(hoisted.begin()), std::make_move_iterator(hoisted.end()));
+            }
+        }
+    }
+
+    return changed;
+}
+
 bool foldConstants(Function &function) {
     bool changed = false;
     std::unordered_map<int, Value> replacements;
@@ -817,11 +1538,19 @@ bool optimize(Module &module) {
     while (again) {
         again = false;
         for (auto &function : module.functions) {
+            if (truncateAfterTerminators(function)) {
+                changed = true;
+                again = true;
+            }
             if (promoteSingleBlockAllocas(function)) {
                 changed = true;
                 again = true;
             }
             if (forwardLocalMemory(function)) {
+                changed = true;
+                again = true;
+            }
+            if (forwardCrossBlockMemory(function)) {
                 changed = true;
                 again = true;
             }
@@ -841,6 +1570,10 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
+            if (hoistLoopInvariants(function)) {
+                changed = true;
+                again = true;
+            }
             if (eliminateDeadCode(function)) {
                 changed = true;
                 again = true;
@@ -848,6 +1581,36 @@ bool optimize(Module &module) {
             if (eliminateDeadAllocas(function)) {
                 changed = true;
                 again = true;
+            }
+        }
+    }
+    bool ssaAgain = true;
+    while (ssaAgain) {
+        ssaAgain = false;
+        for (auto &function : module.functions) {
+            if (truncateAfterTerminators(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (promoteScalarAllocasToSSA(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (foldConstants(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (eliminateCommonSubexpressions(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (eliminateDeadCode(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (eliminateDeadAllocas(function)) {
+                changed = true;
+                ssaAgain = true;
             }
         }
     }
