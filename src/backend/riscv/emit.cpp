@@ -554,6 +554,9 @@ private:
     }
 
     void emitCall(const CallExpr &call) {
+        if (call.callee == "starttime" || call.callee == "stoptime") {
+            return;
+        }
         int intCount = 0;
         int floatCount = 0;
         for (std::size_t i = 0; i < call.args.size(); ++i) {
