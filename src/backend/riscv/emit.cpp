@@ -657,6 +657,20 @@ private:
             }
         } else if (const auto *sub = dynamic_cast<const ArraySubscriptExpr *>(&target)) {
             const ValueKind targetKind = valueKind(target);
+            if (!arrayAddressMayCall(*sub)) {
+                if (targetKind == ValueKind::Float) {
+                    ensureFloat(sourceKind);
+                    out_ << "\tfmv.s ft1, fa0\n";
+                    emitArrayAddress(*sub);
+                    out_ << "\tfsw ft1, 0(a0)\n";
+                } else {
+                    ensureInt(sourceKind);
+                    out_ << "\tmv t4, a0\n";
+                    emitArrayAddress(*sub);
+                    out_ << "\tsw t4, 0(a0)\n";
+                }
+                return;
+            }
             if (targetKind == ValueKind::Float) {
                 ensureFloat(sourceKind);
                 pushFA0();
@@ -684,13 +698,24 @@ private:
         }
 
         const auto object = lookupLocal(base->name);
-        if (object.found && !object.global && isArrayParameter(base->name)) {
-                emitLoad("a0", "s0", object.offset, "ld");
-        } else if (object.found && !object.global) {
-            emitAddress("a0", "s0", object.offset);
-        } else {
-            out_ << "\tla a0, " << base->name << "\n";
+        if (indices.size() == 1) {
+            emitExpr(*indices[0]);
+            int stride = 1;
+            for (std::size_t j = 1; j < object.dims.size(); ++j) {
+                stride *= object.dims[j];
+            }
+            if (stride != 1) {
+                out_ << "\tli t0, " << stride << "\n";
+                out_ << "\tmulw a0, a0, t0\n";
+            }
+            out_ << "\tslli a0, a0, 2\n";
+            out_ << "\tmv t3, a0\n";
+            emitArrayBaseAddress("t2", base->name, object);
+            out_ << "\tadd a0, t2, t3\n";
+            return;
         }
+
+        emitArrayBaseAddress("a0", base->name, object);
         pushA0();
         for (std::size_t i = indices.size(); i > 0; --i) {
             emitExpr(*indices[i - 1]);
@@ -715,6 +740,16 @@ private:
         out_ << "\tadd a0, t0, t1\n";
     }
 
+    void emitArrayBaseAddress(const std::string &dst, const std::string &name, const ObjectInfo &object) {
+        if (object.found && !object.global && isArrayParameter(name)) {
+            emitLoad(dst, "s0", object.offset, "ld");
+        } else if (object.found && !object.global) {
+            emitAddress(dst, "s0", object.offset);
+        } else {
+            out_ << "\tla " << dst << ", " << name << "\n";
+        }
+    }
+
     const DeclRefExpr *collectArrayBase(const Expr &expr, std::vector<const Expr *> &indices) const {
         if (const auto *ref = dynamic_cast<const DeclRefExpr *>(&expr)) {
             return ref;
@@ -735,6 +770,33 @@ private:
         }
         const auto object = lookupLocal(base->name);
         return object.found && indices.size() < object.dims.size();
+    }
+
+    bool arrayAddressMayCall(const ArraySubscriptExpr &sub) const {
+        std::vector<const Expr *> indices;
+        collectArrayBase(sub, indices);
+        for (const Expr *index : indices) {
+            if (exprMayCall(*index)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool exprMayCall(const Expr &expr) const {
+        if (dynamic_cast<const CallExpr *>(&expr)) {
+            return true;
+        }
+        if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
+            return exprMayCall(*unary->operand);
+        }
+        if (const auto *binary = dynamic_cast<const BinaryExpr *>(&expr)) {
+            return exprMayCall(*binary->lhs) || exprMayCall(*binary->rhs);
+        }
+        if (const auto *sub = dynamic_cast<const ArraySubscriptExpr *>(&expr)) {
+            return exprMayCall(*sub->base) || exprMayCall(*sub->index);
+        }
+        return false;
     }
 
     void pushA0() {

@@ -24,11 +24,11 @@ grep -q 'ld a1' "$tmp_dir/call.s"
 
 "$root/compiler" "$root/tests/backend/array1.sy" -S -o "$tmp_dir/array1.s"
 grep -q 'sw a0' "$tmp_dir/array1.s"
-grep -q 'slli t1, t1, 2' "$tmp_dir/array1.s"
+grep -q 'slli a0, a0, 2' "$tmp_dir/array1.s"
 
 "$root/compiler" "$root/tests/backend/global_array.sy" -S -o "$tmp_dir/global_array.s"
 grep -q '^g:' "$tmp_dir/global_array.s"
-grep -q 'la a0, g' "$tmp_dir/global_array.s"
+grep -q 'la t2, g' "$tmp_dir/global_array.s"
 
 "$root/compiler" "$root/tests/backend/array2.sy" -S -o "$tmp_dir/array2.s"
 grep -q 'li t0, 3' "$tmp_dir/array2.s"
