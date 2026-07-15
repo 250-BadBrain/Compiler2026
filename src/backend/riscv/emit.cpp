@@ -94,13 +94,31 @@ private:
                         int index = 0;
                         collectArrayInitializer(*def->init, dimensionsOf(*def), 0, index, values);
                     }
-                    const int total = arrayElementCount(*def);
-                    for (int i = 0; i < total; ++i) {
-                        out_ << "\t.word " << staticInitializerValue(values[static_cast<std::size_t>(i)], var->type) << "\n";
-                    }
+                    emitStaticArrayInitializer(values, var->type);
                 }
             }
         }
+    }
+
+    void emitStaticArrayInitializer(const std::vector<const Expr *> &values, TypeSpecifier type) {
+        int zeroRun = 0;
+        const auto flushZeroRun = [&]() {
+            if (zeroRun > 0) {
+                out_ << "\t.zero " << zeroRun * 4 << "\n";
+                zeroRun = 0;
+            }
+        };
+
+        for (const Expr *expr : values) {
+            const std::string value = staticInitializerValue(expr, type);
+            if (value == "0") {
+                ++zeroRun;
+                continue;
+            }
+            flushZeroRun();
+            out_ << "\t.word " << value << "\n";
+        }
+        flushZeroRun();
     }
 
     void emitFunction(const FuncDef &func) {
