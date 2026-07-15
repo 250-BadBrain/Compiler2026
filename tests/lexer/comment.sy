@@ -1,0 +1,6 @@
+// single-line comment
+int main() {
+    /* block
+       comment */
+    return 0;
+}

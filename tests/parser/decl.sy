@@ -1,0 +1,10 @@
+const int ci = 1, ca[2][3] = {{1, 2}, {3}};
+float gf = 1.5;
+int arr[3] = {1, 2, 3};
+
+int main() {
+    int x = ci;
+    float y = gf + 2.0;
+    int local[2][2] = {{x}, {3, 4}};
+    return local[0][0];
+}

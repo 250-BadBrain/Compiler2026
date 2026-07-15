@@ -1,0 +1,8 @@
+int first_plus(int a[], int i) {
+    return a[0] + a[i];
+}
+
+int main() {
+    int a[4] = {2, 4, 6, 8};
+    return first_plus(a, 3);
+}

@@ -1,0 +1,6 @@
+const int N = 4;
+int g[N] = {1, 2, 3, 4};
+
+int main() {
+    return g[0];
+}

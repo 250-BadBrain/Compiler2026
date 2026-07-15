@@ -1,0 +1,19 @@
+int add(int a, int b) {
+    return a + b;
+}
+
+float mix(float x, int y, float z[]) {
+    return x + y + z[0];
+}
+
+void sink(int a[][3], float b[]) {
+    putf("%d\n", a[0][0]);
+    return;
+}
+
+int main() {
+    int a[2][3] = {};
+    float b[4] = {1.0, 2.0};
+    sink(a, b);
+    return add(1, 2);
+}

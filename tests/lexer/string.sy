@@ -1,0 +1,4 @@
+int main() {
+    putf("value=%d\n", 1);
+    return 0;
+}

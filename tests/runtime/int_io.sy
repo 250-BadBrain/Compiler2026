@@ -1,0 +1,7 @@
+int main() {
+    int a = getint();
+    int b = getint();
+    putint(a + b);
+    putch(10);
+    return a - b;
+}

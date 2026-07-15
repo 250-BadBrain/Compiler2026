@@ -1,0 +1,8 @@
+int pick(int a[][3], int i, int j) {
+    return a[i][j];
+}
+
+int main() {
+    int a[2][3] = {1, 2, 3, 4, 5, 6};
+    return pick(a, 1, 2);
+}
