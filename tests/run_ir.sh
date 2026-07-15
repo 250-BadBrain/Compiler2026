@@ -18,7 +18,7 @@ grep -q 'br while.end' "$tmp_dir/control.ir"
 
 "$root/compiler" --dump-ir "$root/tests/ir/call.sy" >"$tmp_dir/call.ir"
 grep -q 'func @add' "$tmp_dir/call.ir"
-grep -q 'call @add' "$tmp_dir/call.ir"
+grep -q 'call add' "$tmp_dir/call.ir"
 
 "$root/compiler" --dump-ir "$root/tests/ir/global.sy" >"$tmp_dir/global.ir"
 grep -q 'const @N' "$tmp_dir/global.ir"

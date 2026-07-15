@@ -1,5 +1,6 @@
 #include "emit.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1369,10 +1371,912 @@ private:
     int currentFrameSize_ = 4096;
 };
 
+class IRCodeGen {
+public:
+    IRCodeGen(const ir::Module &module, std::ostream &out) : module_(module), out_(out) {}
+
+    void run() {
+        emitGlobals();
+        out_ << "\t.text\n";
+        for (const auto &function : module_.functions) {
+            emitFunction(function);
+        }
+    }
+
+private:
+    void emitGlobals() {
+        if (module_.globals.empty()) {
+            return;
+        }
+        out_ << "\t.data\n";
+        for (const auto &global : module_.globals) {
+            out_ << "\t.globl " << global.name << "\n";
+            out_ << "\t.align 2\n";
+            out_ << global.name << ":\n";
+            int elements = 1;
+            for (int dim : global.dimensions) {
+                elements *= dim;
+            }
+            if (global.dimensions.empty()) {
+                out_ << "\t.word " << (global.initValues.empty() ? "0" : global.initValues.front()) << "\n";
+                continue;
+            }
+            int emitted = 0;
+            int zeroRun = 0;
+            auto flushZero = [&]() {
+                if (zeroRun != 0) {
+                    out_ << "\t.zero " << zeroRun * 4 << "\n";
+                    zeroRun = 0;
+                }
+            };
+            for (const auto &value : global.initValues) {
+                if (value == "0") {
+                    ++zeroRun;
+                } else {
+                    flushZero();
+                    out_ << "\t.word " << value << "\n";
+                }
+                ++emitted;
+            }
+            zeroRun += elements - emitted;
+            flushZero();
+        }
+    }
+
+    void emitFunction(const ir::Function &function) {
+        currentFunction_ = &function;
+        currentFunctionName_ = function.name;
+        valueOffsets_.clear();
+        allocaOffsets_.clear();
+        valueRegs_.clear();
+        valueFRegs_.clear();
+        scalarIntAllocas_.clear();
+        scalarFloatAllocas_.clear();
+        activeSavedIntRegs_.clear();
+        activeSavedFloatRegs_.clear();
+        blockLocalValues_.clear();
+        currentBlockLocalValues_ = nullptr;
+        nextIntReg_ = 0;
+        nextFloatReg_ = 0;
+        epilogueLabel_ = ".L" + function.name + ".ret";
+        analyzeRegisterAllocas(function);
+        prepareSavedRegisters(function);
+        nextOffset_ = firstLocalOffset();
+        collectValueSlots(function);
+        analyzeBlockLocalValues(function);
+        frameSize_ = alignTo(-nextOffset_ + 512, 16);
+        if (frameSize_ < 4096) {
+            frameSize_ = 4096;
+        }
+
+        out_ << "\t.align 1\n";
+        out_ << "\t.globl " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", @function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tli t0, " << frameSize_ << "\n";
+        out_ << "\tsub sp, sp, t0\n";
+        out_ << "\tadd t1, sp, t0\n";
+        out_ << "\tsd ra, -8(t1)\n";
+        out_ << "\tsd s0, -16(t1)\n";
+        for (std::size_t i = 0; i < activeSavedIntRegs_.size(); ++i) {
+            out_ << "\tsd " << activeSavedIntRegs_[i] << ", " << savedIntOffset(i) << "(t1)\n";
+        }
+        for (std::size_t i = 0; i < activeSavedFloatRegs_.size(); ++i) {
+            out_ << "\tfsd " << activeSavedFloatRegs_[i] << ", " << savedFloatOffset(i) << "(t1)\n";
+        }
+        out_ << "\tmv s0, t1\n";
+
+        int intParam = 0;
+        int floatParam = 0;
+        int stackParam = 0;
+        for (std::size_t i = 0; i < function.params.size(); ++i) {
+            valueOffsets_[function.params[i].id] = allocateSlot();
+            if (function.params[i].type.kind == ir::TypeKind::F32) {
+                if (floatParam < 8) {
+                    storeFReg("fa" + std::to_string(floatParam), valueOffsets_[function.params[i].id]);
+                } else {
+                    loadFReg("fa0", stackParam * 8);
+                    storeFReg("fa0", valueOffsets_[function.params[i].id]);
+                    ++stackParam;
+                }
+                ++floatParam;
+            } else {
+                if (intParam < 8) {
+                    storeReg("a" + std::to_string(intParam), valueOffsets_[function.params[i].id]);
+                } else {
+                    loadReg("a0", stackParam * 8);
+                    storeReg("a0", valueOffsets_[function.params[i].id]);
+                    ++stackParam;
+                }
+                ++intParam;
+            }
+        }
+
+        for (const auto &block : function.blocks) {
+            valueRegs_.clear();
+            valueFRegs_.clear();
+            nextIntReg_ = 0;
+            nextFloatReg_ = 0;
+            currentBlockLocalValues_ = &blockLocalValues_[block.name];
+            out_ << blockLabel(block.name) << ":\n";
+            for (const auto &inst : block.instructions) {
+                emitInst(inst);
+            }
+        }
+
+        out_ << epilogueLabel_ << ":\n";
+        out_ << "\tmv t1, s0\n";
+        for (std::size_t i = 0; i < activeSavedFloatRegs_.size(); ++i) {
+            out_ << "\tfld " << activeSavedFloatRegs_[i] << ", " << savedFloatOffset(i) << "(t1)\n";
+        }
+        for (std::size_t i = 0; i < activeSavedIntRegs_.size(); ++i) {
+            out_ << "\tld " << activeSavedIntRegs_[i] << ", " << savedIntOffset(i) << "(t1)\n";
+        }
+        out_ << "\tld ra, -8(t1)\n";
+        out_ << "\tld s0, -16(t1)\n";
+        out_ << "\tmv sp, t1\n";
+        out_ << "\tret\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+        currentFunction_ = nullptr;
+        currentFunctionName_.clear();
+        currentBlockLocalValues_ = nullptr;
+    }
+
+    void collectValueSlots(const ir::Function &function) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0 && inst.opcode != ir::Opcode::Alloca) {
+                    valueOffsets_[inst.result] = allocateSlot();
+                }
+                if (inst.opcode == ir::Opcode::Alloca && inst.result >= 0) {
+                    if (scalarIntAllocas_.count(inst.result) || scalarFloatAllocas_.count(inst.result)) {
+                        continue;
+                    }
+                    allocaOffsets_[inst.result] = allocateBytes(allocaBytes(inst.text));
+                }
+            }
+        }
+    }
+
+    void analyzeRegisterAllocas(const ir::Function &function) {
+        struct Candidate {
+            ir::TypeKind type = ir::TypeKind::I32;
+            bool escaped = false;
+            int uses = 0;
+        };
+        std::unordered_map<int, Candidate> candidates;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Alloca && inst.result >= 0 && allocaBytes(inst.text) == 4) {
+                    candidates[inst.result] = Candidate{};
+                }
+            }
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (std::size_t i = 0; i < inst.operands.size(); ++i) {
+                    const auto &operand = inst.operands[i];
+                    const auto found = candidates.find(operand.id);
+                    if (operand.constant || found == candidates.end()) {
+                        continue;
+                    }
+                    const bool loadAddress = inst.opcode == ir::Opcode::Load && i == 0;
+                    const bool storeAddress = inst.opcode == ir::Opcode::Store && i == 1;
+                    if (loadAddress) {
+                        found->second.type = inst.resultType.kind;
+                        ++found->second.uses;
+                    } else if (storeAddress) {
+                        found->second.type = inst.operands[0].type.kind;
+                        ++found->second.uses;
+                    } else {
+                        found->second.escaped = true;
+                    }
+                }
+            }
+        }
+
+        std::vector<std::pair<int, Candidate>> ints;
+        std::vector<std::pair<int, Candidate>> floats;
+        for (const auto &[id, candidate] : candidates) {
+            if (candidate.escaped || candidate.uses == 0) {
+                continue;
+            }
+            if (candidate.type == ir::TypeKind::F32) {
+                floats.push_back({id, candidate});
+            } else {
+                ints.push_back({id, candidate});
+            }
+        }
+        const auto hotter = [](const auto &lhs, const auto &rhs) {
+            if (lhs.second.uses != rhs.second.uses) {
+                return lhs.second.uses > rhs.second.uses;
+            }
+            return lhs.first < rhs.first;
+        };
+        std::sort(ints.begin(), ints.end(), hotter);
+        std::sort(floats.begin(), floats.end(), hotter);
+        for (std::size_t i = 0; i < ints.size() && i < scalarIntRegs().size(); ++i) {
+            scalarIntAllocas_[ints[i].first] = scalarIntRegs()[i];
+        }
+        for (std::size_t i = 0; i < floats.size() && i < scalarFloatRegs().size(); ++i) {
+            scalarFloatAllocas_[floats[i].first] = scalarFloatRegs()[i];
+        }
+    }
+
+    void prepareSavedRegisters(const ir::Function &function) {
+        auto addInt = [&](const std::string &reg) {
+            if (std::find(activeSavedIntRegs_.begin(), activeSavedIntRegs_.end(), reg) == activeSavedIntRegs_.end()) {
+                activeSavedIntRegs_.push_back(reg);
+            }
+        };
+        auto addFloat = [&](const std::string &reg) {
+            if (std::find(activeSavedFloatRegs_.begin(), activeSavedFloatRegs_.end(), reg) == activeSavedFloatRegs_.end()) {
+                activeSavedFloatRegs_.push_back(reg);
+            }
+        };
+
+        for (const auto &[_, reg] : scalarIntAllocas_) {
+            addInt(reg);
+        }
+        for (const auto &[_, reg] : scalarFloatAllocas_) {
+            addFloat(reg);
+        }
+        for (const auto &reg : intCacheRegs()) {
+            addInt(reg);
+        }
+
+        bool hasFloatValue = false;
+        for (const auto &param : function.params) {
+            hasFloatValue = hasFloatValue || param.type.kind == ir::TypeKind::F32;
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                hasFloatValue = hasFloatValue || inst.resultType.kind == ir::TypeKind::F32;
+                for (const auto &operand : inst.operands) {
+                    hasFloatValue = hasFloatValue || operand.type.kind == ir::TypeKind::F32;
+                }
+            }
+        }
+        if (hasFloatValue) {
+            for (const auto &reg : floatCacheRegs()) {
+                addFloat(reg);
+            }
+        }
+    }
+
+    void analyzeBlockLocalValues(const ir::Function &function) {
+        std::unordered_map<int, std::string> defBlock;
+        std::unordered_map<int, std::unordered_set<std::string>> useBlocks;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    defBlock[inst.result] = block.name;
+                }
+                for (const auto &operand : inst.operands) {
+                    if (!operand.constant && operand.id >= 0) {
+                        useBlocks[operand.id].insert(block.name);
+                    }
+                }
+            }
+        }
+        for (const auto &[id, blockName] : defBlock) {
+            const auto found = useBlocks.find(id);
+            if (found == useBlocks.end()) {
+                continue;
+            }
+            bool local = true;
+            for (const auto &useBlock : found->second) {
+                if (useBlock != blockName) {
+                    local = false;
+                    break;
+                }
+            }
+            if (local) {
+                blockLocalValues_[blockName].insert(id);
+            }
+        }
+    }
+
+    void emitInst(const ir::Instruction &inst) {
+        switch (inst.opcode) {
+        case ir::Opcode::Alloca:
+            break;
+        case ir::Opcode::Load:
+            if (!inst.operands[0].constant) {
+                const auto intAlloca = scalarIntAllocas_.find(inst.operands[0].id);
+                if (intAlloca != scalarIntAllocas_.end()) {
+                    out_ << "\tmv a0, " << intAlloca->second << "\n";
+                    storeResult(inst);
+                    break;
+                }
+                const auto floatAlloca = scalarFloatAllocas_.find(inst.operands[0].id);
+                if (floatAlloca != scalarFloatAllocas_.end()) {
+                    out_ << "\tfmv.s fa0, " << floatAlloca->second << "\n";
+                    storeFResult(inst);
+                    break;
+                }
+            }
+            emitAddressOperand(inst.operands[0]);
+            if (inst.resultType.kind == ir::TypeKind::F32) {
+                out_ << "\tflw fa0, 0(a0)\n";
+                storeFResult(inst);
+            } else {
+                out_ << "\tlw a0, 0(a0)\n";
+                storeResult(inst);
+            }
+            break;
+        case ir::Opcode::Store:
+            if (!inst.operands[1].constant) {
+                const auto intAlloca = scalarIntAllocas_.find(inst.operands[1].id);
+                if (intAlloca != scalarIntAllocas_.end()) {
+                    emitValueOperand(inst.operands[0]);
+                    out_ << "\tmv " << intAlloca->second << ", a0\n";
+                    break;
+                }
+                const auto floatAlloca = scalarFloatAllocas_.find(inst.operands[1].id);
+                if (floatAlloca != scalarFloatAllocas_.end()) {
+                    emitValueOperand(inst.operands[0]);
+                    out_ << "\tfmv.s " << floatAlloca->second << ", fa0\n";
+                    break;
+                }
+            }
+            if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+                emitValueOperand(inst.operands[0]);
+                emitAddressOperand(inst.operands[1]);
+                out_ << "\tfsw fa0, 0(a0)\n";
+            } else {
+                emitValueOperand(inst.operands[0]);
+                out_ << "\tmv t2, a0\n";
+                emitAddressOperand(inst.operands[1]);
+                out_ << "\tsw t2, 0(a0)\n";
+            }
+            break;
+        case ir::Opcode::Gep:
+            emitAddressOperand(inst.operands[0]);
+            out_ << "\tmv t2, a0\n";
+            if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32) {
+                const long long index = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
+                const long long offset = index * 4;
+                if (fitsI12IR(static_cast<int>(offset))) {
+                    out_ << "\taddi a0, t2, " << offset << "\n";
+                } else {
+                    out_ << "\tli a0, " << offset << "\n";
+                    out_ << "\tadd a0, t2, a0\n";
+                }
+            } else {
+                emitValueOperand(inst.operands[1]);
+                out_ << "\tslli a0, a0, 2\n";
+                out_ << "\tadd a0, t2, a0\n";
+            }
+            storeResult(inst);
+            break;
+        case ir::Opcode::Add:
+        case ir::Opcode::Sub:
+        case ir::Opcode::Mul:
+        case ir::Opcode::Div:
+        case ir::Opcode::Mod:
+        case ir::Opcode::ICmp:
+        case ir::Opcode::FCmp:
+            emitBinary(inst);
+            break;
+        case ir::Opcode::Call:
+            emitCall(inst);
+            break;
+        case ir::Opcode::Neg:
+            emitValueOperand(inst.operands[0]);
+            if (inst.resultType.kind == ir::TypeKind::F32) {
+                out_ << "\tfneg.s fa0, fa0\n";
+                storeFResult(inst);
+            } else {
+                out_ << "\tnegw a0, a0\n";
+                storeResult(inst);
+            }
+            break;
+        case ir::Opcode::Not:
+            emitValueOperand(inst.operands[0]);
+            if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+                out_ << "\tfmv.w.x ft0, zero\n";
+                out_ << "\tfeq.s a0, fa0, ft0\n";
+                storeResult(inst);
+                break;
+            }
+            out_ << "\tseqz a0, a0\n";
+            storeResult(inst);
+            break;
+        case ir::Opcode::Br:
+            out_ << "\tj " << blockLabel(inst.text) << "\n";
+            break;
+        case ir::Opcode::CondBr:
+            emitValueOperand(inst.operands[0]);
+            out_ << "\tbnez a0, " << blockLabel(inst.text.substr(0, inst.text.find(','))) << "\n";
+            out_ << "\tj " << blockLabel(inst.text.substr(inst.text.find(',') + 2)) << "\n";
+            break;
+        case ir::Opcode::Ret:
+            if (!inst.operands.empty()) {
+                emitValueOperand(inst.operands[0]);
+            }
+            out_ << "\tj " << epilogueLabel_ << "\n";
+            break;
+        case ir::Opcode::Cast:
+            emitCast(inst);
+            break;
+        case ir::Opcode::Phi:
+            break;
+        }
+    }
+
+    void emitBinary(const ir::Instruction &inst) {
+        if (inst.opcode == ir::Opcode::FCmp ||
+            inst.resultType.kind == ir::TypeKind::F32 ||
+            inst.operands[0].type.kind == ir::TypeKind::F32 ||
+            inst.operands[1].type.kind == ir::TypeKind::F32) {
+            emitFloatBinary(inst);
+            return;
+        }
+        if (emitImmediateBinary(inst)) {
+            return;
+        }
+        emitValueOperand(inst.operands[0]);
+        out_ << "\tmv t0, a0\n";
+        emitValueOperand(inst.operands[1]);
+        switch (inst.opcode) {
+        case ir::Opcode::Add: out_ << "\taddw a0, t0, a0\n"; break;
+        case ir::Opcode::Sub: out_ << "\tsubw a0, t0, a0\n"; break;
+        case ir::Opcode::Mul: out_ << "\tmulw a0, t0, a0\n"; break;
+        case ir::Opcode::Div: out_ << "\tdivw a0, t0, a0\n"; break;
+        case ir::Opcode::Mod: out_ << "\tremw a0, t0, a0\n"; break;
+        case ir::Opcode::ICmp:
+            if (inst.text == "lt") out_ << "\tslt a0, t0, a0\n";
+            else if (inst.text == "gt") out_ << "\tslt a0, a0, t0\n";
+            else if (inst.text == "eq") { out_ << "\tsubw a0, t0, a0\n"; out_ << "\tseqz a0, a0\n"; }
+            else if (inst.text == "ne") { out_ << "\tsubw a0, t0, a0\n"; out_ << "\tsnez a0, a0\n"; }
+            else if (inst.text == "le") { out_ << "\tslt a0, a0, t0\n"; out_ << "\txori a0, a0, 1\n"; }
+            else if (inst.text == "ge") { out_ << "\tslt a0, t0, a0\n"; out_ << "\txori a0, a0, 1\n"; }
+            break;
+        default:
+            break;
+        }
+        storeResult(inst);
+    }
+
+    bool emitImmediateBinary(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2 || !inst.operands[1].constant || inst.operands[1].type.kind != ir::TypeKind::I32) {
+            return false;
+        }
+        const long long rhs = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
+        switch (inst.opcode) {
+        case ir::Opcode::Add:
+            if (!fitsI12IR(static_cast<int>(rhs))) return false;
+            emitValueOperand(inst.operands[0]);
+            out_ << "\taddiw a0, a0, " << rhs << "\n";
+            storeResult(inst);
+            return true;
+        case ir::Opcode::Sub:
+            if (!fitsI12IR(static_cast<int>(-rhs))) return false;
+            emitValueOperand(inst.operands[0]);
+            out_ << "\taddiw a0, a0, " << -rhs << "\n";
+            storeResult(inst);
+            return true;
+        case ir::Opcode::Mul:
+            if (rhs > 0 && isPowerOfTwo(rhs)) {
+                emitValueOperand(inst.operands[0]);
+                out_ << "\tslliw a0, a0, " << log2Int(rhs) << "\n";
+                storeResult(inst);
+                return true;
+            }
+            return false;
+        case ir::Opcode::ICmp:
+            if (inst.text == "lt" && fitsI12IR(static_cast<int>(rhs))) {
+                emitValueOperand(inst.operands[0]);
+                out_ << "\tslti a0, a0, " << rhs << "\n";
+                storeResult(inst);
+                return true;
+            }
+            if (inst.text == "ge" && fitsI12IR(static_cast<int>(rhs))) {
+                emitValueOperand(inst.operands[0]);
+                out_ << "\tslti a0, a0, " << rhs << "\n";
+                out_ << "\txori a0, a0, 1\n";
+                storeResult(inst);
+                return true;
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+
+    void emitFloatBinary(const ir::Instruction &inst) {
+        emitValueOperand(inst.operands[0]);
+        out_ << "\tfmv.s ft0, fa0\n";
+        emitValueOperand(inst.operands[1]);
+        switch (inst.opcode) {
+        case ir::Opcode::Add: out_ << "\tfadd.s fa0, ft0, fa0\n"; storeFResult(inst); break;
+        case ir::Opcode::Sub: out_ << "\tfsub.s fa0, ft0, fa0\n"; storeFResult(inst); break;
+        case ir::Opcode::Mul: out_ << "\tfmul.s fa0, ft0, fa0\n"; storeFResult(inst); break;
+        case ir::Opcode::Div: out_ << "\tfdiv.s fa0, ft0, fa0\n"; storeFResult(inst); break;
+        case ir::Opcode::FCmp:
+            if (inst.text == "lt") out_ << "\tflt.s a0, ft0, fa0\n";
+            else if (inst.text == "gt") out_ << "\tflt.s a0, fa0, ft0\n";
+            else if (inst.text == "le") out_ << "\tfle.s a0, ft0, fa0\n";
+            else if (inst.text == "ge") out_ << "\tfle.s a0, fa0, ft0\n";
+            else if (inst.text == "eq") out_ << "\tfeq.s a0, ft0, fa0\n";
+            else if (inst.text == "ne") { out_ << "\tfeq.s a0, ft0, fa0\n"; out_ << "\txori a0, a0, 1\n"; }
+            storeResult(inst);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void emitCast(const ir::Instruction &inst) {
+        emitValueOperand(inst.operands[0]);
+        if (inst.text == "i2f") {
+            out_ << "\tfcvt.s.w fa0, a0\n";
+            storeFResult(inst);
+        } else if (inst.text == "f2i") {
+            out_ << "\tfcvt.w.s a0, fa0, rtz\n";
+            storeResult(inst);
+        }
+    }
+
+    void emitCall(const ir::Instruction &inst) {
+        if (inst.text == "starttime" || inst.text == "stoptime") {
+            return;
+        }
+        int intArgs = 0;
+        int floatArgs = 0;
+        for (const auto &operand : inst.operands) {
+            if (operand.type.kind == ir::TypeKind::F32) {
+                ++floatArgs;
+            } else {
+                ++intArgs;
+            }
+        }
+        const std::size_t stackArgs = static_cast<std::size_t>((intArgs > 8 ? intArgs - 8 : 0) + (floatArgs > 8 ? floatArgs - 8 : 0));
+        const int stackBytes = alignTo(static_cast<int>(stackArgs) * 8, 16);
+        if (stackBytes != 0) {
+            out_ << "\tli t6, " << stackBytes << "\n";
+            out_ << "\tsub sp, sp, t6\n";
+        }
+        out_ << "\tmv t5, sp\n";
+        int intIndex = 0;
+        int floatIndex = 0;
+        int stackIndex = 0;
+        std::vector<std::pair<ir::TypeKind, int>> saved;
+        for (const auto &operand : inst.operands) {
+            emitValueOperand(operand);
+            if (operand.type.kind == ir::TypeKind::F32) {
+                if (floatIndex < 8) {
+                    out_ << "\taddi sp, sp, -16\n";
+                    out_ << "\tfsw fa0, 8(sp)\n";
+                    saved.push_back({ir::TypeKind::F32, floatIndex});
+                } else {
+                    storeFBase("fa0", "t5", stackIndex * 8);
+                    ++stackIndex;
+                }
+                ++floatIndex;
+            } else {
+                if (intIndex < 8) {
+                    out_ << "\taddi sp, sp, -16\n";
+                    out_ << "\tsd a0, 8(sp)\n";
+                    saved.push_back({ir::TypeKind::I32, intIndex});
+                } else {
+                    storeBase("a0", "t5", stackIndex * 8);
+                    ++stackIndex;
+                }
+                ++intIndex;
+            }
+        }
+        for (std::size_t i = saved.size(); i > 0; --i) {
+            const auto [kind, index] = saved[i - 1];
+            if (kind == ir::TypeKind::F32) {
+                out_ << "\tflw fa" << index << ", 8(sp)\n";
+            } else {
+                out_ << "\tld a" << index << ", 8(sp)\n";
+            }
+            out_ << "\taddi sp, sp, 16\n";
+        }
+        out_ << "\tcall " << inst.text << "\n";
+        if (stackBytes != 0) {
+            out_ << "\tli t6, " << stackBytes << "\n";
+            out_ << "\tadd sp, sp, t6\n";
+        }
+        if (inst.result >= 0) {
+            if (inst.resultType.kind == ir::TypeKind::F32) {
+                storeFResult(inst);
+            } else {
+                storeResult(inst);
+            }
+        }
+    }
+
+    void emitValueOperand(const ir::Value &value) {
+        if (value.constant) {
+            if (!value.name.empty() && value.name[0] == '@') {
+                out_ << "\tla a0, " << value.name.substr(1) << "\n";
+            } else if (value.type.kind == ir::TypeKind::F32) {
+                const float f = static_cast<float>(std::strtof(value.name.c_str(), nullptr));
+                out_ << "\tli t0, " << irFloatBits(f) << "\n";
+                out_ << "\tfmv.w.x fa0, t0\n";
+            } else {
+                out_ << "\tli a0, " << value.name << "\n";
+            }
+            return;
+        }
+        const auto alloca = allocaOffsets_.find(value.id);
+        if (alloca != allocaOffsets_.end()) {
+            addressReg("a0", alloca->second);
+            return;
+        }
+        const auto intReg = valueRegs_.find(value.id);
+        if (intReg != valueRegs_.end()) {
+            out_ << "\tmv a0, " << intReg->second << "\n";
+            return;
+        }
+        const auto floatReg = valueFRegs_.find(value.id);
+        if (floatReg != valueFRegs_.end()) {
+            out_ << "\tfmv.s fa0, " << floatReg->second << "\n";
+            return;
+        }
+        if (value.type.kind == ir::TypeKind::F32) {
+            loadFReg("fa0", valueOffsets_[value.id]);
+        } else {
+            loadReg("a0", valueOffsets_[value.id]);
+        }
+    }
+
+    void emitAddressOperand(const ir::Value &value) {
+        if (value.constant && !value.name.empty() && value.name[0] == '@') {
+            out_ << "\tla a0, " << value.name.substr(1) << "\n";
+            return;
+        }
+        const auto alloca = allocaOffsets_.find(value.id);
+        if (alloca != allocaOffsets_.end()) {
+            addressReg("a0", alloca->second);
+            return;
+        }
+        const auto intReg = valueRegs_.find(value.id);
+        if (intReg != valueRegs_.end()) {
+            out_ << "\tmv a0, " << intReg->second << "\n";
+            return;
+        }
+        loadReg("a0", valueOffsets_[value.id]);
+    }
+
+    void storeResult(const ir::Instruction &inst) {
+        if (cacheResult(inst.result, inst.resultType) && isCurrentBlockLocal(inst.result)) {
+            return;
+        }
+        storeReg("a0", valueOffsets_[inst.result]);
+    }
+
+    void storeFResult(const ir::Instruction &inst) {
+        if (cacheResult(inst.result, inst.resultType) && isCurrentBlockLocal(inst.result)) {
+            return;
+        }
+        storeFReg("fa0", valueOffsets_[inst.result]);
+    }
+
+    bool cacheResult(int id, ir::Type type) {
+        if (id < 0) {
+            return false;
+        }
+        if (type.kind == ir::TypeKind::F32) {
+            if (nextFloatReg_ >= floatCacheRegs().size()) {
+                return false;
+            }
+            const std::string &reg = floatCacheRegs()[nextFloatReg_++];
+            out_ << "\tfmv.s " << reg << ", fa0\n";
+            valueFRegs_[id] = reg;
+            return true;
+        }
+        if (type.kind == ir::TypeKind::I32 || type.kind == ir::TypeKind::Ptr) {
+            if (nextIntReg_ >= intCacheRegs().size()) {
+                return false;
+            }
+            const std::string &reg = intCacheRegs()[nextIntReg_++];
+            out_ << "\tmv " << reg << ", a0\n";
+            valueRegs_[id] = reg;
+            return true;
+        }
+        return false;
+    }
+
+    bool isCurrentBlockLocal(int id) const {
+        return currentBlockLocalValues_ && currentBlockLocalValues_->count(id) != 0;
+    }
+
+    int allocateSlot() {
+        return allocateBytes(8);
+    }
+
+    int allocateBytes(int bytes) {
+        const int aligned = ((bytes + 7) / 8) * 8;
+        nextOffset_ -= aligned - 8;
+        const int offset = nextOffset_;
+        nextOffset_ -= 8;
+        return offset;
+    }
+
+    int allocaBytes(const std::string &text) const {
+        const std::size_t colon = text.find(':');
+        if (colon == std::string::npos) {
+            return 8;
+        }
+        return std::strtol(text.c_str() + colon + 1, nullptr, 10);
+    }
+
+    void loadReg(const std::string &reg, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tld " << reg << ", " << offset << "(s0)\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, s0, t6\n";
+        out_ << "\tld " << reg << ", 0(t6)\n";
+    }
+
+    void storeReg(const std::string &reg, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tsd " << reg << ", " << offset << "(s0)\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, s0, t6\n";
+        out_ << "\tsd " << reg << ", 0(t6)\n";
+    }
+
+    void loadFReg(const std::string &reg, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tflw " << reg << ", " << offset << "(s0)\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, s0, t6\n";
+        out_ << "\tflw " << reg << ", 0(t6)\n";
+    }
+
+    void storeFReg(const std::string &reg, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tfsw " << reg << ", " << offset << "(s0)\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, s0, t6\n";
+        out_ << "\tfsw " << reg << ", 0(t6)\n";
+    }
+
+    void storeBase(const std::string &reg, const std::string &base, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tsd " << reg << ", " << offset << '(' << base << ")\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, " << base << ", t6\n";
+        out_ << "\tsd " << reg << ", 0(t6)\n";
+    }
+
+    void storeFBase(const std::string &reg, const std::string &base, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\tfsw " << reg << ", " << offset << '(' << base << ")\n";
+            return;
+        }
+        out_ << "\tli t6, " << offset << "\n";
+        out_ << "\tadd t6, " << base << ", t6\n";
+        out_ << "\tfsw " << reg << ", 0(t6)\n";
+    }
+
+    void addressReg(const std::string &reg, int offset) {
+        if (fitsI12IR(offset)) {
+            out_ << "\taddi " << reg << ", s0, " << offset << "\n";
+            return;
+        }
+        out_ << "\tli " << reg << ", " << offset << "\n";
+        out_ << "\tadd " << reg << ", s0, " << reg << "\n";
+    }
+
+    std::string blockLabel(const std::string &name) const {
+        return ".Lir." + currentFunctionName_ + "." + name;
+    }
+
+    static bool fitsI12IR(int value) {
+        return value >= -2048 && value <= 2047;
+    }
+
+    static bool isPowerOfTwo(long long value) {
+        return value > 0 && (value & (value - 1)) == 0;
+    }
+
+    static int log2Int(long long value) {
+        int shift = 0;
+        while (value > 1) {
+            value >>= 1;
+            ++shift;
+        }
+        return shift;
+    }
+
+    static int alignTo(int value, int align) {
+        return ((value + align - 1) / align) * align;
+    }
+
+    static const std::vector<std::string> &savedIntRegs() {
+        static const std::vector<std::string> regs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &savedFloatRegs() {
+        static const std::vector<std::string> regs = {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &scalarIntRegs() {
+        static const std::vector<std::string> regs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &scalarFloatRegs() {
+        static const std::vector<std::string> regs = {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &intCacheRegs() {
+        static const std::vector<std::string> regs = {"s9", "s10", "s11"};
+        return regs;
+    }
+
+    static const std::vector<std::string> &floatCacheRegs() {
+        static const std::vector<std::string> regs = {"fs8", "fs9", "fs10", "fs11"};
+        return regs;
+    }
+
+    int savedIntOffset(std::size_t index) const {
+        return -24 - static_cast<int>(index) * 8;
+    }
+
+    int savedFloatOffset(std::size_t index) const {
+        return -24 - static_cast<int>(activeSavedIntRegs_.size()) * 8 - static_cast<int>(index) * 8;
+    }
+
+    int firstLocalOffset() const {
+        return -24 - static_cast<int>(activeSavedIntRegs_.size() + activeSavedFloatRegs_.size()) * 8;
+    }
+
+    static std::uint32_t irFloatBits(float value) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    const ir::Module &module_;
+    std::ostream &out_;
+    const ir::Function *currentFunction_ = nullptr;
+    std::string currentFunctionName_;
+    std::unordered_map<int, int> valueOffsets_;
+    std::unordered_map<int, int> allocaOffsets_;
+    std::unordered_map<int, std::string> valueRegs_;
+    std::unordered_map<int, std::string> valueFRegs_;
+    std::unordered_map<int, std::string> scalarIntAllocas_;
+    std::unordered_map<int, std::string> scalarFloatAllocas_;
+    std::vector<std::string> activeSavedIntRegs_;
+    std::vector<std::string> activeSavedFloatRegs_;
+    std::unordered_map<std::string, std::unordered_set<int>> blockLocalValues_;
+    const std::unordered_set<int> *currentBlockLocalValues_ = nullptr;
+    std::string epilogueLabel_;
+    std::size_t nextIntReg_ = 0;
+    std::size_t nextFloatReg_ = 0;
+    int nextOffset_ = -24;
+    int frameSize_ = 4096;
+};
+
 } // namespace
 
 void emitAssembly(const TranslationUnit &unit, std::ostream &out) {
     CodeGen(unit, out).run();
+}
+
+void emitAssembly(const ir::Module &module, std::ostream &out) {
+    IRCodeGen(module, out).run();
 }
 
 } // namespace sysyc::riscv
