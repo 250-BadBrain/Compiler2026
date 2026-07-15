@@ -625,6 +625,14 @@ int nextValueId(const Function &function) {
     return next;
 }
 
+bool hugeFunction(const Function &function) {
+    std::size_t instructions = 0;
+    for (const auto &block : function.blocks) {
+        instructions += block.instructions.size();
+    }
+    return function.blocks.size() > 1000 || instructions > 30000;
+}
+
 std::unordered_map<int, Type> scalarAllocaTypes(const Function &function, const std::unordered_set<int> &allocas) {
     std::unordered_map<int, Type> types;
     for (int id : allocas) {
@@ -649,6 +657,9 @@ std::unordered_map<int, Type> scalarAllocaTypes(const Function &function, const 
 }
 
 bool promoteScalarAllocasToSSA(Function &function) {
+    if (hugeFunction(function)) {
+        return false;
+    }
     const std::unordered_set<int> allocas = promotableScalarAllocas(function);
     if (allocas.empty() || function.blocks.empty()) {
         return false;
@@ -978,6 +989,9 @@ bool promoteScalarAllocasToSSA(Function &function) {
 }
 
 bool forwardCrossBlockMemory(Function &function) {
+    if (hugeFunction(function)) {
+        return false;
+    }
     const std::unordered_set<int> candidates = promotableScalarAllocas(function);
     if (candidates.empty() || function.blocks.empty()) {
         return false;
@@ -1100,7 +1114,7 @@ bool isHoistableOpcode(Opcode opcode) {
 }
 
 bool hoistLoopInvariants(Function &function) {
-    if (function.blocks.size() < 2) {
+    if (function.blocks.size() < 2 || hugeFunction(function)) {
         return false;
     }
 

@@ -1,11 +1,13 @@
 #include "emit.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <ostream>
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1390,6 +1392,16 @@ private:
         ir::Value source;
     };
 
+    struct Interval {
+        int id = -1;
+        ir::TypeKind type = ir::TypeKind::I32;
+        int start = 0;
+        int end = 0;
+        int weight = 0;
+        bool crossBlock = false;
+        bool phi = false;
+    };
+
     void emitGlobals() {
         if (module_.globals.empty()) {
             return;
@@ -1449,6 +1461,7 @@ private:
         nextIntReg_ = 0;
         nextFloatReg_ = 0;
         nextPhiEdgeLabel_ = 0;
+        useLongJumps_ = needsLongJumps(function);
         epilogueLabel_ = ".L" + function.name + ".ret";
         analyzeRegisterAllocas(function);
         buildPhiCopies(function);
@@ -1607,68 +1620,242 @@ private:
         }
     }
 
-    void analyzeGlobalValueRegisters(const ir::Function &function) {
-        struct Candidate {
-            ir::TypeKind type = ir::TypeKind::I32;
-            int uses = 0;
-            bool crossBlock = false;
-            bool phi = false;
-        };
+    static bool hugeControlFlowFunction(const ir::Function &function) {
+        std::size_t instructions = 0;
+        for (const auto &block : function.blocks) {
+            instructions += block.instructions.size();
+        }
+        return function.blocks.size() > 1000 || instructions > 30000;
+    }
 
-        std::unordered_map<int, Candidate> candidates;
+    void analyzeGlobalValueRegisters(const ir::Function &function) {
+        if (hugeControlFlowFunction(function)) {
+            return;
+        }
+        std::unordered_map<int, Interval> intervals;
         std::unordered_map<int, std::string> defBlock;
-        auto addCandidate = [&](int id, ir::Type type, const std::string &blockName, bool isPhi) {
+        std::unordered_map<int, std::unordered_set<std::string>> useBlocks;
+        std::unordered_map<std::string, int> blockStart;
+        std::unordered_map<std::string, int> blockEnd;
+        int position = 1;
+        for (const auto &block : function.blocks) {
+            blockStart[block.name] = position;
+            position += std::max<std::size_t>(1, block.instructions.size());
+            blockEnd[block.name] = position;
+            ++position;
+        }
+
+        auto addInterval = [&](int id, ir::Type type, const std::string &blockName, int start, bool isPhi) {
             if (id < 0 || type.kind == ir::TypeKind::Void) {
                 return;
             }
-            Candidate &candidate = candidates[id];
-            candidate.type = type.kind;
-            candidate.phi = candidate.phi || isPhi;
+            Interval &interval = intervals[id];
+            interval.id = id;
+            interval.type = type.kind;
+            interval.start = interval.start == 0 ? start : std::min(interval.start, start);
+            interval.end = std::max(interval.end, start);
+            interval.phi = interval.phi || isPhi;
             defBlock[id] = blockName;
         };
 
         for (const auto &param : function.params) {
-            addCandidate(param.id, param.type, "entry", false);
-            candidates[param.id].crossBlock = true;
+            addInterval(param.id, param.type, function.blocks.empty() ? "entry" : function.blocks.front().name, 0, false);
+            intervals[param.id].crossBlock = true;
+            intervals[param.id].weight += 4;
         }
         for (const auto &block : function.blocks) {
+            int instPos = blockStart[block.name];
             for (const auto &inst : block.instructions) {
                 if (inst.opcode != ir::Opcode::Alloca) {
-                    addCandidate(inst.result, inst.resultType, block.name, inst.opcode == ir::Opcode::Phi);
+                    const int defPos = inst.opcode == ir::Opcode::Phi ? blockStart[block.name] : instPos;
+                    addInterval(inst.result, inst.resultType, block.name, defPos, inst.opcode == ir::Opcode::Phi);
                 }
+                ++instPos;
             }
         }
 
         for (const auto &block : function.blocks) {
+            int instPos = blockStart[block.name];
             for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Phi) {
+                    ++instPos;
+                    continue;
+                }
                 for (const auto &operand : inst.operands) {
                     if (operand.constant || operand.id < 0) {
                         continue;
                     }
-                    const auto found = candidates.find(operand.id);
-                    if (found == candidates.end()) {
+                    const auto found = intervals.find(operand.id);
+                    if (found == intervals.end()) {
                         continue;
                     }
-                    found->second.uses += inst.opcode == ir::Opcode::Phi ? 3 : 1;
+                    found->second.end = std::max(found->second.end, instPos);
+                    found->second.weight += 1;
+                    useBlocks[operand.id].insert(block.name);
                     const auto def = defBlock.find(operand.id);
                     if (def != defBlock.end() && def->second != block.name) {
                         found->second.crossBlock = true;
                     }
                 }
+                ++instPos;
             }
         }
         for (const auto &[_, copies] : phiCopies_) {
+            const std::size_t separator = _.find('\n');
+            const std::string pred = separator == std::string::npos ? std::string{} : _.substr(0, separator);
+            const std::string succ = separator == std::string::npos ? std::string{} : _.substr(separator + 1);
+            const int sourceUsePos = blockEnd.count(pred) ? blockEnd[pred] : position;
+            const int targetDefPos = blockStart.count(succ) ? blockStart[succ] : 0;
             for (const PhiCopy &copy : copies) {
-                auto source = candidates.find(copy.source.id);
-                if (!copy.source.constant && source != candidates.end()) {
-                    source->second.uses += 2;
+                auto source = intervals.find(copy.source.id);
+                if (!copy.source.constant && source != intervals.end()) {
+                    source->second.end = std::max(source->second.end, sourceUsePos);
+                    source->second.weight += 3;
                     source->second.crossBlock = true;
+                    useBlocks[copy.source.id].insert(pred);
                 }
-                auto target = candidates.find(copy.target);
-                if (target != candidates.end()) {
-                    target->second.uses += 4;
+                auto target = intervals.find(copy.target);
+                if (target != intervals.end()) {
+                    target->second.start = std::min(target->second.start, targetDefPos);
+                    target->second.end = std::max(target->second.end, targetDefPos);
+                    target->second.weight += 6;
                     target->second.crossBlock = true;
                     target->second.phi = true;
+                }
+            }
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> successors;
+        std::unordered_map<std::string, std::vector<std::string>> predecessors;
+        for (const auto &block : function.blocks) {
+            if (block.instructions.empty()) {
+                continue;
+            }
+            const ir::Instruction &term = block.instructions.back();
+            if (term.opcode == ir::Opcode::Br) {
+                successors[block.name].push_back(term.text);
+                predecessors[term.text].push_back(block.name);
+            } else if (term.opcode == ir::Opcode::CondBr) {
+                const std::size_t comma = term.text.find(',');
+                if (comma != std::string::npos) {
+                    const std::string trueLabel = trimLabel(term.text.substr(0, comma));
+                    const std::string falseLabel = trimLabel(term.text.substr(comma + 1));
+                    successors[block.name].push_back(trueLabel);
+                    successors[block.name].push_back(falseLabel);
+                    predecessors[trueLabel].push_back(block.name);
+                    predecessors[falseLabel].push_back(block.name);
+                }
+            }
+        }
+
+        std::unordered_set<std::string> allBlocks;
+        for (const auto &block : function.blocks) {
+            allBlocks.insert(block.name);
+        }
+        std::unordered_map<std::string, std::unordered_set<std::string>> dominators;
+        for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+            dominators[function.blocks[i].name] = i == 0 ? std::unordered_set<std::string>{function.blocks[i].name} : allBlocks;
+        }
+        bool domChanged = true;
+        while (domChanged) {
+            domChanged = false;
+            for (std::size_t i = 1; i < function.blocks.size(); ++i) {
+                const std::string &name = function.blocks[i].name;
+                std::unordered_set<std::string> next = allBlocks;
+                if (predecessors[name].empty()) {
+                    next.clear();
+                }
+                for (const std::string &pred : predecessors[name]) {
+                    std::unordered_set<std::string> intersection;
+                    for (const std::string &candidate : next) {
+                        if (dominators[pred].count(candidate)) {
+                            intersection.insert(candidate);
+                        }
+                    }
+                    next = std::move(intersection);
+                }
+                next.insert(name);
+                if (next != dominators[name]) {
+                    dominators[name] = std::move(next);
+                    domChanged = true;
+                }
+            }
+        }
+
+        std::unordered_map<std::string, std::unordered_set<int>> use;
+        std::unordered_map<std::string, std::unordered_set<int>> def;
+        for (const auto &block : function.blocks) {
+            std::unordered_set<int> seenDef;
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0 && intervals.count(inst.result)) {
+                    def[block.name].insert(inst.result);
+                    seenDef.insert(inst.result);
+                }
+                if (inst.opcode == ir::Opcode::Phi) {
+                    continue;
+                }
+                for (const auto &operand : inst.operands) {
+                    if (operand.constant || operand.id < 0 || !intervals.count(operand.id)) {
+                        continue;
+                    }
+                    if (!seenDef.count(operand.id)) {
+                        use[block.name].insert(operand.id);
+                    }
+                }
+            }
+        }
+        for (const auto &[key, copies] : phiCopies_) {
+            const std::size_t separator = key.find('\n');
+            const std::string pred = separator == std::string::npos ? std::string{} : key.substr(0, separator);
+            for (const PhiCopy &copy : copies) {
+                if (!copy.source.constant && intervals.count(copy.source.id) && !def[pred].count(copy.source.id)) {
+                    use[pred].insert(copy.source.id);
+                }
+            }
+        }
+
+        std::unordered_map<std::string, std::unordered_set<int>> liveIn;
+        std::unordered_map<std::string, std::unordered_set<int>> liveOut;
+        bool liveChanged = true;
+        while (liveChanged) {
+            liveChanged = false;
+            for (auto it = function.blocks.rbegin(); it != function.blocks.rend(); ++it) {
+                const std::string &name = it->name;
+                std::unordered_set<int> nextOut;
+                for (const std::string &succ : successors[name]) {
+                    nextOut.insert(liveIn[succ].begin(), liveIn[succ].end());
+                }
+                std::unordered_set<int> nextIn = use[name];
+                for (int id : nextOut) {
+                    if (!def[name].count(id)) {
+                        nextIn.insert(id);
+                    }
+                }
+                if (nextOut != liveOut[name]) {
+                    liveOut[name] = std::move(nextOut);
+                    liveChanged = true;
+                }
+                if (nextIn != liveIn[name]) {
+                    liveIn[name] = std::move(nextIn);
+                    liveChanged = true;
+                }
+            }
+        }
+
+        for (const auto &block : function.blocks) {
+            const int start = blockStart[block.name];
+            const int end = blockEnd[block.name];
+            for (int id : liveIn[block.name]) {
+                auto found = intervals.find(id);
+                if (found != intervals.end()) {
+                    found->second.start = std::min(found->second.start, start);
+                    found->second.end = std::max(found->second.end, end);
+                }
+            }
+            for (int id : liveOut[block.name]) {
+                auto found = intervals.find(id);
+                if (found != intervals.end()) {
+                    found->second.end = std::max(found->second.end, end);
                 }
             }
         }
@@ -1682,49 +1869,80 @@ private:
             usedFloatRegs.insert(reg);
         }
 
-        std::vector<std::pair<int, Candidate>> ints;
-        std::vector<std::pair<int, Candidate>> floats;
-        for (const auto &[id, candidate] : candidates) {
-            if (!candidate.phi || !candidate.crossBlock || candidate.uses < 2) {
+        std::vector<Interval> ints;
+        std::vector<Interval> floats;
+        for (auto [id, interval] : intervals) {
+            bool dominatesUses = interval.phi;
+            if (!dominatesUses) {
+                const auto def = defBlock.find(id);
+                dominatesUses = def != defBlock.end();
+                if (dominatesUses) {
+                    for (const std::string &useBlock : useBlocks[id]) {
+                        if (!dominators[useBlock].count(def->second)) {
+                            dominatesUses = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!interval.phi || !dominatesUses || !interval.crossBlock || interval.weight < 2 || interval.end <= interval.start) {
                 continue;
             }
-            if (candidate.type == ir::TypeKind::F32) {
-                floats.push_back({id, candidate});
-            } else if (candidate.type == ir::TypeKind::I32 || candidate.type == ir::TypeKind::Ptr) {
-                ints.push_back({id, candidate});
+            interval.weight += interval.phi ? 120 : 0;
+            if (interval.type == ir::TypeKind::F32) {
+                floats.push_back(interval);
+            } else if (interval.type == ir::TypeKind::I32 || interval.type == ir::TypeKind::Ptr) {
+                ints.push_back(interval);
             }
         }
-        const auto hotter = [](const auto &lhs, const auto &rhs) {
-            const int lhsScore = lhs.second.uses + (lhs.second.phi ? 100 : 0);
-            const int rhsScore = rhs.second.uses + (rhs.second.phi ? 100 : 0);
-            if (lhsScore != rhsScore) {
-                return lhsScore > rhsScore;
-            }
-            return lhs.first < rhs.first;
-        };
-        std::sort(ints.begin(), ints.end(), hotter);
-        std::sort(floats.begin(), floats.end(), hotter);
+        linearScanAssign(ints, globalIntRegs(), usedIntRegs, globalValueRegs_);
+        linearScanAssign(floats, globalFloatRegs(), usedFloatRegs, globalValueFRegs_);
+    }
 
-        std::size_t intIndex = 0;
-        for (const auto &[id, _] : ints) {
-            while (intIndex < globalIntRegs().size() && usedIntRegs.count(globalIntRegs()[intIndex])) {
-                ++intIndex;
-            }
-            if (intIndex >= globalIntRegs().size()) {
-                break;
-            }
-            globalValueRegs_[id] = globalIntRegs()[intIndex++];
-        }
+    struct ActiveInterval {
+        int id = -1;
+        int start = 0;
+        int end = 0;
+        int weight = 0;
+        std::string reg;
+    };
 
-        std::size_t floatIndex = 0;
-        for (const auto &[id, _] : floats) {
-            while (floatIndex < globalFloatRegs().size() && usedFloatRegs.count(globalFloatRegs()[floatIndex])) {
-                ++floatIndex;
+    static void linearScanAssign(std::vector<Interval> intervals, const std::vector<std::string> &registers,
+                                 const std::unordered_set<std::string> &reserved,
+                                 std::unordered_map<int, std::string> &assignment) {
+        std::sort(intervals.begin(), intervals.end(), [](const Interval &lhs, const Interval &rhs) {
+            if (lhs.weight != rhs.weight) {
+                return lhs.weight > rhs.weight;
             }
-            if (floatIndex >= globalFloatRegs().size()) {
-                break;
+            const int lhsLength = lhs.end - lhs.start;
+            const int rhsLength = rhs.end - rhs.start;
+            if (lhsLength != rhsLength) {
+                return lhsLength > rhsLength;
             }
-            globalValueFRegs_[id] = globalFloatRegs()[floatIndex++];
+            if (lhs.start != rhs.start) {
+                return lhs.start < rhs.start;
+            }
+            return lhs.id < rhs.id;
+        });
+
+        std::unordered_map<std::string, std::vector<ActiveInterval>> assigned;
+
+        for (const Interval &interval : intervals) {
+            std::string chosen;
+            for (auto regIt = registers.rbegin(); regIt != registers.rend(); ++regIt) {
+                const std::string &reg = *regIt;
+                if (reserved.count(reg)) {
+                    continue;
+                }
+                if (assigned[reg].empty()) {
+                    chosen = reg;
+                    break;
+                }
+            }
+            if (!chosen.empty()) {
+                assigned[chosen].push_back(ActiveInterval{interval.id, interval.start, interval.end, interval.weight, chosen});
+                assignment[interval.id] = chosen;
+            }
         }
     }
 
@@ -2038,6 +2256,19 @@ private:
         const std::size_t comma = text.find(',');
         const std::string trueLabel = trimLabel(text.substr(0, comma));
         const std::string falseLabel = comma == std::string::npos ? std::string{} : trimLabel(text.substr(comma + 1));
+        if (!useLongJumps_) {
+            if (trueLabel == nextBlockName_) {
+                out_ << "\tbeqz a0, " << blockLabel(falseLabel) << "\n";
+                return;
+            }
+            if (falseLabel == nextBlockName_) {
+                out_ << "\tbnez a0, " << blockLabel(trueLabel) << "\n";
+                return;
+            }
+            out_ << "\tbnez a0, " << blockLabel(trueLabel) << "\n";
+            emitJump(blockLabel(falseLabel));
+            return;
+        }
         const std::string trueLocal = newPhiEdgeLabel();
         out_ << "\tbnez a0, " << trueLocal << "\n";
         emitJump(blockLabel(falseLabel));
@@ -2117,6 +2348,10 @@ private:
     }
 
     void emitJump(const std::string &label) {
+        if (!useLongJumps_) {
+            out_ << "\tj " << label << "\n";
+            return;
+        }
         out_ << "\tlla t6, " << label << "\n";
         out_ << "\tjr t6\n";
     }
@@ -2148,6 +2383,19 @@ private:
             }
             return false;
         case ir::Opcode::ICmp:
+            if ((inst.text == "eq" || inst.text == "ne") && rhs == 0) {
+                emitValueOperand(inst.operands[0]);
+                out_ << (inst.text == "eq" ? "\tseqz a0, a0\n" : "\tsnez a0, a0\n");
+                storeResult(inst);
+                return true;
+            }
+            if ((inst.text == "eq" || inst.text == "ne") && fitsI12IR(static_cast<int>(rhs))) {
+                emitValueOperand(inst.operands[0]);
+                out_ << "\txori a0, a0, " << rhs << "\n";
+                out_ << (inst.text == "eq" ? "\tseqz a0, a0\n" : "\tsnez a0, a0\n");
+                storeResult(inst);
+                return true;
+            }
             if (inst.text == "lt" && fitsI12IR(static_cast<int>(rhs))) {
                 emitValueOperand(inst.operands[0]);
                 out_ << "\tslti a0, a0, " << rhs << "\n";
@@ -2497,6 +2745,9 @@ private:
             return false;
         }
         if (type.kind == ir::TypeKind::F32) {
+            while (nextFloatReg_ < floatCacheRegs().size() && isGlobalFloatReg(floatCacheRegs()[nextFloatReg_])) {
+                ++nextFloatReg_;
+            }
             if (nextFloatReg_ >= floatCacheRegs().size()) {
                 return false;
             }
@@ -2506,6 +2757,9 @@ private:
             return true;
         }
         if (type.kind == ir::TypeKind::I32 || type.kind == ir::TypeKind::Ptr) {
+            while (nextIntReg_ < intCacheRegs().size() && isGlobalIntReg(intCacheRegs()[nextIntReg_])) {
+                ++nextIntReg_;
+            }
             if (nextIntReg_ >= intCacheRegs().size()) {
                 return false;
             }
@@ -2519,6 +2773,24 @@ private:
 
     bool isCurrentBlockLocal(int id) const {
         return currentBlockLocalValues_ && currentBlockLocalValues_->count(id) != 0;
+    }
+
+    bool isGlobalIntReg(const std::string &reg) const {
+        for (const auto &[_, globalReg] : globalValueRegs_) {
+            if (globalReg == reg) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isGlobalFloatReg(const std::string &reg) const {
+        for (const auto &[_, globalReg] : globalValueFRegs_) {
+            if (globalReg == reg) {
+                return true;
+            }
+        }
+        return false;
     }
 
     int allocateSlot() {
@@ -2656,13 +2928,11 @@ private:
     }
 
     static const std::vector<std::string> &globalIntRegs() {
-        static const std::vector<std::string> regs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"};
-        return regs;
+        return savedIntRegs();
     }
 
     static const std::vector<std::string> &globalFloatRegs() {
-        static const std::vector<std::string> regs = {"fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7"};
-        return regs;
+        return savedFloatRegs();
     }
 
     static const std::vector<std::string> &intCacheRegs() {
@@ -2685,6 +2955,34 @@ private:
 
     int firstLocalOffset() const {
         return -24 - static_cast<int>(activeSavedIntRegs_.size() + activeSavedFloatRegs_.size()) * 8;
+    }
+
+    bool needsLongJumps(const ir::Function &function) const {
+        std::size_t estimated = 0;
+        for (const auto &block : function.blocks) {
+            estimated += 1;
+            for (const auto &inst : block.instructions) {
+                switch (inst.opcode) {
+                case ir::Opcode::Alloca:
+                case ir::Opcode::Phi:
+                    break;
+                case ir::Opcode::Call:
+                    estimated += 24 + inst.operands.size() * 5;
+                    break;
+                case ir::Opcode::CondBr:
+                    estimated += 8;
+                    break;
+                case ir::Opcode::Br:
+                case ir::Opcode::Ret:
+                    estimated += 4;
+                    break;
+                default:
+                    estimated += 8 + inst.operands.size() * 2;
+                    break;
+                }
+            }
+        }
+        return estimated > 12000;
     }
 
     static std::uint32_t irFloatBits(float value) {
@@ -2716,9 +3014,591 @@ private:
     std::size_t nextIntReg_ = 0;
     std::size_t nextFloatReg_ = 0;
     int nextPhiEdgeLabel_ = 0;
+    bool useLongJumps_ = false;
     int nextOffset_ = -24;
     int frameSize_ = 4096;
 };
+
+enum class MachineLineKind {
+    Raw,
+    Inst,
+};
+
+struct MachineLine {
+    MachineLineKind kind = MachineLineKind::Raw;
+    std::string raw;
+    std::string op;
+    std::vector<std::string> args;
+
+    bool instruction() const {
+        return kind == MachineLineKind::Inst;
+    }
+
+    std::string render() const {
+        if (kind == MachineLineKind::Raw) {
+            return raw;
+        }
+        std::string line = "\t" + op;
+        if (!args.empty()) {
+            line += ' ';
+            for (std::size_t i = 0; i < args.size(); ++i) {
+                if (i != 0) {
+                    line += ", ";
+                }
+                line += args[i];
+            }
+        }
+        return line;
+    }
+};
+
+struct MachineAccess {
+    std::unordered_set<std::string> uses;
+    std::unordered_set<std::string> defs;
+    bool barrier = false;
+};
+
+bool isLoadOp(const std::string &op);
+bool isStoreOp(const std::string &op);
+
+bool isIntegerRegisterName(const std::string &name) {
+    if (name == "zero" || name == "ra" || name == "sp" || name == "gp" || name == "tp") {
+        return true;
+    }
+    if (name.size() == 2 && (name[0] == 'a' || name[0] == 's' || name[0] == 't') && std::isdigit(static_cast<unsigned char>(name[1]))) {
+        return true;
+    }
+    if (name.size() == 3 && name[0] == 's' && name[1] == '1' && (name[2] == '0' || name[2] == '1')) {
+        return true;
+    }
+    if (name.size() == 3 && name[0] == 't' && name[1] == '6') {
+        return true;
+    }
+    return false;
+}
+
+bool isFloatRegisterName(const std::string &name) {
+    if (name.size() == 3 && name[0] == 'f' && (name[1] == 'a' || name[1] == 't') && std::isdigit(static_cast<unsigned char>(name[2]))) {
+        return true;
+    }
+    if (name.size() == 3 && name[0] == 'f' && name[1] == 's' && std::isdigit(static_cast<unsigned char>(name[2]))) {
+        return true;
+    }
+    if (name.size() == 4 && name[0] == 'f' && name[1] == 's' && name[2] == '1' && (name[3] == '0' || name[3] == '1')) {
+        return true;
+    }
+    return false;
+}
+
+bool isRegisterName(const std::string &name) {
+    return isIntegerRegisterName(name) || isFloatRegisterName(name);
+}
+
+std::string memoryBaseRegister(const std::string &operand) {
+    const std::size_t open = operand.find('(');
+    const std::size_t close = operand.find(')', open == std::string::npos ? 0 : open);
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+        return {};
+    }
+    return operand.substr(open + 1, close - open - 1);
+}
+
+void addReg(std::unordered_set<std::string> &regs, const std::string &reg) {
+    if (isRegisterName(reg) && reg != "zero") {
+        regs.insert(reg);
+    }
+}
+
+MachineAccess accessOf(const MachineLine &line) {
+    MachineAccess access;
+    if (!line.instruction()) {
+        access.barrier = true;
+        return access;
+    }
+    const std::string &op = line.op;
+    const auto &a = line.args;
+    if (op == "call" || op == "ret" || op == "jr" || op == "j" ||
+        op == "beqz" || op == "bnez" || op == "beq" || op == "bne" || op == "blt" || op == "bge") {
+        access.barrier = true;
+    }
+    if (op == "call") {
+        return access;
+    }
+    if (op == "ret") {
+        addReg(access.uses, "a0");
+        return access;
+    }
+    if (op == "j") {
+        return access;
+    }
+    if (op == "jr") {
+        if (!a.empty()) addReg(access.uses, a[0]);
+        return access;
+    }
+    if (op == "beqz" || op == "bnez") {
+        if (!a.empty()) addReg(access.uses, a[0]);
+        return access;
+    }
+    if (op == "beq" || op == "bne" || op == "blt" || op == "bge") {
+        if (a.size() > 0) addReg(access.uses, a[0]);
+        if (a.size() > 1) addReg(access.uses, a[1]);
+        return access;
+    }
+    if (op == "li" || op == "la" || op == "lla") {
+        if (!a.empty()) addReg(access.defs, a[0]);
+        return access;
+    }
+    if (op == "mv" || op == "fmv.s" || op == "fmv.w.x") {
+        if (a.size() > 0) addReg(access.defs, a[0]);
+        if (a.size() > 1) addReg(access.uses, a[1]);
+        return access;
+    }
+    if (isLoadOp(op)) {
+        if (a.size() > 0) addReg(access.defs, a[0]);
+        if (a.size() > 1) addReg(access.uses, memoryBaseRegister(a[1]));
+        return access;
+    }
+    if (isStoreOp(op)) {
+        if (a.size() > 0) addReg(access.uses, a[0]);
+        if (a.size() > 1) addReg(access.uses, memoryBaseRegister(a[1]));
+        return access;
+    }
+    if (op == "fcvt.s.w") {
+        if (a.size() > 0) addReg(access.defs, a[0]);
+        if (a.size() > 1) addReg(access.uses, a[1]);
+        return access;
+    }
+    if (op == "fcvt.w.s") {
+        if (a.size() > 0) addReg(access.defs, a[0]);
+        if (a.size() > 1) addReg(access.uses, a[1]);
+        return access;
+    }
+    if (!a.empty()) {
+        addReg(access.defs, a[0]);
+        for (std::size_t i = 1; i < a.size(); ++i) {
+            addReg(access.uses, a[i]);
+        }
+    }
+    return access;
+}
+
+std::string trimAsm(std::string text) {
+    const std::size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const std::size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+std::vector<std::string> splitAsmArgs(const std::string &text) {
+    std::vector<std::string> args;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::size_t end = comma == std::string::npos ? text.size() : comma;
+        args.push_back(trimAsm(text.substr(start, end - start)));
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return args;
+}
+
+MachineLine parseMachineLine(const std::string &line) {
+    MachineLine parsed;
+    parsed.raw = line;
+    if (line.empty() || line[0] != '\t') {
+        return parsed;
+    }
+    const std::string body = trimAsm(line);
+    if (body.empty() || body[0] == '.') {
+        return parsed;
+    }
+    const std::size_t space = body.find_first_of(" \t");
+    parsed.kind = MachineLineKind::Inst;
+    parsed.op = space == std::string::npos ? body : body.substr(0, space);
+    if (space != std::string::npos) {
+        parsed.args = splitAsmArgs(body.substr(space + 1));
+    }
+    return parsed;
+}
+
+MachineLine machineInst(const std::string &op, const std::vector<std::string> &args) {
+    MachineLine line;
+    line.kind = MachineLineKind::Inst;
+    line.op = op;
+    line.args = args;
+    return line;
+}
+
+bool isLoadOp(const std::string &op) {
+    return op == "ld" || op == "lw" || op == "flw" || op == "fld";
+}
+
+bool isStoreOp(const std::string &op) {
+    return op == "sd" || op == "sw" || op == "fsw" || op == "fsd";
+}
+
+bool parseAsmImmediate(const std::string &text, long long &value) {
+    char *end = nullptr;
+    value = std::strtoll(text.c_str(), &end, 0);
+    return end != text.c_str() && end != nullptr && *end == '\0';
+}
+
+bool fitsI12Asm(long long value) {
+    return value >= -2048 && value <= 2047;
+}
+
+bool positivePowerOfTwo(long long value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+int log2Asm(long long value) {
+    int shift = 0;
+    while (value > 1) {
+        value >>= 1;
+        ++shift;
+    }
+    return shift;
+}
+
+bool matchingLoadStore(const std::string &load, const std::string &store) {
+    return (load == "ld" && store == "sd") || (load == "lw" && store == "sw") ||
+           (load == "flw" && store == "fsw") || (load == "fld" && store == "fsd");
+}
+
+std::vector<MachineLine> parseMachineAssembly(const std::string &assembly) {
+    std::vector<MachineLine> lines;
+    std::istringstream in(assembly);
+    std::string line;
+    while (std::getline(in, line)) {
+        lines.push_back(parseMachineLine(line));
+    }
+    return lines;
+}
+
+void peepholeMachine(std::vector<MachineLine> &lines) {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        std::vector<MachineLine> next;
+        next.reserve(lines.size());
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            const MachineLine &current = lines[i];
+            if (current.instruction() && (current.op == "mv" || current.op == "fmv.s") &&
+                current.args.size() == 2 && current.args[0] == current.args[1]) {
+                changed = true;
+                continue;
+            }
+
+            if (i + 1 < lines.size()) {
+                const MachineLine &following = lines[i + 1];
+                if (current.instruction() && following.instruction()) {
+                    if (isStoreOp(current.op) && isLoadOp(following.op) && current.args.size() == 2 &&
+                        following.args.size() == 2 && matchingLoadStore(following.op, current.op) &&
+                        current.args[1] == following.args[1]) {
+                        if (current.args[0] == following.args[0]) {
+                            next.push_back(lines[i]);
+                            ++i;
+                            changed = true;
+                            continue;
+                        }
+                        const bool floatMove = current.op == "fsw" || current.op == "fsd";
+                        next.push_back(lines[i]);
+                        next.push_back(machineInst(floatMove ? "fmv.s" : "mv", {following.args[0], current.args[0]}));
+                        ++i;
+                        changed = true;
+                        continue;
+                    }
+                    if (isLoadOp(current.op) && isStoreOp(following.op) && current.args.size() == 2 &&
+                        following.args.size() == 2 && matchingLoadStore(current.op, following.op) &&
+                        current.args[0] == following.args[0] && current.args[1] == following.args[1]) {
+                        next.push_back(lines[i]);
+                        ++i;
+                        changed = true;
+                        continue;
+                    }
+                    if (current.op == "mv" && following.op == "mv" && current.args.size() == 2 &&
+                        following.args.size() == 2 && current.args[0] == following.args[1]) {
+                        next.push_back(lines[i]);
+                        next.push_back(machineInst("mv", {following.args[0], current.args[1]}));
+                        ++i;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            next.push_back(lines[i]);
+        }
+        lines = std::move(next);
+    }
+}
+
+void foldImmediateProducer(std::vector<MachineLine> &lines) {
+    std::vector<MachineLine> next;
+    next.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (i + 1 >= lines.size() || !lines[i].instruction() || !lines[i + 1].instruction() ||
+            lines[i].op != "li" || lines[i].args.size() != 2) {
+            next.push_back(std::move(lines[i]));
+            continue;
+        }
+
+        const std::string immReg = lines[i].args[0];
+        long long imm = 0;
+        if (!parseAsmImmediate(lines[i].args[1], imm)) {
+            next.push_back(std::move(lines[i]));
+            continue;
+        }
+
+        MachineLine replacement;
+        bool folded = false;
+        const MachineLine &use = lines[i + 1];
+        if ((use.op == "addw" || use.op == "subw" || use.op == "slt" || use.op == "mulw") && use.args.size() == 3) {
+            const std::string &dst = use.args[0];
+            const std::string &lhs = use.args[1];
+            const std::string &rhs = use.args[2];
+            if (use.op == "addw" && fitsI12Asm(imm)) {
+                if (rhs == immReg && lhs != immReg) {
+                    replacement = machineInst("addiw", {dst, lhs, std::to_string(imm)});
+                    folded = true;
+                } else if (lhs == immReg && rhs != immReg) {
+                    replacement = machineInst("addiw", {dst, rhs, std::to_string(imm)});
+                    folded = true;
+                }
+            } else if (use.op == "subw" && rhs == immReg && lhs != immReg && fitsI12Asm(-imm)) {
+                replacement = machineInst("addiw", {dst, lhs, std::to_string(-imm)});
+                folded = true;
+            } else if (use.op == "slt" && rhs == immReg && lhs != immReg && fitsI12Asm(imm)) {
+                replacement = machineInst("slti", {dst, lhs, std::to_string(imm)});
+                folded = true;
+            } else if (use.op == "mulw" && rhs == immReg && lhs != immReg) {
+                if (imm == 0) {
+                    replacement = machineInst("li", {dst, "0"});
+                    folded = true;
+                } else if (imm == 1) {
+                    replacement = machineInst("mv", {dst, lhs});
+                    folded = true;
+                } else if (positivePowerOfTwo(imm)) {
+                    replacement = machineInst("slliw", {dst, lhs, std::to_string(log2Asm(imm))});
+                    folded = true;
+                }
+            }
+        }
+
+        if (folded) {
+            next.push_back(std::move(replacement));
+            ++i;
+        } else {
+            next.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(next);
+}
+
+bool isMoveInstruction(const MachineLine &line) {
+    return line.instruction() && (line.op == "mv" || line.op == "fmv.s") && line.args.size() == 2;
+}
+
+bool isCrossBlockRegister(const std::string &reg) {
+    return reg == "sp" || reg == "ra" || reg == "s0" || reg == "a0" || reg == "fa0" ||
+           (reg.size() >= 2 && reg[0] == 'a') ||
+           (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 'a') ||
+           (reg.size() >= 2 && reg[0] == 's') ||
+           (reg.size() >= 3 && reg[0] == 'f' && reg[1] == 's');
+}
+
+void eliminateDeadMoves(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    std::size_t blockBegin = 0;
+    auto flushBlock = [&](std::size_t blockEnd) {
+        std::unordered_set<std::string> live;
+        for (std::size_t i = blockEnd; i-- > blockBegin;) {
+            if (!lines[i].instruction()) {
+                continue;
+            }
+            MachineAccess access = accessOf(lines[i]);
+            if (access.barrier) {
+                live.clear();
+            }
+            if (isMoveInstruction(lines[i])) {
+                const std::string &dst = lines[i].args[0];
+                if (!isCrossBlockRegister(dst) && !live.count(dst)) {
+                    remove[i] = true;
+                    continue;
+                }
+            }
+            for (const std::string &def : access.defs) {
+                live.erase(def);
+            }
+            for (const std::string &use : access.uses) {
+                live.insert(use);
+            }
+        }
+    };
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!lines[i].instruction() || (lines[i].instruction() && lines[i].op.back() == ':')) {
+            flushBlock(i);
+            blockBegin = i + 1;
+        } else if (lines[i].instruction()) {
+            MachineAccess access = accessOf(lines[i]);
+            if (access.barrier) {
+                flushBlock(i + 1);
+                blockBegin = i + 1;
+            }
+        }
+    }
+    flushBlock(lines.size());
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+bool isAsmLabel(const MachineLine &line) {
+    if (line.instruction() || line.raw.empty() || line.raw[0] == '\t') {
+        return false;
+    }
+    const std::string text = trimAsm(line.raw);
+    return text.size() > 1 && text.back() == ':';
+}
+
+std::string asmLabelName(const MachineLine &line) {
+    if (!isAsmLabel(line)) {
+        return {};
+    }
+    std::string text = trimAsm(line.raw);
+    text.pop_back();
+    return text;
+}
+
+bool skippableBeforeLabel(const MachineLine &line) {
+    if (line.instruction()) {
+        return false;
+    }
+    const std::string text = trimAsm(line.raw);
+    return text.empty() || text == ".align 2" || text == ".p2align 2" ||
+           text.rfind(".align ", 0) == 0 || text.rfind(".p2align ", 0) == 0;
+}
+
+std::optional<std::string> nextFallthroughLabel(const std::vector<MachineLine> &lines, std::size_t from) {
+    for (std::size_t i = from + 1; i < lines.size(); ++i) {
+        if (isAsmLabel(lines[i])) {
+            return asmLabelName(lines[i]);
+        }
+        if (!skippableBeforeLabel(lines[i])) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+void eliminateJumpsToFallthrough(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!lines[i].instruction()) {
+            continue;
+        }
+        const MachineLine &line = lines[i];
+        if ((line.op == "j" || line.op == "beqz" || line.op == "bnez") && line.args.size() >= 1) {
+            const std::string &target = line.args.back();
+            const std::optional<std::string> fallthrough = nextFallthroughLabel(lines, i);
+            if (fallthrough && *fallthrough == target) {
+                remove[i] = true;
+            }
+            continue;
+        }
+        if (line.op == "lla" && line.args.size() == 2 && line.args[0] == "t6" &&
+            i + 1 < lines.size() && lines[i + 1].instruction() &&
+            lines[i + 1].op == "jr" && lines[i + 1].args.size() == 1 && lines[i + 1].args[0] == "t6") {
+            const std::optional<std::string> fallthrough = nextFallthroughLabel(lines, i + 1);
+            if (fallthrough && *fallthrough == line.args[1]) {
+                remove[i] = true;
+                remove[i + 1] = true;
+            }
+        }
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+std::optional<std::string> oppositeZeroBranch(const std::string &op) {
+    if (op == "beqz") {
+        return "bnez";
+    }
+    if (op == "bnez") {
+        return "beqz";
+    }
+    return std::nullopt;
+}
+
+void foldBranchOverJump(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        if (!lines[i].instruction() || !lines[i + 1].instruction()) {
+            continue;
+        }
+        MachineLine &branch = lines[i];
+        const MachineLine &jump = lines[i + 1];
+        const std::optional<std::string> opposite = oppositeZeroBranch(branch.op);
+        if (!opposite || branch.args.size() != 2 || jump.op != "j" || jump.args.size() != 1) {
+            continue;
+        }
+        const std::optional<std::string> fallthrough = nextFallthroughLabel(lines, i + 1);
+        if (!fallthrough || *fallthrough != branch.args[1]) {
+            continue;
+        }
+        branch.op = *opposite;
+        branch.args[1] = jump.args[0];
+        remove[i + 1] = true;
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+std::string renderMachineAssembly(const std::vector<MachineLine> &lines) {
+    std::ostringstream out;
+    for (const auto &outLine : lines) {
+        out << outLine.render() << '\n';
+    }
+    return out.str();
+}
+
+std::string peepholeAssembly(const std::string &assembly) {
+    std::vector<MachineLine> lines = parseMachineAssembly(assembly);
+    foldImmediateProducer(lines);
+    peepholeMachine(lines);
+    foldBranchOverJump(lines);
+    eliminateJumpsToFallthrough(lines);
+    eliminateDeadMoves(lines);
+    foldImmediateProducer(lines);
+    peepholeMachine(lines);
+    foldBranchOverJump(lines);
+    eliminateJumpsToFallthrough(lines);
+    return renderMachineAssembly(lines);
+}
 
 } // namespace
 
@@ -2727,7 +3607,9 @@ void emitAssembly(const TranslationUnit &unit, std::ostream &out) {
 }
 
 void emitAssembly(const ir::Module &module, std::ostream &out) {
-    IRCodeGen(module, out).run();
+    std::ostringstream raw;
+    IRCodeGen(module, raw).run();
+    out << peepholeAssembly(raw.str());
 }
 
 } // namespace sysyc::riscv
