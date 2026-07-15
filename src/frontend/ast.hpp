@@ -1,6 +1,6 @@
 #pragma once
 
-#include "support/diagnostic.hpp"
+#include "../support/diagnostic.hpp"
 
 #include <memory>
 #include <string>

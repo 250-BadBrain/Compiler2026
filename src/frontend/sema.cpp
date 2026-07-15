@@ -1,4 +1,4 @@
-#include "frontend/sema.hpp"
+#include "sema.hpp"
 
 #include <cmath>
 #include <cstdlib>

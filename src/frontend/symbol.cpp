@@ -1,4 +1,4 @@
-#include "frontend/symbol.hpp"
+#include "symbol.hpp"
 
 #include <utility>
 

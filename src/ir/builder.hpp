@@ -1,7 +1,7 @@
 #pragma once
 
-#include "frontend/ast.hpp"
-#include "ir/ir.hpp"
+#include "../frontend/ast.hpp"
+#include "ir.hpp"
 
 #include <string>
 #include <unordered_map>

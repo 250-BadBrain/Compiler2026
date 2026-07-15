@@ -1,4 +1,4 @@
-#include "frontend/parser.hpp"
+#include "parser.hpp"
 
 #include <cstdlib>
 #include <utility>

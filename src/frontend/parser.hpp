@@ -1,8 +1,8 @@
 #pragma once
 
-#include "frontend/ast.hpp"
-#include "frontend/token.hpp"
-#include "support/diagnostic.hpp"
+#include "ast.hpp"
+#include "token.hpp"
+#include "../support/diagnostic.hpp"
 
 #include <memory>
 #include <vector>

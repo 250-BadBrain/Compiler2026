@@ -1,4 +1,4 @@
-#include "frontend/lexer.hpp"
+#include "lexer.hpp"
 
 #include <cctype>
 #include <unordered_map>

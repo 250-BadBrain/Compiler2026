@@ -1,4 +1,4 @@
-#include "support/diagnostic.hpp"
+#include "diagnostic.hpp"
 
 #include <sstream>
 #include <utility>

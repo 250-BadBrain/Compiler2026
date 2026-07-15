@@ -1,4 +1,4 @@
-#include "frontend/type.hpp"
+#include "type.hpp"
 
 #include <sstream>
 

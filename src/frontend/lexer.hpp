@@ -1,7 +1,7 @@
 #pragma once
 
-#include "frontend/token.hpp"
-#include "support/diagnostic.hpp"
+#include "token.hpp"
+#include "../support/diagnostic.hpp"
 
 #include <string>
 #include <vector>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "frontend/ast.hpp"
+#include "../../frontend/ast.hpp"
 
 #include <iosfwd>
 

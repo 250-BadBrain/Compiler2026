@@ -1,7 +1,7 @@
 #pragma once
 
-#include "frontend/type.hpp"
-#include "support/diagnostic.hpp"
+#include "type.hpp"
+#include "../support/diagnostic.hpp"
 
 #include <memory>
 #include <string>

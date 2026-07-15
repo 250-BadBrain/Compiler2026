@@ -1,4 +1,4 @@
-#include "backend/riscv/emit.hpp"
+#include "emit.hpp"
 
 #include <cstdint>
 #include <cstring>

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "frontend/ast.hpp"
-#include "frontend/symbol.hpp"
-#include "support/diagnostic.hpp"
+#include "ast.hpp"
+#include "symbol.hpp"
+#include "../support/diagnostic.hpp"
 
 #include <memory>
 #include <optional>
