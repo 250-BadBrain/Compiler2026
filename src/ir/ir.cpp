@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
@@ -133,7 +134,6 @@ namespace {
 bool isPure(Opcode opcode) {
     switch (opcode) {
     case Opcode::Load:
-    case Opcode::Gep:
     case Opcode::Add:
     case Opcode::Sub:
     case Opcode::Mul:
@@ -143,6 +143,7 @@ bool isPure(Opcode opcode) {
     case Opcode::Not:
     case Opcode::ICmp:
     case Opcode::FCmp:
+    case Opcode::Gep:
     case Opcode::Cast:
     case Opcode::Phi:
         return true;
@@ -558,12 +559,162 @@ std::vector<std::vector<int>> computePredecessors(const Function &function) {
     return predecessors;
 }
 
+std::vector<std::unordered_set<int>> computeDominators(const Function &function,
+                                                       const std::vector<std::vector<int>> &predecessors) {
+    std::unordered_set<int> allBlocks;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        allBlocks.insert(static_cast<int>(i));
+    }
+
+    std::vector<std::unordered_set<int>> dominators(function.blocks.size());
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        dominators[i] = i == 0 ? std::unordered_set<int>{0} : allBlocks;
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+            std::unordered_set<int> next = allBlocks;
+            if (predecessors[blockIndex].empty()) {
+                next.clear();
+            }
+            for (int pred : predecessors[blockIndex]) {
+                std::unordered_set<int> intersection;
+                for (int candidate : next) {
+                    if (dominators[static_cast<std::size_t>(pred)].count(candidate)) {
+                        intersection.insert(candidate);
+                    }
+                }
+                next = std::move(intersection);
+            }
+            next.insert(static_cast<int>(blockIndex));
+            if (next != dominators[blockIndex]) {
+                dominators[blockIndex] = std::move(next);
+                changed = true;
+            }
+        }
+    }
+    return dominators;
+}
+
+std::vector<std::vector<int>> computeDominatorTree(const Function &function,
+                                                   const std::vector<std::unordered_set<int>> &dominators) {
+    std::vector<std::vector<int>> children(function.blocks.size());
+    for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+        int idom = -1;
+        for (int candidate : dominators[blockIndex]) {
+            if (candidate == static_cast<int>(blockIndex)) {
+                continue;
+            }
+            bool deepest = true;
+            for (int other : dominators[blockIndex]) {
+                if (other == candidate || other == static_cast<int>(blockIndex)) {
+                    continue;
+                }
+                if (!dominators[static_cast<std::size_t>(candidate)].count(other)) {
+                    deepest = false;
+                    break;
+                }
+            }
+            if (deepest) {
+                idom = candidate;
+                break;
+            }
+        }
+        if (idom >= 0) {
+            children[static_cast<std::size_t>(idom)].push_back(static_cast<int>(blockIndex));
+        }
+    }
+    return children;
+}
+
+std::vector<int> estimateBlockValuePressure(const Function &function,
+                                            const std::vector<std::vector<int>> &predecessors) {
+    std::vector<std::vector<int>> successors(function.blocks.size());
+    for (std::size_t blockIndex = 0; blockIndex < predecessors.size(); ++blockIndex) {
+        for (int pred : predecessors[blockIndex]) {
+            successors[static_cast<std::size_t>(pred)].push_back(static_cast<int>(blockIndex));
+        }
+    }
+
+    std::vector<std::unordered_set<int>> use(function.blocks.size());
+    std::vector<std::unordered_set<int>> def(function.blocks.size());
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_set<int> seenDef;
+        for (const auto &inst : function.blocks[blockIndex].instructions) {
+            if (inst.result >= 0) {
+                def[blockIndex].insert(inst.result);
+                seenDef.insert(inst.result);
+            }
+            if (inst.opcode == Opcode::Phi) {
+                continue;
+            }
+            for (const auto &operand : inst.operands) {
+                if (!operand.constant && operand.id >= 0 && !seenDef.count(operand.id)) {
+                    use[blockIndex].insert(operand.id);
+                }
+            }
+        }
+    }
+
+    std::vector<std::unordered_set<int>> liveIn(function.blocks.size());
+    std::vector<std::unordered_set<int>> liveOut(function.blocks.size());
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t blockIndex = function.blocks.size(); blockIndex-- > 0;) {
+            std::unordered_set<int> nextOut;
+            for (int succ : successors[blockIndex]) {
+                nextOut.insert(liveIn[static_cast<std::size_t>(succ)].begin(),
+                               liveIn[static_cast<std::size_t>(succ)].end());
+            }
+            std::unordered_set<int> nextIn = use[blockIndex];
+            for (int id : nextOut) {
+                if (!def[blockIndex].count(id)) {
+                    nextIn.insert(id);
+                }
+            }
+            if (nextOut != liveOut[blockIndex]) {
+                liveOut[blockIndex] = std::move(nextOut);
+                changed = true;
+            }
+            if (nextIn != liveIn[blockIndex]) {
+                liveIn[blockIndex] = std::move(nextIn);
+                changed = true;
+            }
+        }
+    }
+
+    std::vector<int> pressure(function.blocks.size(), 0);
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_set<int> combined = liveIn[blockIndex];
+        combined.insert(liveOut[blockIndex].begin(), liveOut[blockIndex].end());
+        pressure[blockIndex] = static_cast<int>(combined.size());
+    }
+    return pressure;
+}
+
 bool sameValue(const Value &lhs, const Value &rhs) {
     return lhs.id == rhs.id && lhs.type.kind == rhs.type.kind &&
            lhs.name == rhs.name && lhs.constant == rhs.constant;
 }
 
 bool sameMap(const std::unordered_map<int, Value> &lhs, const std::unordered_map<int, Value> &rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (const auto &[key, value] : lhs) {
+        const auto found = rhs.find(key);
+        if (found == rhs.end() || !sameValue(value, found->second)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool sameStringValueMap(const std::unordered_map<std::string, Value> &lhs,
+                        const std::unordered_map<std::string, Value> &rhs) {
     if (lhs.size() != rhs.size()) {
         return false;
     }
@@ -1265,16 +1416,118 @@ bool forwardCrossBlockMemory(Function &function) {
     return replaced;
 }
 
+std::string memoryAddressKey(const Value &address);
+
+bool forwardCrossBlockExactMemory(Function &function) {
+    if (function.blocks.empty() || hugeFunction(function)) {
+        return false;
+    }
+
+    const auto predecessors = computePredecessors(function);
+    std::vector<std::unordered_map<std::string, Value>> in(function.blocks.size());
+    std::vector<std::unordered_map<std::string, Value>> out(function.blocks.size());
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+            std::unordered_map<std::string, Value> nextIn;
+            if (blockIndex != 0 && !predecessors[blockIndex].empty()) {
+                nextIn = out[static_cast<std::size_t>(predecessors[blockIndex].front())];
+                for (std::size_t i = 1; i < predecessors[blockIndex].size(); ++i) {
+                    const auto &predOut = out[static_cast<std::size_t>(predecessors[blockIndex][i])];
+                    for (auto it = nextIn.begin(); it != nextIn.end();) {
+                        const auto found = predOut.find(it->first);
+                        if (found == predOut.end() || !sameValue(it->second, found->second)) {
+                            it = nextIn.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+
+            std::unordered_map<std::string, Value> nextOut = nextIn;
+            for (const auto &inst : function.blocks[blockIndex].instructions) {
+                if (inst.opcode == Opcode::Call) {
+                    nextOut.clear();
+                    continue;
+                }
+                if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                    const std::string key = memoryAddressKey(inst.operands[1]);
+                    nextOut.clear();
+                    if (!key.empty()) {
+                        nextOut[key] = inst.operands[0];
+                    }
+                }
+            }
+
+            if (!sameStringValueMap(in[blockIndex], nextIn)) {
+                in[blockIndex] = std::move(nextIn);
+                changed = true;
+            }
+            if (!sameStringValueMap(out[blockIndex], nextOut)) {
+                out[blockIndex] = std::move(nextOut);
+                changed = true;
+            }
+        }
+    }
+
+    bool replaced = false;
+    std::unordered_map<int, Value> replacements;
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        std::unordered_map<std::string, Value> current = in[blockIndex];
+        std::vector<Instruction> kept;
+        kept.reserve(function.blocks[blockIndex].instructions.size());
+        for (auto inst : function.blocks[blockIndex].instructions) {
+            for (auto &operand : inst.operands) {
+                operand = resolve(operand, replacements);
+            }
+
+            if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
+                const std::string key = memoryAddressKey(inst.operands[0]);
+                const auto found = key.empty() ? current.end() : current.find(key);
+                if (found != current.end()) {
+                    replacements[inst.result] = found->second;
+                    replaced = true;
+                    continue;
+                }
+            }
+
+            if (inst.opcode == Opcode::Call) {
+                current.clear();
+            } else if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const std::string key = memoryAddressKey(inst.operands[1]);
+                current.clear();
+                if (!key.empty()) {
+                    current[key] = inst.operands[0];
+                }
+            }
+            kept.push_back(std::move(inst));
+        }
+        function.blocks[blockIndex].instructions = std::move(kept);
+    }
+
+    if (replaced) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+    return replaced;
+}
+
 bool isHoistableOpcode(Opcode opcode) {
     switch (opcode) {
-    case Opcode::Gep:
     case Opcode::Add:
     case Opcode::Sub:
     case Opcode::Mul:
     case Opcode::Neg:
     case Opcode::Not:
     case Opcode::ICmp:
-    case Opcode::FCmp:
     case Opcode::Cast:
         return true;
     case Opcode::Alloca:
@@ -1282,6 +1535,8 @@ bool isHoistableOpcode(Opcode opcode) {
     case Opcode::Store:
     case Opcode::Div:
     case Opcode::Mod:
+    case Opcode::FCmp:
+    case Opcode::Gep:
     case Opcode::Phi:
     case Opcode::Call:
     case Opcode::Br:
@@ -1551,6 +1806,141 @@ bool eliminateCommonSubexpressions(Function &function) {
     return changed;
 }
 
+bool globallyCseEligible(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::Add:
+    case Opcode::Sub:
+    case Opcode::Mul:
+    case Opcode::Neg:
+    case Opcode::Not:
+    case Opcode::ICmp:
+    case Opcode::Cast:
+        return true;
+    case Opcode::Div:
+    case Opcode::Mod:
+    case Opcode::FCmp:
+    case Opcode::Alloca:
+    case Opcode::Load:
+    case Opcode::Store:
+    case Opcode::Gep:
+    case Opcode::Phi:
+    case Opcode::Call:
+    case Opcode::Br:
+    case Opcode::CondBr:
+    case Opcode::Ret:
+        return false;
+    }
+    return false;
+}
+
+int globalCseCost(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::Mul:
+        return 3;
+    case Opcode::Gep:
+    case Opcode::ICmp:
+        return 2;
+    case Opcode::Add:
+    case Opcode::Sub:
+    case Opcode::Neg:
+    case Opcode::Not:
+    case Opcode::Cast:
+        return 1;
+    case Opcode::Div:
+    case Opcode::Mod:
+    case Opcode::FCmp:
+    case Opcode::Alloca:
+    case Opcode::Load:
+    case Opcode::Store:
+    case Opcode::Phi:
+    case Opcode::Call:
+    case Opcode::Br:
+    case Opcode::CondBr:
+    case Opcode::Ret:
+        return 0;
+    }
+    return 0;
+}
+
+struct GlobalAvailableExpr {
+    Value value;
+    int block = -1;
+    int cost = 0;
+};
+
+bool pressureAllowsGlobalReuse(const GlobalAvailableExpr &available, int useBlock,
+                               const std::vector<int> &blockPressure) {
+    if (available.block == useBlock) {
+        return true;
+    }
+    if (available.cost >= 2) {
+        return true;
+    }
+    const int pressure = useBlock >= 0 && static_cast<std::size_t>(useBlock) < blockPressure.size()
+                             ? blockPressure[static_cast<std::size_t>(useBlock)]
+                             : 1000;
+    return pressure <= 32;
+}
+
+bool eliminateGlobalCommonSubexpressions(Function &function) {
+    if (function.blocks.empty() || hugeFunction(function)) {
+        return false;
+    }
+
+    const auto predecessors = computePredecessors(function);
+    const auto dominators = computeDominators(function, predecessors);
+    const auto domTree = computeDominatorTree(function, dominators);
+    const auto blockPressure = estimateBlockValuePressure(function, predecessors);
+
+    bool changed = false;
+    std::unordered_map<int, Value> replacements;
+
+    std::function<void(int, std::unordered_map<std::string, GlobalAvailableExpr>)> visit =
+        [&](int blockIndex, std::unordered_map<std::string, GlobalAvailableExpr> available) {
+            auto &block = function.blocks[static_cast<std::size_t>(blockIndex)];
+            std::vector<Instruction> kept;
+            kept.reserve(block.instructions.size());
+
+            for (auto inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+
+                if (inst.result >= 0 && globallyCseEligible(inst.opcode)) {
+                    const std::string key = instKey(inst);
+                    const auto found = available.find(key);
+                    if (found != available.end() && pressureAllowsGlobalReuse(found->second, blockIndex, blockPressure)) {
+                        replacements[inst.result] = found->second.value;
+                        changed = true;
+                        continue;
+                    }
+                    available[key] = GlobalAvailableExpr{Value{inst.result, inst.resultType, {}, false},
+                                                         blockIndex, globalCseCost(inst.opcode)};
+                }
+
+                kept.push_back(std::move(inst));
+            }
+
+            block.instructions = std::move(kept);
+            for (int child : domTree[static_cast<std::size_t>(blockIndex)]) {
+                visit(child, available);
+            }
+        };
+
+    visit(0, {});
+
+    if (changed) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 std::string memoryAddressKey(const Value &address) {
     if (address.constant) {
         if (!address.name.empty() && address.name[0] == '@') {
@@ -1701,6 +2091,7 @@ bool forwardLocalMemory(Function &function) {
                         changed = true;
                         continue;
                     }
+                    knownMemory[key] = Value{inst.result, inst.resultType, {}, false};
                 }
             }
 
@@ -1823,6 +2214,10 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
+            if (forwardCrossBlockExactMemory(function)) {
+                changed = true;
+                again = true;
+            }
             if (foldConstants(function)) {
                 changed = true;
                 again = true;
@@ -1832,6 +2227,10 @@ bool optimize(Module &module) {
                 again = true;
             }
             if (eliminateCommonSubexpressions(function)) {
+                changed = true;
+                again = true;
+            }
+            if (eliminateGlobalCommonSubexpressions(function)) {
                 changed = true;
                 again = true;
             }
@@ -1882,6 +2281,10 @@ bool optimize(Module &module) {
                 ssaAgain = true;
             }
             if (eliminateCommonSubexpressions(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (eliminateGlobalCommonSubexpressions(function)) {
                 changed = true;
                 ssaAgain = true;
             }
