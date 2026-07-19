@@ -918,6 +918,120 @@ bool inlineSmallFunctions(Module &module) {
     return changed;
 }
 
+std::unordered_set<std::string> pureFunctionNames(const Module &module) {
+    std::unordered_set<std::string> candidates;
+    std::unordered_map<std::string, std::vector<std::string>> callees;
+    for (const auto &function : module.functions) {
+        if (function.returnType.kind == TypeKind::Void) {
+            continue;
+        }
+        bool ok = true;
+        for (const auto &param : function.params) {
+            if (param.type.kind == TypeKind::Ptr) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == Opcode::Store || inst.opcode == Opcode::Load) {
+                    ok = false;
+                    break;
+                }
+                if (inst.opcode == Opcode::Call) {
+                    callees[function.name].push_back(inst.text);
+                }
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        if (ok) {
+            candidates.insert(function.name);
+        }
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto it = candidates.begin(); it != candidates.end();) {
+            bool ok = true;
+            for (const auto &callee : callees[*it]) {
+                if (!candidates.count(callee)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                it = candidates.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+    return candidates;
+}
+
+bool eliminatePureCallCommonSubexpressions(Module &module) {
+    const std::unordered_set<std::string> pure = pureFunctionNames(module);
+    if (pure.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (auto &function : module.functions) {
+        std::unordered_map<int, Value> replacements;
+
+        for (auto &block : function.blocks) {
+            std::unordered_map<std::string, Value> available;
+            std::vector<Instruction> kept;
+            kept.reserve(block.instructions.size());
+
+            for (auto inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+
+                if (inst.opcode == Opcode::Call && inst.result >= 0 && pure.count(inst.text)) {
+                    const std::string key = instKey(inst);
+                    const auto found = available.find(key);
+                    if (found != available.end()) {
+                        replacements[inst.result] = found->second;
+                        changed = true;
+                        continue;
+                    }
+                    available[key] = Value{inst.result, inst.resultType, {}, false};
+                    kept.push_back(std::move(inst));
+                    continue;
+                }
+
+                if (inst.opcode == Opcode::Call) {
+                    available.clear();
+                }
+                kept.push_back(std::move(inst));
+            }
+
+            block.instructions = std::move(kept);
+        }
+
+        if (!replacements.empty()) {
+            for (auto &block : function.blocks) {
+                for (auto &inst : block.instructions) {
+                    for (auto &operand : inst.operands) {
+                        operand = resolve(operand, replacements);
+                    }
+                }
+            }
+        }
+    }
+
+    return changed;
+}
+
 bool removeUnreachableFunctions(Module &module) {
     std::unordered_set<std::string> defined;
     defined.reserve(module.functions.size());
@@ -2197,6 +2311,10 @@ bool optimize(Module &module) {
             changed = true;
             again = true;
         }
+        if (eliminatePureCallCommonSubexpressions(module)) {
+            changed = true;
+            again = true;
+        }
         for (auto &function : module.functions) {
             if (truncateAfterTerminators(function)) {
                 changed = true;
@@ -2259,6 +2377,10 @@ bool optimize(Module &module) {
     bool ssaAgain = true;
     while (ssaAgain) {
         ssaAgain = false;
+        if (eliminatePureCallCommonSubexpressions(module)) {
+            changed = true;
+            ssaAgain = true;
+        }
         for (auto &function : module.functions) {
             if (truncateAfterTerminators(function)) {
                 changed = true;

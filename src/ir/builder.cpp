@@ -233,6 +233,19 @@ Value IRBuilder::buildExpr(const Expr &expr) {
         return constant(Type{TypeKind::F32}, floating->value);
     }
     if (const auto *ref = dynamic_cast<const DeclRefExpr *>(&expr)) {
+        bool localBinding = false;
+        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+            if (it->count(ref->name)) {
+                localBinding = true;
+                break;
+            }
+        }
+        if (!localBinding) {
+            const auto intConst = constInts_.find(ref->name);
+            if (intConst != constInts_.end()) {
+                return constant(Type{TypeKind::I32}, std::to_string(intConst->second));
+            }
+        }
         const Binding binding = lookup(ref->name);
         if (binding.isArray) {
             return binding.address;

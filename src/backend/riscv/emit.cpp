@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <ostream>
 #include <cstdlib>
@@ -1378,11 +1379,16 @@ public:
     IRCodeGen(const ir::Module &module, std::ostream &out) : module_(module), out_(out) {}
 
     void run() {
+        analyzeImmutableScalarGlobals();
         emitGlobals();
         out_ << "\t.text\n";
         for (const auto &function : module_.functions) {
             emitFunction(function);
         }
+    }
+
+    const std::unordered_map<std::string, std::unordered_set<std::string>> &tempFrameOperandsByFunction() const {
+        return tempFrameOperandsByFunction_;
     }
 
 private:
@@ -1442,6 +1448,46 @@ private:
         }
     }
 
+    void analyzeImmutableScalarGlobals() {
+        immutableScalarGlobals_.clear();
+        std::unordered_set<std::string> candidates;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind == ir::TypeKind::I32 && global.dimensions.empty()) {
+                immutableScalarGlobals_[global.name] = global.initValues.empty() ? "0" : global.initValues.front();
+                candidates.insert(global.name);
+            }
+        }
+        if (candidates.empty()) {
+            return;
+        }
+
+        auto invalidate = [&](const ir::Value &value) {
+            if (value.constant && value.name.size() >= 2 && value.name[0] == '@') {
+                immutableScalarGlobals_.erase(value.name.substr(1));
+            }
+        };
+        for (const auto &function : module_.functions) {
+            for (const auto &block : function.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::Store && inst.operands.size() >= 2) {
+                        invalidate(inst.operands[1]);
+                        if (inst.operands[0].type.kind == ir::TypeKind::Ptr) {
+                            invalidate(inst.operands[0]);
+                        }
+                    } else if (inst.opcode == ir::Opcode::Gep && !inst.operands.empty()) {
+                        invalidate(inst.operands[0]);
+                    } else if (inst.opcode == ir::Opcode::Call) {
+                        for (const auto &operand : inst.operands) {
+                            if (operand.type.kind == ir::TypeKind::Ptr) {
+                                invalidate(operand);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     void emitFunction(const ir::Function &function) {
         currentFunction_ = &function;
         currentFunctionName_ = function.name;
@@ -1453,6 +1499,9 @@ private:
         scalarFloatAllocas_.clear();
         globalValueRegs_.clear();
         globalValueFRegs_.clear();
+        globalBaseRegs_.clear();
+        scalarGlobalRegs_.clear();
+        scalarGlobalWriteback_.clear();
         transientRegs_.clear();
         transientFRegs_.clear();
         valueUseCounts_.clear();
@@ -1475,25 +1524,29 @@ private:
         analyzeRegisterAllocas(function);
         buildPhiCopies(function);
         analyzeGlobalValueRegisters(function);
+        analyzeGlobalBaseRegisters(function);
+        analyzeScalarGlobalRegisters(function);
         analyzeBlockLocalValues(function);
         prepareSavedRegisters(function);
         nextOffset_ = firstLocalOffset();
         collectValueSlots(function);
         omitFrame_ = !saveReturnAddress && activeSavedIntRegs_.empty() && activeSavedFloatRegs_.empty() &&
                      valueOffsets_.empty() && allocaOffsets_.empty() && maxStackParamSlots(function) == 0;
-        frameSize_ = alignTo(-nextOffset_ + 512, 16);
-        if (frameSize_ < 4096) {
-            frameSize_ = 4096;
-        }
+        frameSize_ = alignTo(-nextOffset_, 16);
 
         out_ << "\t.align 1\n";
         out_ << "\t.globl " << function.name << "\n";
         out_ << "\t.type " << function.name << ", @function\n";
         out_ << function.name << ":\n";
         if (!omitFrame_) {
-            out_ << "\tli t0, " << frameSize_ << "\n";
-            out_ << "\tsub sp, sp, t0\n";
-            out_ << "\tadd t1, sp, t0\n";
+            if (fitsI12IR(frameSize_) && fitsI12IR(-frameSize_)) {
+                out_ << "\taddi sp, sp, " << -frameSize_ << "\n";
+                out_ << "\taddi t1, sp, " << frameSize_ << "\n";
+            } else {
+                out_ << "\tli t0, " << frameSize_ << "\n";
+                out_ << "\tsub sp, sp, t0\n";
+                out_ << "\tadd t1, sp, t0\n";
+            }
             if (saveReturnAddress) {
                 out_ << "\tsd ra, -8(t1)\n";
             }
@@ -1505,6 +1558,18 @@ private:
                 out_ << "\tfsd " << activeSavedFloatRegs_[i] << ", " << savedFloatOffset(i) << "(t1)\n";
             }
             out_ << "\tmv s0, t1\n";
+        }
+        for (const auto &[name, reg] : globalBaseRegs_) {
+            out_ << "\tla " << reg << ", " << name << "\n";
+        }
+        for (const auto &[name, reg] : scalarGlobalRegs_) {
+            const auto base = globalBaseRegs_.find(name);
+            if (base != globalBaseRegs_.end()) {
+                out_ << "\tlw " << reg << ", 0(" << base->second << ")\n";
+            } else {
+                out_ << "\tla t6, " << name << "\n";
+                out_ << "\tlw " << reg << ", 0(t6)\n";
+            }
         }
 
         int intParam = 0;
@@ -1606,6 +1671,19 @@ private:
         }
 
         out_ << epilogueLabel_ << ":\n";
+        for (const auto &name : scalarGlobalWriteback_) {
+            const auto cached = scalarGlobalRegs_.find(name);
+            if (cached == scalarGlobalRegs_.end()) {
+                continue;
+            }
+            const auto base = globalBaseRegs_.find(name);
+            if (base != globalBaseRegs_.end()) {
+                out_ << "\tsw " << cached->second << ", 0(" << base->second << ")\n";
+            } else {
+                out_ << "\tla t6, " << name << "\n";
+                out_ << "\tsw " << cached->second << ", 0(t6)\n";
+            }
+        }
         if (!omitFrame_) {
             for (std::size_t i = 0; i < activeSavedFloatRegs_.size(); ++i) {
                 out_ << "\tfld " << activeSavedFloatRegs_[i] << ", " << savedFloatOffset(i) << "(s0)\n";
@@ -1796,6 +1874,7 @@ private:
         for (const auto &param : function.params) {
             if (!globalValueRegs_.count(param.id) && !globalValueFRegs_.count(param.id)) {
                 valueOffsets_[param.id] = allocateSlot();
+                tempFrameOperandsByFunction_[currentFunctionName_].insert(frameOperand(valueOffsets_[param.id]));
             }
         }
         for (const auto &block : function.blocks) {
@@ -1803,6 +1882,7 @@ private:
                 if (inst.result >= 0 && inst.opcode != ir::Opcode::Alloca &&
                     !globalValueRegs_.count(inst.result) && !globalValueFRegs_.count(inst.result)) {
                     valueOffsets_[inst.result] = allocateSlot();
+                    tempFrameOperandsByFunction_[currentFunctionName_].insert(frameOperand(valueOffsets_[inst.result]));
                 }
                 if (inst.opcode == ir::Opcode::Alloca && inst.result >= 0) {
                     if (scalarIntAllocas_.count(inst.result) || scalarFloatAllocas_.count(inst.result)) {
@@ -2390,8 +2470,9 @@ private:
         };
         std::sort(ints.begin(), ints.end(), hotter);
         std::sort(floats.begin(), floats.end(), hotter);
-        for (std::size_t i = 0; i < ints.size() && i < scalarIntRegs().size(); ++i) {
-            scalarIntAllocas_[ints[i].first] = scalarIntRegs()[i];
+        const auto &intRegs = functionHasRealCall(function) ? scalarIntRegs() : leafIntRegs();
+        for (std::size_t i = 0; i < ints.size() && i < intRegs.size(); ++i) {
+            scalarIntAllocas_[ints[i].first] = intRegs[i];
         }
         for (std::size_t i = 0; i < floats.size() && i < scalarFloatRegs().size(); ++i) {
             scalarFloatAllocas_[floats[i].first] = scalarFloatRegs()[i];
@@ -2422,6 +2503,12 @@ private:
         for (const auto &[_, reg] : globalValueRegs_) {
             addInt(reg);
         }
+        for (const auto &[_, reg] : globalBaseRegs_) {
+            addInt(reg);
+        }
+        for (const auto &[_, reg] : scalarGlobalRegs_) {
+            addInt(reg);
+        }
         for (const auto &[_, reg] : globalValueFRegs_) {
             addFloat(reg);
         }
@@ -2444,6 +2531,188 @@ private:
         if (hasFloatValue) {
             for (const auto &reg : floatCacheRegs()) {
                 addFloat(reg);
+            }
+        }
+    }
+
+    void analyzeGlobalBaseRegisters(const ir::Function &function) {
+        std::unordered_map<std::string, int> counts;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    if (operand.constant && !operand.name.empty() && operand.name[0] == '@') {
+                        counts[operand.name.substr(1)] += 2;
+                    }
+                }
+            }
+        }
+
+        std::vector<std::pair<std::string, int>> hot;
+        hot.reserve(counts.size());
+        for (const auto &[name, count] : counts) {
+            if (count >= 24) {
+                hot.push_back({name, count});
+            }
+        }
+        std::sort(hot.begin(), hot.end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first;
+        });
+
+        std::unordered_set<std::string> used;
+        for (const auto &[_, reg] : scalarIntAllocas_) {
+            used.insert(reg);
+        }
+        for (const auto &[_, reg] : globalValueRegs_) {
+            used.insert(reg);
+        }
+        for (const auto &[_, reg] : globalBaseRegs_) {
+            used.insert(reg);
+        }
+
+        for (const auto &[name, _] : hot) {
+            for (auto regIt = savedIntRegs().rbegin(); regIt != savedIntRegs().rend(); ++regIt) {
+                if (!used.count(*regIt)) {
+                    globalBaseRegs_[name] = *regIt;
+                    used.insert(*regIt);
+                    break;
+                }
+            }
+        }
+    }
+
+    bool isMutableScalarIntGlobal(const std::string &name) const {
+        for (const auto &global : module_.globals) {
+            if (global.name == name) {
+                return !global.isConst && global.type.kind == ir::TypeKind::I32 && global.dimensions.empty();
+            }
+        }
+        return false;
+    }
+
+    void analyzeScalarGlobalRegisters(const ir::Function &function) {
+        if (hugeControlFlowFunction(function)) {
+            return;
+        }
+
+        std::unordered_map<std::string, const ir::Function *> functionsByName;
+        for (const auto &candidate : module_.functions) {
+            functionsByName[candidate.name] = &candidate;
+        }
+        std::unordered_map<std::string, std::unordered_set<std::string>> directScalarAccesses;
+        std::unordered_map<std::string, std::vector<std::string>> directCalls;
+        for (const auto &candidate : module_.functions) {
+            for (const auto &block : candidate.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if ((inst.opcode == ir::Opcode::Load || inst.opcode == ir::Opcode::Store) && !inst.operands.empty()) {
+                        const std::size_t ptrIndex = inst.opcode == ir::Opcode::Load ? 0 : 1;
+                        if (ptrIndex < inst.operands.size()) {
+                            const ir::Value &ptr = inst.operands[ptrIndex];
+                            if (ptr.constant && ptr.name.size() >= 2 && ptr.name[0] == '@') {
+                                const std::string name = ptr.name.substr(1);
+                                if (isMutableScalarIntGlobal(name)) {
+                                    directScalarAccesses[candidate.name].insert(name);
+                                }
+                            }
+                        }
+                    } else if (inst.opcode == ir::Opcode::Call) {
+                        directCalls[candidate.name].push_back(inst.text);
+                    }
+                }
+            }
+        }
+
+        std::function<bool(const std::string &, const std::string &, std::unordered_set<std::string> &)> calleeMayAccess =
+            [&](const std::string &callee, const std::string &global, std::unordered_set<std::string> &visiting) -> bool {
+            if (!functionsByName.count(callee)) {
+                return true;
+            }
+            const auto direct = directScalarAccesses.find(callee);
+            if (direct != directScalarAccesses.end() && direct->second.count(global)) {
+                return true;
+            }
+            if (!visiting.insert(callee).second) {
+                return false;
+            }
+            const auto calls = directCalls.find(callee);
+            if (calls != directCalls.end()) {
+                for (const std::string &nested : calls->second) {
+                    if (calleeMayAccess(nested, global, visiting)) {
+                        return true;
+                    }
+                }
+            }
+            visiting.erase(callee);
+            return false;
+        };
+
+        std::unordered_map<std::string, int> scores;
+        std::unordered_set<std::string> written;
+        std::unordered_set<std::string> unsafeAcrossCall;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if ((inst.opcode == ir::Opcode::Load || inst.opcode == ir::Opcode::Store) && !inst.operands.empty()) {
+                    const std::size_t ptrIndex = inst.opcode == ir::Opcode::Load ? 0 : 1;
+                    if (ptrIndex >= inst.operands.size()) {
+                        continue;
+                    }
+                    const ir::Value &ptr = inst.operands[ptrIndex];
+                    if (!ptr.constant || ptr.name.size() < 2 || ptr.name[0] != '@') {
+                        continue;
+                    }
+                    const std::string name = ptr.name.substr(1);
+                    if (!isMutableScalarIntGlobal(name)) {
+                        continue;
+                    }
+                    scores[name] += inst.opcode == ir::Opcode::Load ? 2 : 3;
+                    if (inst.opcode == ir::Opcode::Store) {
+                        written.insert(name);
+                    }
+                } else if (inst.opcode == ir::Opcode::Call) {
+                    for (const auto &global : module_.globals) {
+                        if (!isMutableScalarIntGlobal(global.name)) {
+                            continue;
+                        }
+                        std::unordered_set<std::string> visiting;
+                        if (calleeMayAccess(inst.text, global.name, visiting)) {
+                            unsafeAcrossCall.insert(global.name);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<std::pair<std::string, int>> hot;
+        for (const auto &[name, score] : scores) {
+            if (score >= 4 && !unsafeAcrossCall.count(name)) {
+                hot.push_back({name, score});
+            }
+        }
+        std::sort(hot.begin(), hot.end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first;
+        });
+
+        std::unordered_set<std::string> used;
+        for (const auto &[_, reg] : scalarIntAllocas_) used.insert(reg);
+        for (const auto &[_, reg] : globalValueRegs_) used.insert(reg);
+        for (const auto &[_, reg] : globalBaseRegs_) used.insert(reg);
+
+        for (const auto &[name, _] : hot) {
+            for (const std::string &reg : savedIntRegs()) {
+                if (used.count(reg)) {
+                    continue;
+                }
+                scalarGlobalRegs_[name] = reg;
+                used.insert(reg);
+                if (written.count(name)) {
+                    scalarGlobalWriteback_.insert(name);
+                }
+                break;
             }
         }
     }
@@ -2524,6 +2793,32 @@ private:
         case ir::Opcode::Alloca:
             break;
         case ir::Opcode::Load:
+            if (inst.operands[0].constant && !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@' &&
+                inst.resultType.kind == ir::TypeKind::I32) {
+                const auto immutable = immutableScalarGlobals_.find(inst.operands[0].name.substr(1));
+                if (immutable != immutableScalarGlobals_.end()) {
+                    const std::string dst = prepareIntLoadResultRegister(inst);
+                    out_ << "\tli " << dst << ", " << immutable->second << "\n";
+                    if (dst == "a0") {
+                        storeResult(inst);
+                    }
+                    break;
+                }
+            }
+            if (inst.operands[0].constant && !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@' &&
+                inst.resultType.kind == ir::TypeKind::I32) {
+                const auto cachedGlobal = scalarGlobalRegs_.find(inst.operands[0].name.substr(1));
+                if (cachedGlobal != scalarGlobalRegs_.end()) {
+                    const std::string dst = prepareIntLoadResultRegister(inst);
+                    if (dst != cachedGlobal->second) {
+                        out_ << "\tmv " << dst << ", " << cachedGlobal->second << "\n";
+                    }
+                    if (dst == "a0") {
+                        storeResult(inst);
+                    }
+                    break;
+                }
+            }
             if (!inst.operands[0].constant) {
                 const auto intAlloca = scalarIntAllocas_.find(inst.operands[0].id);
                 if (intAlloca != scalarIntAllocas_.end()) {
@@ -2556,6 +2851,14 @@ private:
             }
             break;
         case ir::Opcode::Store:
+            if (inst.operands[1].constant && !inst.operands[1].name.empty() && inst.operands[1].name[0] == '@' &&
+                inst.operands[0].type.kind == ir::TypeKind::I32) {
+                const auto cachedGlobal = scalarGlobalRegs_.find(inst.operands[1].name.substr(1));
+                if (cachedGlobal != scalarGlobalRegs_.end()) {
+                    emitValueOperandTo(cachedGlobal->second, inst.operands[0]);
+                    break;
+                }
+            }
             if (!inst.operands[1].constant) {
                 const auto intAlloca = scalarIntAllocas_.find(inst.operands[1].id);
                 if (intAlloca != scalarIntAllocas_.end()) {
@@ -2574,12 +2877,24 @@ private:
                 out_ << "\tfsw fa0, 0(a0)\n";
             } else {
                 std::string sourceReg = existingIntRegister(inst.operands[0]);
-                if (sourceReg.empty() || sourceReg == "a0") {
-                    emitValueOperandTo("t2", inst.operands[0]);
-                    sourceReg = "t2";
+                const bool globalAddress = inst.operands[1].constant && !inst.operands[1].name.empty() &&
+                                           inst.operands[1].name[0] == '@';
+                if (globalAddress) {
+                    if (sourceReg.empty()) {
+                        emitValueOperandTo("a0", inst.operands[0]);
+                        sourceReg = "a0";
+                    }
+                    const std::string addressReg = (sourceReg == "a0" || sourceReg == "t2") ? "t3" : "a0";
+                    emitAddressOperandTo(addressReg, inst.operands[1]);
+                    out_ << "\tsw " << sourceReg << ", 0(" << addressReg << ")\n";
+                } else {
+                    if (sourceReg.empty() || sourceReg == "a0") {
+                        emitValueOperandTo("t2", inst.operands[0]);
+                        sourceReg = "t2";
+                    }
+                    emitAddressOperand(inst.operands[1]);
+                    out_ << "\tsw " << sourceReg << ", 0(a0)\n";
                 }
-                emitAddressOperand(inst.operands[1]);
-                out_ << "\tsw " << sourceReg << ", 0(a0)\n";
             }
             break;
         case ir::Opcode::Gep:
@@ -2663,15 +2978,24 @@ private:
     }
 
     void emitGepAddressTo(const std::string &dst, const ir::Instruction &inst) {
-        emitAddressOperandTo("t2", inst.operands[0]);
+        std::string baseReg = "t2";
+        if (inst.operands[0].constant && !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@') {
+            const auto globalBase = globalBaseRegs_.find(inst.operands[0].name.substr(1));
+            if (globalBase != globalBaseRegs_.end()) {
+                baseReg = globalBase->second;
+            }
+        }
+        if (baseReg == "t2") {
+            emitAddressOperandTo("t2", inst.operands[0]);
+        }
         if (inst.operands[1].constant && inst.operands[1].type.kind == ir::TypeKind::I32) {
             const long long index = std::strtoll(inst.operands[1].name.c_str(), nullptr, 0);
             const long long offset = index * 4;
             if (fitsI12IR(static_cast<int>(offset))) {
-                out_ << "\taddi " << dst << ", t2, " << offset << "\n";
+                out_ << "\taddi " << dst << ", " << baseReg << ", " << offset << "\n";
             } else {
                 out_ << "\tli " << dst << ", " << offset << "\n";
-                out_ << "\tadd " << dst << ", t2, " << dst << "\n";
+                out_ << "\tadd " << dst << ", " << baseReg << ", " << dst << "\n";
             }
         } else {
             const std::string indexReg = existingIntRegister(inst.operands[1]);
@@ -2681,7 +3005,7 @@ private:
                 emitValueOperandTo(dst, inst.operands[1]);
                 out_ << "\tslli " << dst << ", " << dst << ", 2\n";
             }
-            out_ << "\tadd " << dst << ", t2, " << dst << "\n";
+            out_ << "\tadd " << dst << ", " << baseReg << ", " << dst << "\n";
         }
     }
 
@@ -2702,13 +3026,17 @@ private:
     }
 
     void emitFoldedGepLoad(const ir::Instruction &gep, const ir::Instruction &load) {
-        emitGepAddress(gep);
         if (load.resultType.kind == ir::TypeKind::F32) {
+            emitGepAddress(gep);
             out_ << "\tflw fa0, 0(a0)\n";
             storeFResult(load);
         } else {
-            out_ << "\tlw a0, 0(a0)\n";
-            storeResult(load);
+            const std::string dst = prepareIntLoadResultRegister(load);
+            emitGepAddressTo(dst, gep);
+            out_ << "\tlw " << dst << ", 0(" << dst << ")\n";
+            if (dst == "a0") {
+                storeResult(load);
+            }
         }
     }
 
@@ -3187,22 +3515,142 @@ private:
             }
             return;
         }
+        bool allIntCopies = true;
         for (const PhiCopy &copy : copies) {
             if (copy.targetType.kind == ir::TypeKind::F32) {
+                allIntCopies = false;
+                break;
+            }
+        }
+        if (allIntCopies) {
+            struct IntCopy {
+                ir::Value source;
+                std::string targetLoc;
+                std::string targetReg;
+                int targetOffset = 0;
+                bool targetIsReg = false;
+                std::string sourceLoc;
+                std::string sourceReg;
+                bool sourceIsTemp = false;
+                bool constant = false;
+            };
+            std::vector<IntCopy> intCopies;
+            intCopies.reserve(copies.size());
+            for (const PhiCopy &copy : copies) {
+                IntCopy item;
+                item.source = copy.source;
+                item.targetReg = phiTargetReg(copy);
+                if (!item.targetReg.empty()) {
+                    item.targetIsReg = true;
+                    item.targetLoc = "R:" + item.targetReg;
+                } else {
+                    item.targetOffset = valueOffsets_[copy.target];
+                    item.targetLoc = "M:" + std::to_string(item.targetOffset);
+                }
+                item.constant = copy.source.constant;
+                if (!item.constant && copy.source.id >= 0) {
+                    item.sourceReg = phiSourceReg(copy);
+                    if (!item.sourceReg.empty()) {
+                        item.sourceLoc = "R:" + item.sourceReg;
+                    } else {
+                        item.sourceLoc = "M:" + std::to_string(valueOffsets_[copy.source.id]);
+                    }
+                }
+                if (item.constant || item.targetLoc != item.sourceLoc) {
+                    intCopies.push_back(item);
+                }
+            }
+
+            const std::string tempReg = "t0";
+            auto emitIntCopy = [&](const IntCopy &copy) {
+                if (copy.targetIsReg) {
+                    if (copy.sourceIsTemp) {
+                        if (copy.targetReg != tempReg) {
+                            out_ << "\tmv " << copy.targetReg << ", " << tempReg << "\n";
+                        }
+                    } else {
+                        emitValueOperandTo(copy.targetReg, copy.source);
+                    }
+                    return;
+                }
+                if (copy.sourceIsTemp) {
+                    storeReg(tempReg, copy.targetOffset);
+                } else if (!copy.sourceReg.empty()) {
+                    storeReg(copy.sourceReg, copy.targetOffset);
+                } else {
+                    emitValueOperandTo("a0", copy.source);
+                    storeReg("a0", copy.targetOffset);
+                }
+            };
+
+            while (!intCopies.empty()) {
+                std::unordered_set<std::string> sources;
+                for (const auto &copy : intCopies) {
+                    if (!copy.constant && !copy.sourceLoc.empty()) {
+                        sources.insert(copy.sourceLoc);
+                    }
+                }
+                bool emitted = false;
+                for (std::size_t i = 0; i < intCopies.size(); ++i) {
+                    if (!sources.count(intCopies[i].targetLoc)) {
+                        emitIntCopy(intCopies[i]);
+                        intCopies.erase(intCopies.begin() + static_cast<std::ptrdiff_t>(i));
+                        emitted = true;
+                        break;
+                    }
+                }
+                if (emitted) {
+                    continue;
+                }
+
+                const IntCopy breaker = intCopies.front();
+                if (breaker.targetIsReg) {
+                    out_ << "\tmv " << tempReg << ", " << breaker.targetReg << "\n";
+                } else {
+                    loadReg(tempReg, breaker.targetOffset);
+                }
+                for (auto &copy : intCopies) {
+                    if (!copy.constant && copy.sourceLoc == breaker.targetLoc) {
+                        copy.sourceIsTemp = true;
+                        copy.sourceReg = tempReg;
+                        copy.sourceLoc = "R:" + tempReg;
+                    }
+                }
+            }
+            return;
+        }
+        const int snapshotBytes = alignTo(static_cast<int>(copies.size()) * 16, 16);
+        if (fitsI12IR(-snapshotBytes)) {
+            out_ << "\taddi sp, sp, " << -snapshotBytes << "\n";
+        } else {
+            out_ << "\tli t6, " << snapshotBytes << "\n";
+            out_ << "\tsub sp, sp, t6\n";
+        }
+        std::vector<bool> snapshotStored(copies.size(), false);
+        for (std::size_t i = 0; i < copies.size(); ++i) {
+            const PhiCopy &copy = copies[i];
+            if (copy.source.constant) {
+                continue;
+            }
+            const int offset = 8 + static_cast<int>(i) * 16;
+            if (copy.targetType.kind == ir::TypeKind::F32) {
                 emitFloatOperandTo("fa0", copy.source);
-                out_ << "\taddi sp, sp, -16\n";
-                out_ << "\tfsw fa0, 8(sp)\n";
+                out_ << "\tfsw fa0, " << offset << "(sp)\n";
             } else {
                 emitValueOperandTo("a0", copy.source);
-                out_ << "\taddi sp, sp, -16\n";
-                out_ << "\tsd a0, 8(sp)\n";
+                out_ << "\tsd a0, " << offset << "(sp)\n";
             }
+            snapshotStored[i] = true;
         }
         for (std::size_t i = copies.size(); i > 0; --i) {
             const PhiCopy &copy = copies[i - 1];
+            const int offset = 8 + static_cast<int>(i - 1) * 16;
             if (copy.targetType.kind == ir::TypeKind::F32) {
-                out_ << "\tflw fa0, 8(sp)\n";
-                out_ << "\taddi sp, sp, 16\n";
+                if (snapshotStored[i - 1]) {
+                    out_ << "\tflw fa0, " << offset << "(sp)\n";
+                } else {
+                    emitFloatOperandTo("fa0", copy.source);
+                }
                 const auto targetReg = globalValueFRegs_.find(copy.target);
                 if (targetReg != globalValueFRegs_.end()) {
                     if (targetReg->second != "fa0") {
@@ -3211,8 +3659,11 @@ private:
                 }
             } else {
                 const auto targetReg = globalValueRegs_.find(copy.target);
-                out_ << "\tld a0, 8(sp)\n";
-                out_ << "\taddi sp, sp, 16\n";
+                if (snapshotStored[i - 1]) {
+                    out_ << "\tld a0, " << offset << "(sp)\n";
+                } else {
+                    emitValueOperandTo("a0", copy.source);
+                }
                 if (targetReg != globalValueRegs_.end()) {
                     if (targetReg->second != "a0") {
                         out_ << "\tmv " << targetReg->second << ", a0\n";
@@ -3226,6 +3677,12 @@ private:
             } else if (!globalValueRegs_.count(copy.target)) {
                 storeReg("a0", valueOffsets_[copy.target]);
             }
+        }
+        if (fitsI12IR(snapshotBytes)) {
+            out_ << "\taddi sp, sp, " << snapshotBytes << "\n";
+        } else {
+            out_ << "\tli t6, " << snapshotBytes << "\n";
+            out_ << "\tadd sp, sp, t6\n";
         }
     }
 
@@ -3270,6 +3727,46 @@ private:
             if (rhs > 0 && isPowerOfTwo(rhs)) {
                 emitValueOperandTo(dst, inst.operands[0]);
                 out_ << "\tslliw " << dst << ", " << dst << ", " << log2Int(rhs) << "\n";
+                finish();
+                return true;
+            }
+            return false;
+        case ir::Opcode::Div:
+            if (rhs == 1) {
+                emitValueOperandTo(dst, inst.operands[0]);
+                finish();
+                return true;
+            }
+            if (rhs > 0 && isPowerOfTwo(rhs)) {
+                const int shift = log2Int(rhs);
+                emitValueOperandTo(dst, inst.operands[0]);
+                out_ << "\tsraiw t0, " << dst << ", 31\n";
+                out_ << "\tsrliw t0, t0, " << (32 - shift) << "\n";
+                out_ << "\taddw " << dst << ", " << dst << ", t0\n";
+                out_ << "\tsraiw " << dst << ", " << dst << ", " << shift << "\n";
+                finish();
+                return true;
+            }
+            return false;
+        case ir::Opcode::Mod:
+            if (rhs == 1) {
+                out_ << "\tli " << dst << ", 0\n";
+                finish();
+                return true;
+            }
+            if (rhs > 0 && isPowerOfTwo(rhs)) {
+                const int shift = log2Int(rhs);
+                emitValueOperandTo(dst, inst.operands[0]);
+                out_ << "\tsraiw t0, " << dst << ", 31\n";
+                out_ << "\tsrliw t0, t0, " << (32 - shift) << "\n";
+                out_ << "\taddw " << dst << ", " << dst << ", t0\n";
+                if (fitsI12IR(static_cast<int>(rhs - 1))) {
+                    out_ << "\tandi " << dst << ", " << dst << ", " << (rhs - 1) << "\n";
+                } else {
+                    out_ << "\tslli " << dst << ", " << dst << ", " << (64 - shift) << "\n";
+                    out_ << "\tsrli " << dst << ", " << dst << ", " << (64 - shift) << "\n";
+                }
+                out_ << "\tsubw " << dst << ", " << dst << ", t0\n";
                 finish();
                 return true;
             }
@@ -3647,6 +4144,13 @@ private:
 
     void emitAddressOperand(const ir::Value &value) {
         if (value.constant && !value.name.empty() && value.name[0] == '@') {
+            const auto globalBase = globalBaseRegs_.find(value.name.substr(1));
+            if (globalBase != globalBaseRegs_.end()) {
+                if (globalBase->second != "a0") {
+                    out_ << "\tmv a0, " << globalBase->second << "\n";
+                }
+                return;
+            }
             out_ << "\tla a0, " << value.name.substr(1) << "\n";
             return;
         }
@@ -3674,6 +4178,13 @@ private:
             return;
         }
         if (value.constant && !value.name.empty() && value.name[0] == '@') {
+            const auto globalBase = globalBaseRegs_.find(value.name.substr(1));
+            if (globalBase != globalBaseRegs_.end()) {
+                if (globalBase->second != reg) {
+                    out_ << "\tmv " << reg << ", " << globalBase->second << "\n";
+                }
+                return;
+            }
             out_ << "\tla " << reg << ", " << value.name.substr(1) << "\n";
             return;
         }
@@ -3790,11 +4301,29 @@ private:
     }
 
     bool isReservedIntReg(const std::string &reg) const {
-        return isGlobalIntReg(reg) || isScalarIntReg(reg);
+        return isGlobalIntReg(reg) || isScalarIntReg(reg) || isGlobalBaseReg(reg) || isScalarGlobalReg(reg);
     }
 
     bool isGlobalFloatReg(const std::string &reg) const {
         for (const auto &[_, globalReg] : globalValueFRegs_) {
+            if (globalReg == reg) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isGlobalBaseReg(const std::string &reg) const {
+        for (const auto &[_, baseReg] : globalBaseRegs_) {
+            if (baseReg == reg) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isScalarGlobalReg(const std::string &reg) const {
+        for (const auto &[_, globalReg] : scalarGlobalRegs_) {
             if (globalReg == reg) {
                 return true;
             }
@@ -3916,6 +4445,10 @@ private:
         return ((value + align - 1) / align) * align;
     }
 
+    static std::string frameOperand(int offset) {
+        return std::to_string(offset) + "(s0)";
+    }
+
     static const std::vector<std::string> &savedIntRegs() {
         static const std::vector<std::string> regs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
         return regs;
@@ -4007,18 +4540,23 @@ private:
 
     const ir::Module &module_;
     std::ostream &out_;
+    std::unordered_map<std::string, std::string> immutableScalarGlobals_;
     const ir::Function *currentFunction_ = nullptr;
     std::string currentFunctionName_;
     std::string currentBlockName_;
     std::string nextBlockName_;
     std::unordered_map<int, int> valueOffsets_;
     std::unordered_map<int, int> allocaOffsets_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> tempFrameOperandsByFunction_;
     std::unordered_map<int, std::string> valueRegs_;
     std::unordered_map<int, std::string> valueFRegs_;
     std::unordered_map<int, std::string> scalarIntAllocas_;
     std::unordered_map<int, std::string> scalarFloatAllocas_;
     std::unordered_map<int, std::string> globalValueRegs_;
     std::unordered_map<int, std::string> globalValueFRegs_;
+    std::unordered_map<std::string, std::string> globalBaseRegs_;
+    std::unordered_map<std::string, std::string> scalarGlobalRegs_;
+    std::unordered_set<std::string> scalarGlobalWriteback_;
     std::unordered_map<int, std::string> transientRegs_;
     std::unordered_map<int, std::string> transientFRegs_;
     std::unordered_map<int, int> valueUseCounts_;
@@ -4124,6 +4662,10 @@ std::string memoryBaseRegister(const std::string &operand) {
         return {};
     }
     return operand.substr(open + 1, close - open - 1);
+}
+
+bool isFrameMemoryOperand(const std::string &operand) {
+    return memoryBaseRegister(operand) == "s0";
 }
 
 bool replaceMemoryBaseRegister(std::string &operand, const std::unordered_map<std::string, std::string> &copies) {
@@ -4297,6 +4839,19 @@ bool fitsI12Asm(long long value) {
     return value >= -2048 && value <= 2047;
 }
 
+bool parseMemoryOffsetBase(const std::string &operand, long long &offset, std::string &base) {
+    const std::size_t open = operand.find('(');
+    const std::size_t close = operand.find(')', open == std::string::npos ? 0 : open);
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+        return false;
+    }
+    if (!parseAsmImmediate(operand.substr(0, open), offset)) {
+        return false;
+    }
+    base = operand.substr(open + 1, close - open - 1);
+    return true;
+}
+
 bool positivePowerOfTwo(long long value) {
     return value > 0 && (value & (value - 1)) == 0;
 }
@@ -4380,6 +4935,211 @@ void peepholeMachine(std::vector<MachineLine> &lines) {
         }
         lines = std::move(next);
     }
+}
+
+void foldFrameAddressMaterialization(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+
+    auto addiConst = [](const MachineLine &line, std::string &dst, std::string &src, long long &imm) {
+        if (!line.instruction() || line.op != "addi" || line.args.size() != 3 ||
+            !parseAsmImmediate(line.args[2], imm)) {
+            return false;
+        }
+        dst = line.args[0];
+        src = line.args[1];
+        return true;
+    };
+    auto usedLaterBeforeDef = [&](std::size_t start, const std::string &reg) {
+        for (std::size_t j = start; j < lines.size(); ++j) {
+            if (!lines[j].instruction() || isAsmLabel(lines[j])) {
+                return false;
+            }
+            MachineAccess access = accessOf(lines[j]);
+            if (access.uses.count(reg)) {
+                return true;
+            }
+            if (access.defs.count(reg) || access.barrier) {
+                return false;
+            }
+        }
+        return false;
+    };
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (i + 1 < lines.size() && lines[i].instruction() && lines[i + 1].instruction()) {
+            std::string addr;
+            std::string base;
+            long long baseOffset = 0;
+            if (addiConst(lines[i], addr, base, baseOffset) && isRegisterName(base) &&
+                (isLoadOp(lines[i + 1].op) || isStoreOp(lines[i + 1].op)) && lines[i + 1].args.size() == 2) {
+                long long memOffset = 0;
+                std::string memBase;
+                const bool addressOverwrittenByLoad = isLoadOp(lines[i + 1].op) && lines[i + 1].args[0] == addr;
+                if (parseMemoryOffsetBase(lines[i + 1].args[1], memOffset, memBase) && memBase == addr &&
+                    fitsI12Asm(baseOffset + memOffset) &&
+                    (addressOverwrittenByLoad || !usedLaterBeforeDef(i + 2, addr))) {
+                    lines[i + 1].args[1] = std::to_string(baseOffset + memOffset) + "(" + base + ")";
+                    remove[i] = true;
+                    continue;
+                }
+            }
+        }
+
+        if (i + 2 < lines.size() && lines[i].instruction() && lines[i + 1].instruction() && lines[i + 2].instruction()) {
+            std::string baseReg;
+            std::string frameReg;
+            long long baseOffset = 0;
+            std::string addrReg;
+            std::string srcReg;
+            long long extraOffset = 0;
+            if (addiConst(lines[i], baseReg, frameReg, baseOffset) && frameReg == "s0" &&
+                addiConst(lines[i + 1], addrReg, srcReg, extraOffset) && srcReg == baseReg &&
+                (isLoadOp(lines[i + 2].op) || isStoreOp(lines[i + 2].op)) && lines[i + 2].args.size() == 2) {
+                long long memOffset = 0;
+                std::string memBase;
+                if (parseMemoryOffsetBase(lines[i + 2].args[1], memOffset, memBase) && memBase == addrReg &&
+                    fitsI12Asm(baseOffset + extraOffset + memOffset) &&
+                    !usedLaterBeforeDef(i + 3, baseReg) && !usedLaterBeforeDef(i + 3, addrReg)) {
+                    lines[i + 2].args[1] = std::to_string(baseOffset + extraOffset + memOffset) + "(s0)";
+                    remove[i] = true;
+                    remove[i + 1] = true;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+void propagateZeroToStores(std::vector<MachineLine> &lines) {
+    std::unordered_set<std::string> zeroRegs;
+    auto trackableIntReg = [](const std::string &reg) {
+        return isIntegerRegisterName(reg) && reg != "zero" && reg != "sp" && reg != "ra" &&
+               reg != "gp" && reg != "tp" && reg != "s0";
+    };
+    for (MachineLine &line : lines) {
+        if (!line.instruction() || isAsmLabel(line)) {
+            zeroRegs.clear();
+            continue;
+        }
+
+        MachineAccess access = accessOf(line);
+        if (access.barrier) {
+            zeroRegs.clear();
+            continue;
+        }
+
+        if ((line.op == "sw" || line.op == "sd") && line.args.size() == 2 && zeroRegs.count(line.args[0])) {
+            line.args[0] = "zero";
+            access = accessOf(line);
+        }
+
+        for (const std::string &def : access.defs) {
+            zeroRegs.erase(def);
+        }
+        if (line.op == "li" && line.args.size() == 2 && line.args[1] == "0" &&
+            trackableIntReg(line.args[0])) {
+            zeroRegs.insert(line.args[0]);
+        }
+        if (line.op == "mv" && line.args.size() == 2 && line.args[1] == "zero" &&
+            trackableIntReg(line.args[0])) {
+            zeroRegs.insert(line.args[0]);
+        }
+    }
+}
+
+void mergeAdjacentZeroStores(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        MachineLine &first = lines[i];
+        MachineLine &second = lines[i + 1];
+        if (!first.instruction() || !second.instruction() ||
+            first.op != "sw" || second.op != "sw" ||
+            first.args.size() != 2 || second.args.size() != 2 ||
+            first.args[0] != "zero" || second.args[0] != "zero") {
+            continue;
+        }
+        long long firstOffset = 0;
+        long long secondOffset = 0;
+        std::string firstBase;
+        std::string secondBase;
+        if (!parseMemoryOffsetBase(first.args[1], firstOffset, firstBase) ||
+            !parseMemoryOffsetBase(second.args[1], secondOffset, secondBase) ||
+            firstBase != secondBase) {
+            continue;
+        }
+        const long long low = std::min(firstOffset, secondOffset);
+        const long long high = std::max(firstOffset, secondOffset);
+        if (high != low + 4 || (low % 8) != 0 || !fitsI12Asm(low)) {
+            continue;
+        }
+        first.op = "sd";
+        first.args[1] = std::to_string(low) + "(" + firstBase + ")";
+        remove[i + 1] = true;
+        ++i;
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+void fuseMaterializedBranches(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        MachineLine &def = lines[i];
+        MachineLine &branch = lines[i + 1];
+        if (!def.instruction() || !branch.instruction() ||
+            (branch.op != "beqz" && branch.op != "bnez") || branch.args.size() != 2) {
+            continue;
+        }
+        const std::string &condReg = branch.args[0];
+        const std::string &target = branch.args[1];
+
+        if (def.op == "slt" && def.args.size() == 3 && def.args[0] == condReg) {
+            const std::string &lhs = def.args[1];
+            const std::string &rhs = def.args[2];
+            if (condReg != lhs && condReg != rhs) {
+                branch = machineInst(branch.op == "bnez" ? "blt" : "bge", {lhs, rhs, target});
+                remove[i] = true;
+                continue;
+            }
+        }
+        if ((def.op == "seqz" || def.op == "snez") && def.args.size() == 2 && def.args[0] == condReg) {
+            const std::string &src = def.args[1];
+            if (condReg != src) {
+                const bool branchWhenTrue = branch.op == "bnez";
+                const bool condIsEqZero = def.op == "seqz";
+                const bool branchOnZero = branchWhenTrue == condIsEqZero;
+                branch = machineInst(branchOnZero ? "beqz" : "bnez", {src, target});
+                remove[i] = true;
+                continue;
+            }
+        }
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
 }
 
 void foldImmediateProducer(std::vector<MachineLine> &lines) {
@@ -4639,6 +5399,59 @@ void eliminateDeadMoves(std::vector<MachineLine> &lines) {
     lines = std::move(kept);
 }
 
+void eliminateDeadPureDefinitions(std::vector<MachineLine> &lines) {
+    std::vector<bool> remove(lines.size(), false);
+    std::size_t blockBegin = 0;
+    auto flushBlock = [&](std::size_t blockEnd) {
+        std::unordered_set<std::string> live;
+        for (std::size_t i = blockEnd; i-- > blockBegin;) {
+            if (!lines[i].instruction()) {
+                continue;
+            }
+            MachineAccess access = accessOf(lines[i]);
+            if (access.barrier) {
+                live.clear();
+            }
+            if (isPureDefinitionInstruction(lines[i]) && access.defs.size() == 1) {
+                const std::string &dst = *access.defs.begin();
+                if (!isCrossBlockRegister(dst) && !live.count(dst)) {
+                    remove[i] = true;
+                    continue;
+                }
+            }
+            for (const std::string &def : access.defs) {
+                live.erase(def);
+            }
+            for (const std::string &use : access.uses) {
+                live.insert(use);
+            }
+        }
+    };
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!lines[i].instruction()) {
+            flushBlock(i);
+            blockBegin = i + 1;
+        } else {
+            MachineAccess access = accessOf(lines[i]);
+            if (access.barrier) {
+                flushBlock(i + 1);
+                blockBegin = i + 1;
+            }
+        }
+    }
+    flushBlock(lines.size());
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
 void eliminateOverwrittenDefs(std::vector<MachineLine> &lines) {
     std::vector<bool> remove(lines.size(), false);
     for (std::size_t i = 0; i < lines.size(); ++i) {
@@ -4676,6 +5489,11 @@ struct AvailableLoad {
     std::string op;
     std::string reg;
     std::string base;
+};
+
+struct AvailableFrameStore {
+    std::string op;
+    std::unordered_set<std::string> regs;
 };
 
 std::string loadAvailabilityKey(const MachineLine &line) {
@@ -4741,6 +5559,255 @@ void eliminateRedundantLoads(std::vector<MachineLine> &lines) {
         }
 
         killAvailableLoads(loads, access.defs);
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!remove[i]) {
+            kept.push_back(std::move(lines[i]));
+        }
+    }
+    lines = std::move(kept);
+}
+
+void forwardFrameStoreLoads(std::vector<MachineLine> &lines) {
+    std::unordered_map<std::string, AvailableFrameStore> stores;
+
+    auto killDefinedRegs = [&](const std::unordered_set<std::string> &defs) {
+        if (defs.empty() || stores.empty()) {
+            return;
+        }
+        if (defs.count("s0")) {
+            stores.clear();
+            return;
+        }
+        for (auto it = stores.begin(); it != stores.end();) {
+            for (const std::string &def : defs) {
+                it->second.regs.erase(def);
+            }
+            if (it->second.regs.empty()) {
+                it = stores.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    auto rememberCopy = [&](const std::string &dst, const std::string &src, const std::string &op) {
+        if (!copyPropagatableRegister(dst) || !copyPropagatableRegister(src)) {
+            return;
+        }
+        for (auto &[_, stored] : stores) {
+            const bool sameClass = (op == "mv" && stored.op != "fsw" && stored.op != "fsd") ||
+                                   (op == "fmv.s" && (stored.op == "fsw" || stored.op == "fsd"));
+            if (sameClass && stored.regs.count(src)) {
+                stored.regs.insert(dst);
+            }
+        }
+    };
+
+    for (MachineLine &line : lines) {
+        if (!line.instruction() || isAsmLabel(line)) {
+            stores.clear();
+            continue;
+        }
+
+        MachineAccess access = accessOf(line);
+        if (access.barrier) {
+            stores.clear();
+            continue;
+        }
+
+        if (isMoveInstruction(line) && line.args.size() == 2) {
+            killDefinedRegs(access.defs);
+            rememberCopy(line.args[0], line.args[1], line.op);
+            continue;
+        }
+
+        if (isLoadOp(line.op) && line.args.size() == 2 && isFrameMemoryOperand(line.args[1])) {
+            const auto found = stores.find(line.args[1]);
+            if (found != stores.end() && matchingLoadStore(line.op, found->second.op) && !found->second.regs.empty()) {
+                const std::string replacementReg = *found->second.regs.begin();
+                if (replacementReg == line.args[0]) {
+                    line = MachineLine{};
+                } else {
+                    const bool floatMove = line.op == "flw" || line.op == "fld";
+                    line = machineInst(floatMove ? "fmv.s" : "mv", {line.args[0], replacementReg});
+                }
+                access = accessOf(line);
+            }
+        } else if (isStoreOp(line.op) && line.args.size() == 2 && isFrameMemoryOperand(line.args[1])) {
+            AvailableFrameStore stored;
+            stored.op = line.op;
+            if (copyPropagatableRegister(line.args[0])) {
+                stored.regs.insert(line.args[0]);
+            }
+            if (stored.regs.empty()) {
+                stores.erase(line.args[1]);
+            } else {
+                stores[line.args[1]] = std::move(stored);
+            }
+        }
+
+        killDefinedRegs(access.defs);
+    }
+
+    std::vector<MachineLine> kept;
+    kept.reserve(lines.size());
+    for (MachineLine &line : lines) {
+        if (line.kind != MachineLineKind::Raw || !line.raw.empty()) {
+            kept.push_back(std::move(line));
+        }
+    }
+    lines = std::move(kept);
+}
+
+std::string asmFunctionNameFromSize(const MachineLine &line) {
+    if (line.instruction()) {
+        return {};
+    }
+    const std::string text = trimAsm(line.raw);
+    const std::string prefix = ".size ";
+    if (text.rfind(prefix, 0) != 0) {
+        return {};
+    }
+    const std::size_t start = prefix.size();
+    const std::size_t comma = text.find(',', start);
+    if (comma == std::string::npos || comma <= start) {
+        return {};
+    }
+    return text.substr(start, comma - start);
+}
+
+std::string asmFunctionNameFromType(const MachineLine &line) {
+    if (line.instruction()) {
+        return {};
+    }
+    const std::string text = trimAsm(line.raw);
+    const std::string prefix = ".type ";
+    if (text.rfind(prefix, 0) != 0 || text.find("@function") == std::string::npos) {
+        return {};
+    }
+    const std::size_t start = prefix.size();
+    const std::size_t comma = text.find(',', start);
+    if (comma == std::string::npos || comma <= start) {
+        return {};
+    }
+    return text.substr(start, comma - start);
+}
+
+void eliminateDeadFrameTempStores(
+    std::vector<MachineLine> &lines,
+    const std::unordered_map<std::string, std::unordered_set<std::string>> &tempFrameOperandsByFunction) {
+    if (tempFrameOperandsByFunction.empty()) {
+        return;
+    }
+    auto loadOpForStore = [](const std::string &op) -> std::string {
+        if (op == "sd") {
+            return "ld";
+        }
+        if (op == "fsw") {
+            return "flw";
+        }
+        return {};
+    };
+
+    std::unordered_map<std::string, std::unordered_set<std::string>> loadedTempsByFunction;
+    {
+        std::string scanFunction;
+        const std::unordered_set<std::string> *scanTemps = nullptr;
+        for (const MachineLine &line : lines) {
+            if (!line.instruction()) {
+                const std::string typeName = asmFunctionNameFromType(line);
+                if (!typeName.empty()) {
+                    scanFunction = typeName;
+                    const auto found = tempFrameOperandsByFunction.find(scanFunction);
+                    scanTemps = found == tempFrameOperandsByFunction.end() ? nullptr : &found->second;
+                    continue;
+                }
+                const std::string sizeName = asmFunctionNameFromSize(line);
+                if (!sizeName.empty() && sizeName == scanFunction) {
+                    scanFunction.clear();
+                    scanTemps = nullptr;
+                    continue;
+                }
+            }
+            if (scanTemps && isLoadOp(line.op) && line.args.size() == 2 && scanTemps->count(line.args[1])) {
+                loadedTempsByFunction[scanFunction].insert(line.op + "|" + line.args[1]);
+            }
+        }
+    }
+
+    std::unordered_set<std::string> needed;
+    std::unordered_set<std::string> overwritten;
+    std::vector<bool> remove(lines.size(), false);
+    const std::unordered_set<std::string> *currentTemps = nullptr;
+    const std::unordered_set<std::string> *currentLoadedTemps = nullptr;
+    std::string currentFunction;
+
+    auto flush = [&]() {
+        needed.clear();
+        overwritten.clear();
+    };
+    auto tempStoreOp = [](const std::string &op) {
+        return op == "sd" || op == "fsw";
+    };
+
+    for (std::size_t i = lines.size(); i-- > 0;) {
+        const MachineLine &line = lines[i];
+        if (!line.instruction()) {
+            const std::string sizeName = asmFunctionNameFromSize(line);
+            if (!sizeName.empty()) {
+                currentFunction = sizeName;
+                const auto found = tempFrameOperandsByFunction.find(currentFunction);
+                currentTemps = found == tempFrameOperandsByFunction.end() ? nullptr : &found->second;
+                const auto loaded = loadedTempsByFunction.find(currentFunction);
+                currentLoadedTemps = loaded == loadedTempsByFunction.end() ? nullptr : &loaded->second;
+                flush();
+                continue;
+            }
+            const std::string typeName = asmFunctionNameFromType(line);
+            if (!typeName.empty() && typeName == currentFunction) {
+                currentFunction.clear();
+                currentTemps = nullptr;
+                currentLoadedTemps = nullptr;
+                flush();
+                continue;
+            }
+        }
+        if (!line.instruction() || isAsmLabel(line)) {
+            flush();
+            continue;
+        }
+        MachineAccess access = accessOf(line);
+        if (access.barrier) {
+            flush();
+            continue;
+        }
+
+        if (currentTemps && isLoadOp(line.op) && line.args.size() == 2 && currentTemps->count(line.args[1])) {
+            needed.insert(line.op + "|" + line.args[1]);
+            continue;
+        }
+        if (currentTemps && isStoreOp(line.op) && line.args.size() == 2 && currentTemps->count(line.args[1])) {
+            const std::string matchingLoad = loadOpForStore(line.op);
+            const std::string loadKey = matchingLoad.empty() ? std::string{} : matchingLoad + "|" + line.args[1];
+            if (tempStoreOp(line.op) && !loadKey.empty() &&
+                (!currentLoadedTemps || !currentLoadedTemps->count(loadKey))) {
+                remove[i] = true;
+                continue;
+            }
+            if (tempStoreOp(line.op) && !loadKey.empty() && !needed.count(loadKey) &&
+                overwritten.count(line.args[1])) {
+                remove[i] = true;
+                continue;
+            }
+            if (!loadKey.empty()) {
+                needed.erase(loadKey);
+            }
+            overwritten.insert(line.args[1]);
+        }
     }
 
     std::vector<MachineLine> kept;
@@ -4954,25 +6021,40 @@ std::string renderMachineAssembly(const std::vector<MachineLine> &lines) {
     return out.str();
 }
 
-std::string peepholeAssembly(const std::string &assembly) {
+std::string peepholeAssembly(const std::string &assembly,
+                             const std::unordered_map<std::string, std::unordered_set<std::string>> &tempFrameOperandsByFunction = {}) {
     std::vector<MachineLine> lines = parseMachineAssembly(assembly);
     foldImmediateProducer(lines);
     peepholeMachine(lines);
+    foldFrameAddressMaterialization(lines);
+    propagateZeroToStores(lines);
+    mergeAdjacentZeroStores(lines);
+    fuseMaterializedBranches(lines);
     foldBranchOverJump(lines);
     eliminateJumpsToFallthrough(lines);
     eliminateRedundantValueProducers(lines);
     eliminateRedundantLoads(lines);
     propagateRegisterCopies(lines);
+    forwardFrameStoreLoads(lines);
+    eliminateDeadFrameTempStores(lines, tempFrameOperandsByFunction);
     eliminateDeadMoves(lines);
+    eliminateDeadPureDefinitions(lines);
     eliminateOverwrittenDefs(lines);
     foldImmediateProducer(lines);
     peepholeMachine(lines);
+    foldFrameAddressMaterialization(lines);
+    propagateZeroToStores(lines);
+    mergeAdjacentZeroStores(lines);
+    fuseMaterializedBranches(lines);
     foldBranchOverJump(lines);
     eliminateJumpsToFallthrough(lines);
     eliminateRedundantValueProducers(lines);
     eliminateRedundantLoads(lines);
     propagateRegisterCopies(lines);
+    forwardFrameStoreLoads(lines);
+    eliminateDeadFrameTempStores(lines, tempFrameOperandsByFunction);
     eliminateDeadMoves(lines);
+    eliminateDeadPureDefinitions(lines);
     eliminateOverwrittenDefs(lines);
     return renderMachineAssembly(lines);
 }
@@ -4985,8 +6067,9 @@ void emitAssembly(const TranslationUnit &unit, std::ostream &out) {
 
 void emitAssembly(const ir::Module &module, std::ostream &out) {
     std::ostringstream raw;
-    IRCodeGen(module, raw).run();
-    out << peepholeAssembly(raw.str());
+    IRCodeGen codegen(module, raw);
+    codegen.run();
+    out << peepholeAssembly(raw.str(), codegen.tempFrameOperandsByFunction());
 }
 
 } // namespace sysyc::riscv
