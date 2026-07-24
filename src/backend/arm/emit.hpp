@@ -5,9 +5,9 @@
 
 #include <iosfwd>
 
-namespace sysyc::riscv {
+namespace sysyc::arm {
 
 void emitAssembly(const TranslationUnit &unit, std::ostream &out);
 void emitAssembly(const ir::Module &module, std::ostream &out);
 
-} // namespace sysyc::riscv
+} // namespace sysyc::arm

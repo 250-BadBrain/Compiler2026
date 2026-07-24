@@ -1,6 +1,6 @@
 # Compiler2026
 
-SysY2026 到 RISC-V 64GC 汇编的 C++17 编译器项目。
+SysY2026 到 ARM 汇编的 C++17 编译器项目。
 
 ## 团队
 
@@ -27,9 +27,15 @@ make
 
 ## 测试
 
+ARM 链接运行测试需要：
+
+```bash
+sudo apt install gcc-arm-linux-gnueabihf qemu-user
+```
+
 ```bash
 ./tests/run_smoke.sh
 ./tests/run_all.sh
-./tests/run_public_functional.sh compiler2026/2026初赛RISCV赛道功能用例
-./tests/run_public_functional.sh compiler2026/2026初赛RISCV赛道性能用例
+./tests/run_public_functional.sh compiler2026/2026初赛ARM赛道功能用例
+./tests/run_public_functional.sh compiler2026/2026初赛ARM赛道性能用例
 ```

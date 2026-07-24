@@ -3,18 +3,24 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 limit="${1:-20}"
-cases_dir="$root/compiler2026/2026初赛RISCV赛道功能用例/functional"
+cases_dir="$root/compiler2026/2026初赛ARM赛道功能用例/functional"
 tmp_dir="${TMPDIR:-/tmp}/compiler2026-public-smoke"
 mkdir -p "$tmp_dir"
 
-cc="${RISCV_CC:-riscv64-linux-gnu-gcc}"
-qemu="${QEMU_RISCV:-qemu-riscv64}"
+cc="${ARM_CC:-arm-linux-gnueabihf-gcc}"
+qemu="${QEMU_ARM:-qemu-arm}"
 
-command -v "$cc" >/dev/null
-command -v "$qemu" >/dev/null
+if ! command -v "$cc" >/dev/null; then
+    echo "missing ARM compiler: $cc" >&2
+    exit 1
+fi
+if ! command -v "$qemu" >/dev/null; then
+    echo "missing ARM qemu: $qemu" >&2
+    exit 1
+fi
 
 make -C "$root" >/dev/null
-"$cc" -march=rv64gc -mcmodel=medany -static -c "$root/tests/runtime/sylib.c" -o "$tmp_dir/sylib.o"
+"$cc" -static -c "$root/tests/runtime/sylib.c" -o "$tmp_dir/sylib.o"
 
 passed=0
 total=0
@@ -30,7 +36,7 @@ while IFS= read -r case_file; do
     expected="${case_file%.sy}.out"
 
     "$root/compiler" "$case_file" -S -o "$asm"
-    "$cc" -march=rv64gc -mcmodel=medany -static "$asm" "$tmp_dir/sylib.o" -o "$exe"
+    "$cc" -static "$asm" "$tmp_dir/sylib.o" -o "$exe"
 
     set +e
     if [[ -f "$input_file" ]]; then

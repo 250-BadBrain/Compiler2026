@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cases_dir="${1:-$root/compiler2026/2026初赛RISCV赛道功能用例}"
+cases_dir="${1:-$root/compiler2026/2026初赛ARM赛道功能用例}"
 tmp_dir="${TMPDIR:-/tmp}/compiler2026-functional-test"
 mkdir -p "$tmp_dir"
 

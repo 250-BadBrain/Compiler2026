@@ -11,7 +11,7 @@ SRC := \
 	src/frontend/sema.cpp \
 	src/ir/ir.cpp \
 	src/ir/builder.cpp \
-	src/backend/riscv/emit.cpp \
+	src/backend/arm/emit.cpp \
 	src/support/diagnostic.cpp
 
 OBJ := $(SRC:.cpp=.o)

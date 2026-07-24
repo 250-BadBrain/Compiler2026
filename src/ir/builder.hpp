@@ -40,6 +40,7 @@ private:
     Value buildLValue(const Expr &expr);
     const DeclRefExpr *collectArrayBase(const Expr &expr, std::vector<const Expr *> &indices) const;
     bool subscriptYieldsArray(const ArraySubscriptExpr &expr) const;
+    bool isZeroInitializer(const Expr &expr, Type type) const;
     Type lValueElementType(const Expr &expr) const;
     Value emitValue(Opcode opcode, Type type, std::vector<Value> operands = {}, std::string text = {});
     void emitVoid(Opcode opcode, std::vector<Value> operands = {}, std::string text = {});

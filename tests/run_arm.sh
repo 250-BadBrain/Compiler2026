@@ -2,14 +2,20 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp_dir="${TMPDIR:-/tmp}/compiler2026-riscv-test"
+tmp_dir="${TMPDIR:-/tmp}/compiler2026-arm-test"
 mkdir -p "$tmp_dir"
 
-cc="${RISCV_CC:-riscv64-linux-gnu-gcc}"
-qemu="${QEMU_RISCV:-qemu-riscv64}"
+cc="${ARM_CC:-arm-linux-gnueabihf-gcc}"
+qemu="${QEMU_ARM:-qemu-arm}"
 
-command -v "$cc" >/dev/null
-command -v "$qemu" >/dev/null
+if ! command -v "$cc" >/dev/null; then
+    echo "missing ARM compiler: $cc" >&2
+    exit 1
+fi
+if ! command -v "$qemu" >/dev/null; then
+    echo "missing ARM qemu: $qemu" >&2
+    exit 1
+fi
 
 make -C "$root" >/dev/null
 
@@ -22,19 +28,15 @@ run_case() {
     local exe="$tmp_dir/$name"
 
     "$root/compiler" "$src" -S -o "$asm"
-    "$cc" -march=rv64gc -mcmodel=medany -static "$asm" -o "$exe"
+    "$cc" -static "$asm" -o "$exe"
     set +e
-    "$qemu" "$exe" >/tmp/compiler2026-riscv.stdout 2>/tmp/compiler2026-riscv.stderr
+    "$qemu" "$exe" >"$tmp_dir/$name.stdout" 2>"$tmp_dir/$name.stderr"
     local status=$?
     set -e
     if [[ "$status" != "$expected" ]]; then
         echo "unexpected exit for $src: got $status expected $expected" >&2
-        echo "--- asm ---" >&2
         sed -n '1,160p' "$asm" >&2
-        echo "--- stdout ---" >&2
-        cat /tmp/compiler2026-riscv.stdout >&2
-        echo "--- stderr ---" >&2
-        cat /tmp/compiler2026-riscv.stderr >&2
+        cat "$tmp_dir/$name.stderr" >&2
         exit 1
     fi
 }
@@ -52,4 +54,4 @@ run_case "$root/tests/backend/array_param.sy" 10
 run_case "$root/tests/backend/array_param2.sy" 6
 run_case "$root/tests/backend/short_circuit.sy" 2
 
-echo "riscv execution tests passed"
+echo "arm execution tests passed"

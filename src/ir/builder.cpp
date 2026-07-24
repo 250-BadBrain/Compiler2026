@@ -102,9 +102,15 @@ void IRBuilder::buildVarDecl(const VarDecl &decl, bool global) {
             std::vector<const Expr *> init(static_cast<std::size_t>(elements), nullptr);
             int index = 0;
             collectArrayInitializer(*def->init, dims, 0, index, init);
+            emitVoid(Opcode::Call,
+                     {address, constant(Type{TypeKind::I32}, "0"), constant(Type{TypeKind::I32}, std::to_string(bytes))},
+                     "memset");
             for (std::size_t i = 0; i < init.size(); ++i) {
+                if (!init[i] || isZeroInitializer(*init[i], typeFrom(decl.type))) {
+                    continue;
+                }
                 Value ptr = emitValue(Opcode::Gep, Type{TypeKind::Ptr}, {address, constant(Type{TypeKind::I32}, std::to_string(i))});
-                Value value = init[i] ? buildExpr(*init[i]) : constant(typeFrom(decl.type), "0");
+                Value value = buildExpr(*init[i]);
                 emitVoid(Opcode::Store, {convert(value, typeFrom(decl.type)), ptr});
             }
         }
@@ -437,6 +443,27 @@ bool IRBuilder::subscriptYieldsArray(const ArraySubscriptExpr &expr) const {
     }
     const Binding binding = lookup(base->name);
     return indices.size() < binding.dims.size();
+}
+
+bool IRBuilder::isZeroInitializer(const Expr &expr, Type type) const {
+    if (const auto *integer = dynamic_cast<const IntegerLiteral *>(&expr)) {
+        if (type.kind == TypeKind::F32) {
+            return static_cast<float>(std::strtoll(integer->value.c_str(), nullptr, 0)) == 0.0f;
+        }
+        return std::strtoll(integer->value.c_str(), nullptr, 0) == 0;
+    }
+    if (const auto *floating = dynamic_cast<const FloatLiteral *>(&expr)) {
+        if (type.kind == TypeKind::I32) {
+            return static_cast<long long>(std::strtod(floating->value.c_str(), nullptr)) == 0;
+        }
+        return std::strtof(floating->value.c_str(), nullptr) == 0.0f;
+    }
+    if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
+        if (unary->op == UnaryOp::Plus || unary->op == UnaryOp::Minus) {
+            return isZeroInitializer(*unary->operand, type);
+        }
+    }
+    return false;
 }
 
 Type IRBuilder::lValueElementType(const Expr &expr) const {

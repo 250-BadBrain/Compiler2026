@@ -1,4 +1,4 @@
-#include "backend/riscv/emit.hpp"
+#include "backend/arm/emit.hpp"
 #include "frontend/lexer.hpp"
 #include "frontend/parser.hpp"
 #include "frontend/sema.hpp"
@@ -170,10 +170,10 @@ int main(int argc, char **argv) {
         sysyc::ir::IRBuilder builder;
         auto module = builder.build(unit);
         sysyc::ir::optimize(module);
-        sysyc::riscv::emitAssembly(module, out);
+        sysyc::arm::emitAssembly(module, out);
     } else {
         (void)options.optimize;
-        sysyc::riscv::emitAssembly(unit, out);
+        sysyc::arm::emitAssembly(unit, out);
     }
     return 0;
 }
