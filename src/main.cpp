@@ -63,6 +63,10 @@ bool parseArgs(int argc, char **argv, Options &options) {
             return false;
         } else if (options.inputPath.empty()) {
             options.inputPath = arg;
+        } else if (options.outputPath.empty() && !options.dumpTokens && !options.parseOnly &&
+                   !options.semaOnly && !options.dumpIr) {
+            options.outputPath = arg;
+            options.emitAssembly = true;
         } else {
             std::cerr << "unexpected extra input: " << arg << '\n';
             return false;
