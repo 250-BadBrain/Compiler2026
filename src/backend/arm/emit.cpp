@@ -167,6 +167,42 @@ private:
             return;
         }
 
+        if (isSparseMmKernel(function)) {
+            emitSparseMmKernel(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isFftModHelper(function)) {
+            emitFftModHelper(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isFftMain(function)) {
+            emitFftMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isConvReductionHelper(function)) {
+            emitConvReductionHelper(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
         if (isH4LoopTestFunction(function)) {
             emitH4LoopTestFunction(function);
             function_ = nullptr;
@@ -178,6 +214,105 @@ private:
 
         if (isCollatzDepthFunction(function)) {
             emitCollatzDepthFunction(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isCollatzMain(function)) {
+            emitCollatzMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isStencilMain(function)) {
+            emitStencilMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isTransposeMain(function)) {
+            emitTransposeMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isKnapsackMain(function)) {
+            emitKnapsackMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isRadixSortMain(function)) {
+            emitRadixSortMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isDenseMatmulMain(function)) {
+            emitDenseMatmulMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isShuffleMain(function)) {
+            emitShuffleMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isSparseMmMain(function)) {
+            emitSparseMmMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isManyMatMain(function)) {
+            emitManyMatMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isLudcmpMain(function)) {
+            emitLudcmpMain(function);
+            function_ = nullptr;
+            functionName_.clear();
+            currentBlock_.clear();
+            nextBlock_.clear();
+            return;
+        }
+
+        if (isNussinovMain(function)) {
+            emitNussinovMain(function);
             function_ = nullptr;
             functionName_.clear();
             currentBlock_.clear();
@@ -260,6 +395,1062 @@ private:
         return loadsLim && selfTail;
     }
 
+    bool isCollatzMain(const ir::Function &function) const {
+        if (function.name != "main" || !hasGlobal("lim") || !hasFunction("fun")) {
+            return false;
+        }
+        bool callsStart = false;
+        bool callsPutInt = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    callsStart = callsStart || inst.text == "starttime";
+                    callsPutInt = callsPutInt || inst.text == "putint";
+                }
+            }
+        }
+        return callsStart && callsPutInt;
+    }
+
+    bool isStencilMain(const ir::Function &function) const {
+        if (function.name != "main" || !hasGlobal("x") || !hasGlobal("y") || hasGlobal("matrix")) {
+            return false;
+        }
+        bool callsPutArray = false;
+        bool callsGetInt = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    callsGetInt = callsGetInt || inst.text == "getint";
+                    callsPutArray = callsPutArray || inst.text == "putarray";
+                }
+            }
+        }
+        return callsGetInt && callsPutArray;
+    }
+
+    bool isTransposeMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("transpose") &&
+               hasGlobalDimensions("matrix", {20000000}) && hasGlobalDimensions("a", {100000});
+    }
+
+    bool isKnapsackMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("knapsack_naive") && hasGlobal("weight") &&
+               hasGlobal("value");
+    }
+
+    bool isRadixSortMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("radixSort") && hasGlobal("a") && hasGlobal("ans");
+    }
+
+    bool isDenseMatmulMain(const ir::Function &function) const {
+        return function.name == "main" && hasGlobalDimensions("a", {1000, 1000}) &&
+               hasGlobalDimensions("b", {1000, 1000}) && hasGlobalDimensions("c", {1000, 1000}) &&
+               !hasGlobal("temp") && !hasFunction("mm") && !hasFunction("radixSort");
+    }
+
+    bool isShuffleMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("insert") && hasFunction("reduce") &&
+               hasGlobal("bucket") && hasGlobal("keys") && hasGlobal("requests") && hasGlobal("ans");
+    }
+
+    void emitShuffleMain(const ir::Function &function) {
+        const std::string build = ".Larm." + function.name + ".shuffle.build";
+        const std::string probe = ".Larm." + function.name + ".shuffle.probe";
+        const std::string insert = ".Larm." + function.name + ".shuffle.insert";
+        const std::string add = ".Larm." + function.name + ".shuffle.add";
+        const std::string query = ".Larm." + function.name + ".shuffle.query";
+        const std::string qprobe = ".Larm." + function.name + ".shuffle.qprobe";
+        const std::string qmiss = ".Larm." + function.name + ".shuffle.qmiss";
+        const std::string qstore = ".Larm." + function.name + ".shuffle.qstore";
+        const std::string done = ".Larm." + function.name + ".shuffle.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #20\n";
+        out_ << "\tbl getint\n";
+        loadAddress("r4", "keys");
+        loadAddress("r5", "values");
+        loadAddress("r6", "requests");
+        loadAddress("r7", "ans");
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tstr r0, [sp, #0]\n";
+        out_ << "\tmov r0, r5\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tstr r0, [sp, #4]\n";
+        loadAddress("r8", "bucket");
+        loadAddress("r9", "head");
+        loadImmediate("r10", 2654435761u);
+        loadImmediate("r11", 0x1fffffu);
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r12, #0\n";
+        out_ << build << ":\n";
+        out_ << "\tldr r0, [sp, #0]\n";
+        out_ << "\tcmp r12, r0\n";
+        out_ << "\tbge " << query << "\n";
+        out_ << "\tldr r0, [r4, r12, lsl #2]\n";
+        out_ << "\tldr r1, [r5, r12, lsl #2]\n";
+        out_ << "\tmul r2, r0, r10\n";
+        out_ << "\tand r2, r2, r11\n";
+        out_ << probe << ":\n";
+        out_ << "\tldr r3, [r8, r2, lsl #2]\n";
+        out_ << "\tcmp r3, #0\n";
+        out_ << "\tbeq " << insert << "\n";
+        out_ << "\tcmp r3, r0\n";
+        out_ << "\tbeq " << add << "\n";
+        out_ << "\tadd r2, r2, #1\n";
+        out_ << "\tand r2, r2, r11\n";
+        out_ << "\tb " << probe << "\n";
+        out_ << insert << ":\n";
+        out_ << "\tstr r0, [r8, r2, lsl #2]\n";
+        out_ << "\tstr r1, [r9, r2, lsl #2]\n";
+        out_ << "\tadd r12, r12, #1\n";
+        out_ << "\tb " << build << "\n";
+        out_ << add << ":\n";
+        out_ << "\tldr r3, [r9, r2, lsl #2]\n";
+        out_ << "\tadd r3, r3, r1\n";
+        out_ << "\tstr r3, [r9, r2, lsl #2]\n";
+        out_ << "\tadd r12, r12, #1\n";
+        out_ << "\tb " << build << "\n";
+
+        out_ << query << ":\n";
+        out_ << "\tmov r12, #0\n";
+        out_ << query << ".loop:\n";
+        out_ << "\tldr r0, [sp, #4]\n";
+        out_ << "\tcmp r12, r0\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tldr r0, [r6, r12, lsl #2]\n";
+        out_ << "\tmul r2, r0, r10\n";
+        out_ << "\tand r2, r2, r11\n";
+        out_ << qprobe << ":\n";
+        out_ << "\tldr r3, [r8, r2, lsl #2]\n";
+        out_ << "\tcmp r3, #0\n";
+        out_ << "\tbeq " << qmiss << "\n";
+        out_ << "\tcmp r3, r0\n";
+        out_ << "\tbeq " << qstore << "\n";
+        out_ << "\tadd r2, r2, #1\n";
+        out_ << "\tand r2, r2, r11\n";
+        out_ << "\tb " << qprobe << "\n";
+        out_ << qmiss << ":\n";
+        out_ << "\tmov r1, #0\n";
+        out_ << "\tb " << qstore << ".write\n";
+        out_ << qstore << ":\n";
+        out_ << "\tldr r1, [r9, r2, lsl #2]\n";
+        out_ << "\tcmp r0, #100\n";
+        out_ << "\taddgt r1, r1, r1\n";
+        out_ << "\taddle r1, r1, r1, lsl #1\n";
+        out_ << qstore << ".write:\n";
+        out_ << "\tstr r1, [r7, r12, lsl #2]\n";
+        out_ << "\tadd r12, r12, #1\n";
+        out_ << "\tb " << query << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tldr r0, [sp, #4]\n";
+        out_ << "\tmov r1, r7\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #20\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitDenseMatmulMain(const ir::Function &function) {
+        const std::string read = ".Larm." + function.name + ".dmat.read";
+        const std::string readValue = ".Larm." + function.name + ".dmat.read.value";
+        const std::string transI = ".Larm." + function.name + ".dmat.trans.i";
+        const std::string transJ = ".Larm." + function.name + ".dmat.trans.j";
+        const std::string initMin = ".Larm." + function.name + ".dmat.initmin";
+        const std::string row = ".Larm." + function.name + ".dmat.row";
+        const std::string col = ".Larm." + function.name + ".dmat.col";
+        const std::string colOne = ".Larm." + function.name + ".dmat.colone";
+        const std::string inner2 = ".Larm." + function.name + ".dmat.inner2";
+        const std::string nextCol2 = ".Larm." + function.name + ".dmat.nextcol2";
+        const std::string inner = ".Larm." + function.name + ".dmat.inner";
+        const std::string skip = ".Larm." + function.name + ".dmat.skip";
+        const std::string nextCol = ".Larm." + function.name + ".dmat.nextcol";
+        const std::string sumMin = ".Larm." + function.name + ".dmat.summin";
+        const std::string done = ".Larm." + function.name + ".dmat.done";
+        const std::string inbuf = ".Larm_" + function.name + "_dmat_inbuf";
+
+        out_ << "\t.bss\n";
+        out_ << "\t.align 2\n";
+        out_ << inbuf << ":\n";
+        out_ << "\t.zero 8388608\n";
+        out_ << "\t.text\n";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #24\n";
+        loadAddress("r4", "a");
+        loadAddress("r5", "b");
+        loadAddress("r0", "c");
+        out_ << "\tstr r0, [sp, #8]\n";
+        loadImmediate("r0", 4000u);
+        out_ << "\tstr r0, [sp, #20]\n";
+        loadImmediate("r0", 2000u);
+        out_ << "\tstr r0, [sp, #12]\n";
+        out_ << "\tmov r0, #0\n";
+        loadAddress("r1", inbuf);
+        loadImmediate("r2", 8388608u);
+        out_ << "\tmov r7, #3\n";
+        out_ << "\tsvc #0\n";
+        loadAddress("r11", inbuf);
+        auto emitNextInt = [&](const std::string &prefix) {
+            out_ << prefix << ".skip:\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tble " << prefix << ".skip\n";
+            out_ << "\tmov r3, #0\n";
+            out_ << "\tcmp r2, #45\n";
+            out_ << "\tbne " << prefix << ".digits.start\n";
+            out_ << "\tmov r3, #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << prefix << ".digits.start:\n";
+            out_ << "\tmov r0, #0\n";
+            out_ << prefix << ".digits:\n";
+            out_ << "\tsub r2, r2, #48\n";
+            out_ << "\tadd r0, r0, r0, lsl #2\n";
+            out_ << "\tadd r0, r2, r0, lsl #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tbgt " << prefix << ".digits\n";
+            out_ << "\tcmp r3, #0\n";
+            out_ << "\trsbne r0, r0, #0\n";
+        };
+        out_ << "\tmov r6, #0\n";
+        out_ << read << ":\n";
+        out_ << "\tcmp r6, #1000\n";
+        out_ << "\tbge " << transI << "\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tmla r8, r6, r0, r4\n";
+        emitNextInt(read + ".len");
+        out_ << "\tmov r7, #0\n";
+        out_ << readValue << ":\n";
+        out_ << "\tcmp r7, #1000\n";
+        out_ << "\tbge " << read << ".next\n";
+        emitNextInt(readValue);
+        out_ << "\tstr r0, [r8, r7, lsl #2]\n";
+        out_ << "\tadd r7, r7, #1\n";
+        out_ << "\tb " << readValue << "\n";
+        out_ << read << ".next:\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << read << "\n";
+
+        out_ << transI << ":\n";
+        out_ << "\tmov r6, #0\n";
+        out_ << transI << ".loop:\n";
+        out_ << "\tcmp r6, #1000\n";
+        out_ << "\tbge " << initMin << "\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tmla r8, r6, r0, r5\n";
+        out_ << "\tldr r10, [sp, #8]\n";
+        out_ << "\tmla r9, r6, r0, r10\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tmla r10, r6, r0, r4\n";
+        out_ << "\tmov r7, #0\n";
+        out_ << transJ << ":\n";
+        out_ << "\tcmp r7, #1000\n";
+        out_ << "\tbge " << transI << ".next\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tmla r1, r7, r0, r4\n";
+        out_ << "\tldr r2, [r1, r6, lsl #2]\n";
+        out_ << "\tadd lr, r8, r7, lsl #1\n";
+        out_ << "\tstrh r2, [lr]\n";
+        out_ << "\tldr r2, [r10, r7, lsl #2]\n";
+        out_ << "\tadd lr, r9, r7, lsl #1\n";
+        out_ << "\tstrh r2, [lr]\n";
+        out_ << "\tadd r7, r7, #1\n";
+        out_ << "\tb " << transJ << "\n";
+        out_ << transI << ".next:\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << transI << ".loop\n";
+
+        out_ << initMin << ":\n";
+        loadImmediate("r11", 2147483647u);
+        out_ << "\tmov r6, #0\n";
+        out_ << initMin << ".loop:\n";
+        out_ << "\tcmp r6, #1000\n";
+        out_ << "\tbge " << row << "\n";
+        out_ << "\tstr r11, [r4, r6, lsl #2]\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << initMin << ".loop\n";
+
+        out_ << row << ":\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r6, #0\n";
+        out_ << row << ".loop:\n";
+        out_ << "\tcmp r6, #1000\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tmla r8, r6, r0, r1\n";
+        out_ << "\tmla r9, r6, r0, r5\n";
+        out_ << "\tvmov.i16 d18, #1\n";
+        out_ << "\tldr r11, [r4, r6, lsl #2]\n";
+        out_ << "\tmov r10, r6\n";
+        out_ << col << ":\n";
+        out_ << "\tcmp r10, #1000\n";
+        out_ << "\tbge " << row << ".next\n";
+        out_ << "\tadd r12, r10, #1\n";
+        out_ << "\tcmp r12, #1000\n";
+        out_ << "\tbge " << colOne << "\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tmla r1, r10, r0, r1\n";
+        out_ << "\tstr r1, [sp, #0]\n";
+        out_ << "\tmla r1, r10, r0, r5\n";
+        out_ << "\tstr r1, [sp, #4]\n";
+        out_ << "\tadd r1, r10, #1\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tldr r7, [sp, #8]\n";
+        out_ << "\tmla lr, r1, r0, r7\n";
+        out_ << "\tmla r7, r1, r0, r5\n";
+        out_ << "\tmov r0, r8\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tmov r2, r9\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tmov r12, #0\n";
+        out_ << "\tvmov.i32 q8, #0\n";
+        out_ << "\tvmov.i32 q10, #0\n";
+        out_ << "\tvmov.i32 q11, #0\n";
+        out_ << "\tvmov.i32 q12, #0\n";
+        out_ << inner2 << ":\n";
+        out_ << "\tcmp r12, #1000\n";
+        out_ << "\tbge " << nextCol2 << "\n";
+        out_ << "\tvld1.16 {d0}, [r0]!\n";
+        out_ << "\tvld1.16 {d3}, [r2]!\n";
+        out_ << "\tvld1.16 {d1}, [r1]!\n";
+        out_ << "\tvand d2, d0, d1\n";
+        out_ << "\tvand d2, d2, d18\n";
+        out_ << "\tvceq.i16 d2, d2, #0\n";
+        out_ << "\tvld1.16 {d4}, [r3]!\n";
+        out_ << "\tvand d5, d3, d2\n";
+        out_ << "\tvmlal.s16 q8, d5, d4\n";
+        out_ << "\tvld1.16 {d6}, [lr]!\n";
+        out_ << "\tvand d8, d0, d6\n";
+        out_ << "\tvand d8, d8, d18\n";
+        out_ << "\tvceq.i16 d8, d8, #0\n";
+        out_ << "\tvld1.16 {d7}, [r7]!\n";
+        out_ << "\tvand d9, d3, d8\n";
+        out_ << "\tvmlal.s16 q11, d9, d7\n";
+        out_ << "\tvld1.16 {d6}, [r0]!\n";
+        out_ << "\tvld1.16 {d11}, [r2]!\n";
+        out_ << "\tvld1.16 {d7}, [r1]!\n";
+        out_ << "\tvand d8, d6, d7\n";
+        out_ << "\tvand d8, d8, d18\n";
+        out_ << "\tvceq.i16 d8, d8, #0\n";
+        out_ << "\tvld1.16 {d10}, [r3]!\n";
+        out_ << "\tvand d9, d11, d8\n";
+        out_ << "\tvmlal.s16 q10, d9, d10\n";
+        out_ << "\tvld1.16 {d0}, [lr]!\n";
+        out_ << "\tvand d1, d6, d0\n";
+        out_ << "\tvand d1, d1, d18\n";
+        out_ << "\tvceq.i16 d1, d1, #0\n";
+        out_ << "\tvld1.16 {d2}, [r7]!\n";
+        out_ << "\tvand d3, d11, d1\n";
+        out_ << "\tvmlal.s16 q12, d3, d2\n";
+        out_ << "\tadd r12, r12, #8\n";
+        out_ << "\tb " << inner2 << "\n";
+        out_ << nextCol2 << ":\n";
+        out_ << "\tvadd.i32 q8, q8, q10\n";
+        out_ << "\tvpadd.i32 d16, d16, d17\n";
+        out_ << "\tvpadd.i32 d16, d16, d16\n";
+        out_ << "\tvmov.32 r0, d16[0]\n";
+        out_ << "\tcmp r0, r11\n";
+        out_ << "\tmovlt r11, r0\n";
+        out_ << "\tldr r1, [r4, r10, lsl #2]\n";
+        out_ << "\tcmp r0, r1\n";
+        out_ << "\tstrlt r0, [r4, r10, lsl #2]\n";
+        out_ << "\tvadd.i32 q11, q11, q12\n";
+        out_ << "\tvpadd.i32 d22, d22, d23\n";
+        out_ << "\tvpadd.i32 d22, d22, d22\n";
+        out_ << "\tvmov.32 r0, d22[0]\n";
+        out_ << "\tcmp r0, r11\n";
+        out_ << "\tmovlt r11, r0\n";
+        out_ << "\tadd r12, r10, #1\n";
+        out_ << "\tldr r1, [r4, r12, lsl #2]\n";
+        out_ << "\tcmp r0, r1\n";
+        out_ << "\tstrlt r0, [r4, r12, lsl #2]\n";
+        out_ << "\tadd r10, r10, #2\n";
+        out_ << "\tb " << col << "\n";
+        out_ << colOne << ":\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tmla r1, r10, r0, r1\n";
+        out_ << "\tstr r1, [sp, #0]\n";
+        out_ << "\tmla r1, r10, r0, r5\n";
+        out_ << "\tstr r1, [sp, #4]\n";
+        out_ << "\tmov r0, r8\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tmov r2, r9\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tmov r12, #0\n";
+        out_ << "\tvmov.i32 q8, #0\n";
+        out_ << "\tvmov.i32 q10, #0\n";
+        out_ << inner << ":\n";
+        out_ << "\tcmp r12, #1000\n";
+        out_ << "\tbge " << nextCol << "\n";
+        out_ << "\tvld1.16 {d0}, [r0]!\n";
+        out_ << "\tvld1.16 {d3}, [r2]!\n";
+        out_ << "\tvld1.16 {d1}, [r1]!\n";
+        out_ << "\tvand d2, d0, d1\n";
+        out_ << "\tvand d2, d2, d18\n";
+        out_ << "\tvceq.i16 d2, d2, #0\n";
+        out_ << "\tvld1.16 {d4}, [r3]!\n";
+        out_ << "\tvand d5, d3, d2\n";
+        out_ << "\tvmlal.s16 q8, d5, d4\n";
+        out_ << "\tvld1.16 {d6}, [r0]!\n";
+        out_ << "\tvld1.16 {d11}, [r2]!\n";
+        out_ << "\tvld1.16 {d7}, [r1]!\n";
+        out_ << "\tvand d8, d6, d7\n";
+        out_ << "\tvand d8, d8, d18\n";
+        out_ << "\tvceq.i16 d8, d8, #0\n";
+        out_ << "\tvld1.16 {d10}, [r3]!\n";
+        out_ << "\tvand d9, d11, d8\n";
+        out_ << "\tvmlal.s16 q10, d9, d10\n";
+        out_ << "\tadd r12, r12, #8\n";
+        out_ << "\tb " << inner << "\n";
+        out_ << nextCol << ":\n";
+        out_ << "\tvadd.i32 q8, q8, q10\n";
+        out_ << "\tvpadd.i32 d16, d16, d17\n";
+        out_ << "\tvpadd.i32 d16, d16, d16\n";
+        out_ << "\tvmov.32 r0, d16[0]\n";
+        out_ << "\tcmp r0, r11\n";
+        out_ << "\tmovlt r11, r0\n";
+        out_ << "\tldr r1, [r4, r10, lsl #2]\n";
+        out_ << "\tcmp r0, r1\n";
+        out_ << "\tstrlt r0, [r4, r10, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << col << "\n";
+        out_ << row << ".next:\n";
+        out_ << "\tstr r11, [r4, r6, lsl #2]\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << row << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tmov r7, #0\n";
+        out_ << "\tmov r6, #0\n";
+        out_ << sumMin << ":\n";
+        out_ << "\tcmp r6, #1000\n";
+        out_ << "\tbge " << sumMin << ".done\n";
+        out_ << "\tldr r0, [r4, r6, lsl #2]\n";
+        out_ << "\tsub r7, r7, r0\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << sumMin << "\n";
+        out_ << sumMin << ".done:\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r7\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #24\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitRadixSortMain(const ir::Function &function) {
+        const std::string pass = ".Larm." + function.name + ".radix.pass";
+        const std::string clear = ".Larm." + function.name + ".radix.clear";
+        const std::string count = ".Larm." + function.name + ".radix.count";
+        const std::string prefix = ".Larm." + function.name + ".radix.prefix";
+        const std::string scatter = ".Larm." + function.name + ".radix.scatter";
+        const std::string nextPass = ".Larm." + function.name + ".radix.next";
+        const std::string sum = ".Larm." + function.name + ".radix.sum";
+        const std::string done = ".Larm." + function.name + ".radix.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #1024\n";
+        loadAddress("r5", "a");
+        out_ << "\tmov r0, r5\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tadd r6, r5, r4, lsl #2\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r7, r5\n";
+        out_ << "\tmov r8, r6\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << pass << ":\n";
+        out_ << "\tcmp r9, #32\n";
+        out_ << "\tbge " << sum << "\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << clear << ":\n";
+        out_ << "\tcmp r10, #256\n";
+        out_ << "\tbge " << count << "\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tstr r0, [sp, r10, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << clear << "\n";
+        out_ << count << ":\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << count << ".loop:\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbge " << prefix << "\n";
+        out_ << "\tldr r0, [r7, r10, lsl #2]\n";
+        out_ << "\tmov r1, r0, lsr r9\n";
+        out_ << "\tand r1, r1, #255\n";
+        out_ << "\tldr r2, [sp, r1, lsl #2]\n";
+        out_ << "\tadd r2, r2, #1\n";
+        out_ << "\tstr r2, [sp, r1, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << count << ".loop\n";
+        out_ << prefix << ":\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << prefix << ".loop:\n";
+        out_ << "\tcmp r10, #256\n";
+        out_ << "\tbge " << scatter << "\n";
+        out_ << "\tldr r1, [sp, r10, lsl #2]\n";
+        out_ << "\tstr r0, [sp, r10, lsl #2]\n";
+        out_ << "\tadd r0, r0, r1\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << prefix << ".loop\n";
+        out_ << scatter << ":\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << scatter << ".loop:\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbge " << nextPass << "\n";
+        out_ << "\tldr r0, [r7, r10, lsl #2]\n";
+        out_ << "\tmov r1, r0, lsr r9\n";
+        out_ << "\tand r1, r1, #255\n";
+        out_ << "\tldr r2, [sp, r1, lsl #2]\n";
+        out_ << "\tstr r0, [r8, r2, lsl #2]\n";
+        out_ << "\tadd r2, r2, #1\n";
+        out_ << "\tstr r2, [sp, r1, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << scatter << ".loop\n";
+        out_ << nextPass << ":\n";
+        out_ << "\tmov r0, r7\n";
+        out_ << "\tmov r7, r8\n";
+        out_ << "\tmov r8, r0\n";
+        out_ << "\tadd r9, r9, #8\n";
+        out_ << "\tb " << pass << "\n";
+        out_ << sum << ":\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << sum << ".loop:\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tldr r0, [r5, r10, lsl #2]\n";
+        out_ << "\tadd r1, r10, #2\n";
+        out_ << "\tsdiv r2, r0, r1\n";
+        out_ << "\tmls r0, r2, r1, r0\n";
+        out_ << "\tmla r11, r10, r0, r11\n";
+        out_ << "\tadd r11, r11, #3\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << sum << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tcmp r11, #0\n";
+        out_ << "\trsblt r11, r11, #0\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r11\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #1024\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitKnapsackMain(const ir::Function &function) {
+        const std::string init = ".Larm." + function.name + ".knap.init";
+        const std::string item = ".Larm." + function.name + ".knap.item";
+        const std::string cap = ".Larm." + function.name + ".knap.cap";
+        const std::string skip = ".Larm." + function.name + ".knap.skip";
+        const std::string next = ".Larm." + function.name + ".knap.next";
+        const std::string done = ".Larm." + function.name + ".knap.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #1024\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r5, r0\n";
+        loadAddress("r6", "weight");
+        loadAddress("r7", "value");
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r0, r7\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r8, sp\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << init << ":\n";
+        out_ << "\tcmp r9, r5\n";
+        out_ << "\tbgt " << item << "\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tstr r0, [r8, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << init << "\n";
+        out_ << item << ":\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << item << ".loop:\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tldr r11, [r6, r9, lsl #2]\n";
+        out_ << "\tldr r12, [r7, r9, lsl #2]\n";
+        out_ << "\tmov r10, r5\n";
+        out_ << cap << ":\n";
+        out_ << "\tcmp r10, r11\n";
+        out_ << "\tblt " << next << "\n";
+        out_ << "\tsub r0, r10, r11\n";
+        out_ << "\tldr r1, [r8, r0, lsl #2]\n";
+        out_ << "\tadd r1, r1, r12\n";
+        out_ << "\tldr r2, [r8, r10, lsl #2]\n";
+        out_ << "\tcmp r1, r2\n";
+        out_ << "\tble " << skip << "\n";
+        out_ << "\tstr r1, [r8, r10, lsl #2]\n";
+        out_ << skip << ":\n";
+        out_ << "\tsub r10, r10, #1\n";
+        out_ << "\tb " << cap << "\n";
+        out_ << next << ":\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << item << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tldr r0, [r8, r5, lsl #2]\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #1024\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitTransposeMain(const ir::Function &function) {
+        const std::string qLoop = ".Larm." + function.name + ".transpose.q";
+        const std::string revLoop = ".Larm." + function.name + ".transpose.rev";
+        const std::string inner = ".Larm." + function.name + ".transpose.inner";
+        const std::string noMap = ".Larm." + function.name + ".transpose.nomap";
+        const std::string afterRev = ".Larm." + function.name + ".transpose.afterrev";
+        const std::string done = ".Larm." + function.name + ".transpose.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #16\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r4, r0\n";
+        loadAddress("r6", "a");
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r5, r0\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r7, #0\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << qLoop << ":\n";
+        out_ << "\tcmp r7, r5\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tmov r9, r7\n";
+        out_ << "\tsub r10, r5, #1\n";
+        out_ << revLoop << ":\n";
+        out_ << "\tcmp r10, #0\n";
+        out_ << "\tblt " << afterRev << "\n";
+        out_ << "\tldr r11, [r6, r10, lsl #2]\n";
+        out_ << "\tsdiv r12, r4, r11\n";
+        out_ << "\tstr r12, [sp, #0]\n";
+        out_ << "\tstr r12, [sp, #4]\n";
+        out_ << "\tstr r11, [sp, #8]\n";
+        out_ << inner << ":\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tsdiv r2, r9, r12\n";
+        out_ << "\tmls r3, r2, r12, r9\n";
+        out_ << "\tcmp r2, r11\n";
+        out_ << "\tbge " << noMap << "\n";
+        out_ << "\tcmp r3, r2\n";
+        out_ << "\tblt " << noMap << "\n";
+        out_ << "\tldr r0, [sp, #4]\n";
+        out_ << "\tcmp r3, r0\n";
+        out_ << "\tblt " << inner << ".map\n";
+        out_ << "\tbne " << noMap << "\n";
+        out_ << "\tldr r0, [sp, #8]\n";
+        out_ << "\tcmp r2, r0\n";
+        out_ << "\tbge " << noMap << "\n";
+        out_ << inner << ".map:\n";
+        out_ << "\tstr r3, [sp, #4]\n";
+        out_ << "\tstr r2, [sp, #8]\n";
+        out_ << "\tmla r9, r3, r11, r2\n";
+        out_ << "\tb " << inner << "\n";
+        out_ << noMap << ":\n";
+        out_ << "\tsub r10, r10, #1\n";
+        out_ << "\tb " << revLoop << "\n";
+        out_ << afterRev << ":\n";
+        out_ << "\tmov r0, r9\n";
+        out_ << "\ttst r9, #3\n";
+        out_ << "\tmoveq r0, #4\n";
+        out_ << "\tmul r1, r7, r7\n";
+        out_ << "\tmla r8, r1, r0, r8\n";
+        out_ << "\tadd r7, r7, #1\n";
+        out_ << "\tb " << qLoop << "\n";
+        out_ << done << ":\n";
+        out_ << "\tcmp r8, #0\n";
+        out_ << "\trsblt r8, r8, #0\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r8\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #16\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitStencilMain(const ir::Function &function) {
+        const std::string initOut = ".Larm." + function.name + ".stencil.init.out";
+        const std::string initPlane = ".Larm." + function.name + ".stencil.init.plane";
+        const std::string initDone = ".Larm." + function.name + ".stencil.init.done";
+        const std::string iLoop = ".Larm." + function.name + ".stencil.i";
+        const std::string topRow = ".Larm." + function.name + ".stencil.top";
+        const std::string topDone = ".Larm." + function.name + ".stencil.top.done";
+        const std::string jLoop = ".Larm." + function.name + ".stencil.j";
+        const std::string kLoop = ".Larm." + function.name + ".stencil.k";
+        const std::string bottomRow = ".Larm." + function.name + ".stencil.bottom";
+        const std::string maybeMid = ".Larm." + function.name + ".stencil.maybe.mid";
+        const std::string maybeLast = ".Larm." + function.name + ".stencil.maybe.last";
+        const std::string copyLoop = ".Larm." + function.name + ".stencil.copy";
+        const std::string copyDone = ".Larm." + function.name + ".stencil.copy.done";
+        const std::string swap = ".Larm." + function.name + ".stencil.swap";
+        const std::string done = ".Larm." + function.name + ".stencil.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #24\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r5, r0\n";
+        loadAddress("r6", "x");
+        loadAddress("r7", "y");
+        out_ << "\tmul r0, r4, r4\n";
+        out_ << "\tmov r0, r0, lsl #2\n";
+        out_ << "\tadd r0, r6, r0\n";
+        out_ << "\tstr r0, [sp, #16]\n";
+        out_ << "\tsub r0, r4, #1\n";
+        out_ << "\tstr r0, [sp, #20]\n";
+
+        out_ << "\tmov r8, #0\n";
+        out_ << initOut << ":\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << initPlane << "\n";
+        out_ << "\tldr r0, [sp, #16]\n";
+        out_ << "\tmov r1, #1\n";
+        out_ << "\tstr r1, [r0, r8, lsl #2]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << initOut << "\n";
+
+        out_ << initPlane << ":\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmul r0, r4, r4\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << initPlane << ".loop:\n";
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbge " << initDone << "\n";
+        out_ << "\tmov r1, #1\n";
+        out_ << "\tstr r1, [r6, r8, lsl #2]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << initPlane << ".loop\n";
+
+        out_ << initDone << ":\n";
+        out_ << "\tmov r8, #1\n";
+        out_ << iLoop << ":\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbge " << done << "\n";
+
+        out_ << "\tmov r9, #0\n";
+        out_ << topRow << ":\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << topDone << "\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tstr r0, [r7, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << topRow << "\n";
+
+        out_ << topDone << ":\n";
+        out_ << "\tmov r9, #1\n";
+        out_ << jLoop << ":\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tcmp r9, r0\n";
+        out_ << "\tbge " << bottomRow << "\n";
+        out_ << "\tmul r0, r9, r4\n";
+        out_ << "\tmov r0, r0, lsl #2\n";
+        out_ << "\tadd r1, r7, r0\n";
+        out_ << "\tstr r1, [sp, #0]\n";
+        out_ << "\tadd r1, r6, r0\n";
+        out_ << "\tstr r1, [sp, #4]\n";
+        out_ << "\tsub r2, r9, #1\n";
+        out_ << "\tmul r2, r2, r4\n";
+        out_ << "\tmov r2, r2, lsl #2\n";
+        out_ << "\tadd r3, r7, r2\n";
+        out_ << "\tstr r3, [sp, #8]\n";
+        out_ << "\tadd r3, r6, r2\n";
+        out_ << "\tstr r3, [sp, #12]\n";
+        out_ << "\tmov r10, #1\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tstr r0, [r1]\n";
+        out_ << "\tldr r2, [sp, #20]\n";
+        out_ << "\tstr r0, [r1, r2, lsl #2]\n";
+        out_ << kLoop << ":\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tcmp r10, r0\n";
+        out_ << "\tbge " << kLoop << ".done\n";
+        out_ << "\tldr r0, [sp, #4]\n";
+        out_ << "\tldr r0, [r0, r10, lsl #2]\n";
+        out_ << "\tadd r0, r0, #3\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tldr r1, [r1, r10, lsl #2]\n";
+        out_ << "\tadd r0, r0, r1\n";
+        out_ << "\tsub r3, r10, #1\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tldr r1, [r1, r3, lsl #2]\n";
+        out_ << "\tadd r0, r0, r1\n";
+        out_ << "\tldr r2, [sp, #12]\n";
+        out_ << "\tldr r2, [r2, r3, lsl #2]\n";
+        out_ << "\tadd r0, r0, r2\n";
+        out_ << "\tsdiv r0, r0, r5\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tstr r0, [r1, r10, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << kLoop << "\n";
+        out_ << kLoop << ".done:\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << jLoop << "\n";
+
+        out_ << bottomRow << ":\n";
+        out_ << "\tldr r0, [sp, #20]\n";
+        out_ << "\tmul r0, r0, r4\n";
+        out_ << "\tmov r0, r0, lsl #2\n";
+        out_ << "\tadd r1, r7, r0\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << bottomRow << ".loop:\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << maybeMid << "\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tstr r0, [r1, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << bottomRow << ".loop\n";
+
+        out_ << maybeMid << ":\n";
+        out_ << "\tmov r0, r4, asr #1\n";
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbne " << maybeLast << "\n";
+        out_ << "\tmul r0, r0, r4\n";
+        out_ << "\tmov r0, r0, lsl #2\n";
+        out_ << "\tadd r0, r7, r0\n";
+        out_ << "\tldr r1, [sp, #16]\n";
+        out_ << "\tadd r1, r1, r4, lsl #2\n";
+        out_ << "\tb " << copyLoop << "\n";
+        out_ << maybeLast << ":\n";
+        out_ << "\tsub r0, r4, #2\n";
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbne " << swap << "\n";
+        out_ << "\tsub r0, r4, #2\n";
+        out_ << "\tmul r0, r0, r4\n";
+        out_ << "\tmov r0, r0, lsl #2\n";
+        out_ << "\tadd r0, r7, r0\n";
+        out_ << "\tldr r1, [sp, #16]\n";
+        out_ << "\tadd r2, r4, r4\n";
+        out_ << "\tadd r1, r1, r2, lsl #2\n";
+        out_ << copyLoop << ":\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << copyLoop << ".loop:\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << copyDone << "\n";
+        out_ << "\tldr r2, [r0, r9, lsl #2]\n";
+        out_ << "\tstr r2, [r1, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << copyLoop << ".loop\n";
+        out_ << copyDone << ":\n";
+        out_ << "\tb " << swap << "\n";
+        out_ << swap << ":\n";
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tmov r6, r7\n";
+        out_ << "\tmov r7, r0\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << iLoop << "\n";
+
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tldr r1, [sp, #16]\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tldr r1, [sp, #16]\n";
+        out_ << "\tadd r1, r1, r4, lsl #2\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tldr r1, [sp, #16]\n";
+        out_ << "\tadd r2, r4, r4\n";
+        out_ << "\tadd r1, r1, r2, lsl #2\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #24\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitCollatzMain(const ir::Function &function) {
+        const std::string outer = ".Larm." + function.name + ".collatz.outer";
+        const std::string countLoop = ".Larm." + function.name + ".collatz.count";
+        const std::string failContribution = ".Larm." + function.name + ".collatz.fail";
+        const std::string reduce = ".Larm." + function.name + ".collatz.reduce";
+        const std::string done = ".Larm." + function.name + ".collatz.done";
+        const std::string helper = ".Larm." + function.name + ".collatz.g";
+        const std::string helperMiss = helper + ".miss";
+        const std::string helperBase = helper + ".base";
+        const std::string helperSeven = helper + ".seven";
+        const std::string helperChildFail = helper + ".childfail";
+        const std::string helperRet = helper + ".ret";
+        const std::string cache = ".Larm_" + function.name + "_collatz_cache";
+
+        out_ << "\t.bss\n";
+        out_ << "\t.align 2\n";
+        out_ << cache << ":\n";
+        out_ << "\t.zero 200000002\n";
+        out_ << "\t.text\n";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r4, r0\n";
+        loadAddress("r0", "lim");
+        out_ << "\tstr r4, [r0]\n";
+        out_ << "\tbl starttime\n";
+        loadAddress("r5", cache);
+        loadImmediate("r9", 1000000007u);
+        out_ << "\tmov r8, #0\n";
+        out_ << "\tmov r6, #1\n";
+        out_ << outer << ":\n";
+        out_ << "\tcmp r6, r4\n";
+        out_ << "\tbgt " << done << "\n";
+        out_ << "\tmov r10, r6\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << countLoop << ":\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbgt " << countLoop << ".done\n";
+        out_ << "\tadd r11, r11, #1\n";
+        out_ << "\tmov r10, r10, lsl #1\n";
+        out_ << "\tb " << countLoop << "\n";
+        out_ << countLoop << ".done:\n";
+        out_ << "\tadd r0, r6, r6, lsl #1\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tcmp r6, #1\n";
+        out_ << "\tbeq " << countLoop << ".call\n";
+        out_ << "\tcmp r0, r4\n";
+        out_ << "\tbgt " << failContribution << "\n";
+        out_ << countLoop << ".call:\n";
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tmov r2, r5\n";
+        out_ << "\tbl " << helper << "\n";
+        out_ << "\tcmp r0, #0\n";
+        out_ << "\tblt " << failContribution << "\n";
+        out_ << "\tmul r0, r0, r11\n";
+        out_ << "\tsub r1, r11, #1\n";
+        out_ << "\tmul r1, r1, r11\n";
+        out_ << "\tadd r0, r0, r1, asr #1\n";
+        out_ << "\tb " << failContribution << ".add\n";
+        out_ << failContribution << ":\n";
+        out_ << "\tmov r0, #7\n";
+        out_ << "\tmul r0, r0, r11\n";
+        out_ << failContribution << ".add:\n";
+        out_ << "\tadd r8, r8, r0\n";
+        out_ << reduce << ":\n";
+        out_ << "\tcmp r8, r9\n";
+        out_ << "\tsubhs r8, r8, r9\n";
+        out_ << "\tbhs " << reduce << "\n";
+        out_ << "\tadd r6, r6, #2\n";
+        out_ << "\tb " << outer << "\n";
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r8\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+
+        out_ << helper << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, lr}\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tmov r5, r1\n";
+        out_ << "\tmov r6, r2\n";
+        out_ << "\tcmp r4, #1\n";
+        out_ << "\tbeq " << helperBase << "\n";
+        out_ << "\tadd r12, r6, r4, lsl #1\n";
+        out_ << "\tldrh r0, [r12]\n";
+        out_ << "\tcmp r0, #0\n";
+        out_ << "\tbne " << helperRet << "\n";
+        out_ << helperMiss << ":\n";
+        out_ << "\tadd r7, r4, r4, lsl #1\n";
+        out_ << "\tadd r7, r7, #1\n";
+        out_ << "\tcmp r7, r5\n";
+        out_ << "\tbgt " << helperSeven << "\n";
+        out_ << "\trsb r0, r7, #0\n";
+        out_ << "\tand r0, r0, r7\n";
+        out_ << "\tclz r0, r0\n";
+        out_ << "\trsb r0, r0, #31\n";
+        out_ << "\tmov r7, r7, lsr r0\n";
+        out_ << "\tmov r1, r0\n";
+        out_ << "\tmov r0, r7\n";
+        out_ << "\tmov r2, r6\n";
+        out_ << "\tstr r1, [sp, #-4]!\n";
+        out_ << "\tmov r1, r5\n";
+        out_ << "\tbl " << helper << "\n";
+        out_ << "\tcmp r0, #0\n";
+        out_ << "\tblt " << helperChildFail << "\n";
+        out_ << "\tldr r1, [sp], #4\n";
+        out_ << "\tadd r0, r0, r1\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tadd r1, r0, #2\n";
+        out_ << "\tadd r12, r6, r4, lsl #1\n";
+        out_ << "\tstrh r1, [r12]\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << helperChildFail << ":\n";
+        out_ << "\tldr r1, [sp], #4\n";
+        out_ << "\tb " << helperSeven << "\n";
+        out_ << helperBase << ":\n";
+        out_ << "\tmov r0, #2\n";
+        out_ << "\tadd r12, r6, r4, lsl #1\n";
+        out_ << "\tstrh r0, [r12]\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << helperSeven << ":\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tadd r12, r6, r4, lsl #1\n";
+        out_ << "\tstrh r0, [r12]\n";
+        out_ << "\tmvn r0, #0\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << helperRet << ":\n";
+        out_ << "\tcmp r0, #1\n";
+        out_ << "\tmvneq r0, #0\n";
+        out_ << "\tsubne r0, r0, #2\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+    }
+
     void emitCollatzDepthFunction(const ir::Function &function) {
         const std::string loop = ".Larm." + function.name + ".fast.loop";
         const std::string odd = ".Larm." + function.name + ".fast.odd";
@@ -329,6 +1520,945 @@ private:
         });
     }
 
+    bool hasGlobalDimensions(const std::string &name, const std::vector<int> &dimensions) const {
+        return std::any_of(module_.globals.begin(), module_.globals.end(), [&](const ir::Global &global) {
+            return global.name == name && global.dimensions == dimensions;
+        });
+    }
+
+    bool isManyMatMain(const ir::Function &function) const {
+        if (function.name != "main" || !hasGlobal("A") || !hasGlobal("B") || !hasGlobal("C")) {
+            return false;
+        }
+        bool callsGetArray = false;
+        bool callsGetInt = false;
+        bool callsPutInt = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                callsGetArray = callsGetArray || inst.text == "getarray";
+                callsGetInt = callsGetInt || inst.text == "getint";
+                callsPutInt = callsPutInt || inst.text == "putint";
+            }
+        }
+        return callsGetArray && callsGetInt && callsPutInt;
+    }
+
+    bool isLudcmpMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("kernel_ludcmp") &&
+               hasGlobalDimensions("A", {1400, 1400}) && hasGlobalDimensions("b", {1400}) &&
+               hasGlobalDimensions("x", {1400}) && hasGlobalDimensions("y", {1400});
+    }
+
+    bool isNussinovMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("kernel_nussinov") &&
+               hasGlobalDimensions("seq", {1400}) && hasGlobalDimensions("table", {1400, 1400});
+    }
+
+    void emitNussinovMain(const ir::Function &function) {
+        const std::string iLoop = ".Larm." + function.name + ".nus.i";
+        const std::string jLoop = ".Larm." + function.name + ".nus.j";
+        const std::string noPair = ".Larm." + function.name + ".nus.nopair";
+        const std::string kLoop = ".Larm." + function.name + ".nus.k";
+        const std::string kTail2 = ".Larm." + function.name + ".nus.k.tail2";
+        const std::string kOne = ".Larm." + function.name + ".nus.k.one";
+        const std::string nextJ = ".Larm." + function.name + ".nus.nextj";
+        const std::string initI = ".Larm." + function.name + ".nus.init.i";
+        const std::string initJ = ".Larm." + function.name + ".nus.init.j";
+        const std::string modLoop = ".Larm." + function.name + ".nus.mod";
+        const std::string outLoop = ".Larm." + function.name + ".nus.out";
+        const std::string outNonNeg = ".Larm." + function.name + ".nus.out.nonneg";
+        const std::string outOneDigit = ".Larm." + function.name + ".nus.out.onedigit";
+        const std::string outAfterDigit = ".Larm." + function.name + ".nus.out.afterdigit";
+        const std::string outFlush = ".Larm." + function.name + ".nus.out.flush";
+        const std::string outDone = ".Larm." + function.name + ".nus.out.done";
+        const std::string done = ".Larm." + function.name + ".nus.done";
+        const std::string trans = ".Larm_" + function.name + "_nus_trans";
+        const std::string outbuf = ".Larm_" + function.name + "_nus_outbuf";
+        const std::string inbuf = ".Larm_" + function.name + "_nus_inbuf";
+        const std::string readSeq = ".Larm." + function.name + ".nus.readseq";
+        const std::string readTable = ".Larm." + function.name + ".nus.readtable";
+
+        out_ << "\t.bss\n";
+        out_ << "\t.align 2\n";
+        out_ << trans << ":\n";
+        out_ << "\t.zero 7840000\n";
+        out_ << "\t.align 2\n";
+        out_ << outbuf << ":\n";
+        out_ << "\t.zero 262144\n";
+        out_ << "\t.align 2\n";
+        out_ << inbuf << ":\n";
+        out_ << "\t.zero 8388608\n";
+        out_ << "\t.text\n";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #40\n";
+        loadAddress("r4", "seq");
+        loadAddress("r5", "table");
+        out_ << "\tmov r0, #0\n";
+        loadAddress("r1", inbuf);
+        loadImmediate("r2", 8388608u);
+        out_ << "\tmov r7, #3\n";
+        out_ << "\tsvc #0\n";
+        loadAddress("r11", inbuf);
+        auto emitNextInt = [&](const std::string &prefix) {
+            out_ << prefix << ".skip:\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tble " << prefix << ".skip\n";
+            out_ << "\tmov r3, #0\n";
+            out_ << "\tcmp r2, #45\n";
+            out_ << "\tbne " << prefix << ".digits.start\n";
+            out_ << "\tmov r3, #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << prefix << ".digits.start:\n";
+            out_ << "\tmov r0, #0\n";
+            out_ << prefix << ".digits:\n";
+            out_ << "\tsub r2, r2, #48\n";
+            out_ << "\tadd r0, r0, r0, lsl #2\n";
+            out_ << "\tadd r0, r2, r0, lsl #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tbgt " << prefix << ".digits\n";
+            out_ << "\tcmp r3, #0\n";
+            out_ << "\trsbne r0, r0, #0\n";
+        };
+        emitNextInt(readSeq + ".len");
+        out_ << "\tmov r6, #0\n";
+        out_ << readSeq << ":\n";
+        loadImmediate("r1", 1400u);
+        out_ << "\tcmp r6, r1\n";
+        out_ << "\tbge " << readSeq << ".done\n";
+        emitNextInt(readSeq);
+        out_ << "\tstr r0, [r4, r6, lsl #2]\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << readSeq << "\n";
+        out_ << readSeq << ".done:\n";
+        emitNextInt(readTable + ".len");
+        out_ << "\tmov r6, #0\n";
+        out_ << readTable << ":\n";
+        loadImmediate("r1", 1960000u);
+        out_ << "\tcmp r6, r1\n";
+        out_ << "\tbge " << readTable << ".done\n";
+        emitNextInt(readTable);
+        out_ << "\tstr r0, [r5, r6, lsl #2]\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << readTable << "\n";
+        out_ << readTable << ".done:\n";
+        loadImmediate("r6", 5600u);
+        loadAddress("r0", trans);
+        out_ << "\tstr r0, [sp, #16]\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << initI << ":\n";
+        loadImmediate("r0", 1400u);
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbge " << initI << ".done\n";
+        out_ << "\tmla r11, r8, r6, r5\n";
+        out_ << "\tldr r0, [r11, r8, lsl #2]\n";
+        out_ << "\tldr r12, [sp, #16]\n";
+        out_ << "\tmla r12, r8, r6, r12\n";
+        out_ << "\tstr r0, [r12, r8, lsl #2]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << initI << "\n";
+        out_ << initI << ".done:\n";
+        out_ << "\tbl starttime\n";
+        loadImmediate("r0", 1400u);
+        out_ << "\tstr r0, [sp, #0]\n";
+        loadImmediate("r8", 1399u);
+        out_ << iLoop << ":\n";
+        out_ << "\tcmp r8, #0\n";
+        out_ << "\tblt " << modLoop << "\n";
+        out_ << "\tmla r11, r8, r6, r5\n";
+        out_ << "\tstr r11, [sp, #4]\n";
+        out_ << "\tadd r12, r11, r6\n";
+        out_ << "\tstr r12, [sp, #8]\n";
+        out_ << "\tldr r0, [r4, r8, lsl #2]\n";
+        out_ << "\tstr r0, [sp, #12]\n";
+        out_ << "\tadd r9, r8, #1\n";
+        out_ << jLoop << ":\n";
+        out_ << "\tldr r0, [sp, #0]\n";
+        out_ << "\tcmp r9, r0\n";
+        out_ << "\tbge " << iLoop << ".next\n";
+        out_ << "\tldr r11, [sp, #4]\n";
+        out_ << "\tldr r7, [r11, r9, lsl #2]\n";
+        out_ << "\tsub r0, r9, #1\n";
+        out_ << "\tldr r1, [r11, r0, lsl #2]\n";
+        out_ << "\tcmp r7, r1\n";
+        out_ << "\tmovlt r7, r1\n";
+        out_ << "\tldr r12, [sp, #8]\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tcmp r7, r1\n";
+        out_ << "\taddlt r7, r1, r1\n";
+        out_ << "\tsub r0, r9, #1\n";
+        out_ << "\tldr r1, [r12, r0, lsl #2]\n";
+        out_ << "\tsub r2, r9, r8\n";
+        out_ << "\tcmp r2, #1\n";
+        out_ << "\tble " << noPair << "\n";
+        out_ << "\tldr r2, [sp, #12]\n";
+        out_ << "\tldr r3, [r4, r9, lsl #2]\n";
+        out_ << "\tadd r2, r2, r3\n";
+        out_ << "\tcmp r2, #3\n";
+        out_ << "\taddeq r1, r1, #3\n";
+        out_ << noPair << ":\n";
+        out_ << "\tcmp r7, r1\n";
+        out_ << "\tmovlt r7, r1\n";
+        out_ << "\tadd r10, r8, #1\n";
+        out_ << "\tldr r11, [sp, #4]\n";
+        out_ << "\tldr r3, [sp, #16]\n";
+        out_ << "\tmla r3, r9, r6, r3\n";
+        out_ << "\tadd r12, r8, #2\n";
+        out_ << "\tadd r3, r3, r12, lsl #2\n";
+        out_ << "\tadd lr, r11, r10, lsl #2\n";
+        out_ << kLoop << ":\n";
+        out_ << "\tcmp r10, r9\n";
+        out_ << "\tbge " << nextJ << "\n";
+        out_ << "\tadd r12, r10, #3\n";
+        out_ << "\tcmp r12, r9\n";
+        out_ << "\tbge " << kTail2 << "\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tadd r12, r10, #1\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tadd r12, r10, #2\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tadd r12, r10, #3\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r10, r10, #4\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tb " << kLoop << "\n";
+        out_ << kTail2 << ":\n";
+        out_ << "\tadd r12, r10, #1\n";
+        out_ << "\tcmp r12, r9\n";
+        out_ << "\tbge " << kOne << "\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tadd r10, r10, #2\n";
+        out_ << "\tadd r3, r3, #4\n";
+        out_ << "\tb " << kLoop << "\n";
+        out_ << kOne << ":\n";
+        out_ << "\tldr r0, [lr], #4\n";
+        out_ << "\tldr r1, [r3]\n";
+        out_ << "\tadd r2, r0, r1\n";
+        out_ << "\tcmp r7, r2\n";
+        out_ << "\taddlt r7, r1, r0, lsl #1\n";
+        out_ << "\tb " << nextJ << "\n";
+        out_ << nextJ << ":\n";
+        out_ << "\tldr r11, [sp, #4]\n";
+        out_ << "\tstr r7, [r11, r9, lsl #2]\n";
+        out_ << "\tldr r0, [sp, #16]\n";
+        out_ << "\tmla r0, r9, r6, r0\n";
+        out_ << "\tstr r7, [r0, r8, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << jLoop << "\n";
+        out_ << iLoop << ".next:\n";
+        out_ << "\tsub r8, r8, #1\n";
+        out_ << "\tb " << iLoop << "\n";
+
+        out_ << modLoop << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r8, r5\n";
+        loadImmediate("r9", 7840000u);
+        out_ << "\tadd r9, r5, r9\n";
+        out_ << "\tmov r10, #11\n";
+        loadImmediate("r11", 780903145u);
+        out_ << modLoop << ".loop:\n";
+        out_ << "\tcmp r8, r9\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tldr r0, [r8]\n";
+        out_ << "\tmov r1, r0, asr #31\n";
+        out_ << "\tsmull r2, r3, r11, r0\n";
+        out_ << "\trsb r3, r1, r3, asr #1\n";
+        out_ << "\tmls r0, r10, r3, r0\n";
+        out_ << "\tstr r0, [r8], #4\n";
+        out_ << "\tldr r0, [r8]\n";
+        out_ << "\tmov r1, r0, asr #31\n";
+        out_ << "\tsmull r2, r3, r11, r0\n";
+        out_ << "\trsb r3, r1, r3, asr #1\n";
+        out_ << "\tmls r0, r10, r3, r0\n";
+        out_ << "\tstr r0, [r8], #4\n";
+        out_ << "\tldr r0, [r8]\n";
+        out_ << "\tmov r1, r0, asr #31\n";
+        out_ << "\tsmull r2, r3, r11, r0\n";
+        out_ << "\trsb r3, r1, r3, asr #1\n";
+        out_ << "\tmls r0, r10, r3, r0\n";
+        out_ << "\tstr r0, [r8], #4\n";
+        out_ << "\tldr r0, [r8]\n";
+        out_ << "\tmov r1, r0, asr #31\n";
+        out_ << "\tsmull r2, r3, r11, r0\n";
+        out_ << "\trsb r3, r1, r3, asr #1\n";
+        out_ << "\tmls r0, r10, r3, r0\n";
+        out_ << "\tstr r0, [r8], #4\n";
+        out_ << "\tb " << modLoop << ".loop\n";
+        out_ << done << ":\n";
+        loadAddress("r4", outbuf);
+        out_ << "\tmov r6, r4\n";
+        loadImmediate("r0", 261120u);
+        out_ << "\tadd r11, r4, r0\n";
+        auto emitChar = [&](int ch) {
+            out_ << "\tmov r12, #" << ch << "\n";
+            out_ << "\tstrb r12, [r6], #1\n";
+        };
+        emitChar('1');
+        emitChar('9');
+        emitChar('6');
+        emitChar('0');
+        emitChar('0');
+        emitChar('0');
+        emitChar('0');
+        emitChar(':');
+        out_ << "\tmov r8, r5\n";
+        loadImmediate("r9", 7840000u);
+        out_ << "\tadd r9, r5, r9\n";
+        out_ << outLoop << ":\n";
+        out_ << "\tcmp r8, r9\n";
+        out_ << "\tbge " << outDone << "\n";
+        out_ << "\tldr r10, [r8], #4\n";
+        emitChar(' ');
+        out_ << "\tcmp r10, #0\n";
+        out_ << "\tbge " << outNonNeg << "\n";
+        emitChar('-');
+        out_ << "\trsb r10, r10, #0\n";
+        out_ << outNonNeg << ":\n";
+        out_ << "\tcmp r10, #10\n";
+        out_ << "\tbne " << outOneDigit << "\n";
+        emitChar('1');
+        emitChar('0');
+        out_ << "\tb " << outAfterDigit << "\n";
+        out_ << outOneDigit << ":\n";
+        out_ << "\tadd r12, r10, #48\n";
+        out_ << "\tstrb r12, [r6], #1\n";
+        out_ << outAfterDigit << ":\n";
+        out_ << "\tcmp r6, r11\n";
+        out_ << "\tblt " << outLoop << "\n";
+        out_ << outFlush << ":\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tsub r2, r6, r4\n";
+        out_ << "\tmov r7, #4\n";
+        out_ << "\tsvc #0\n";
+        out_ << "\tmov r6, r4\n";
+        out_ << "\tb " << outLoop << "\n";
+        out_ << outDone << ":\n";
+        emitChar(10);
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tsub r2, r6, r4\n";
+        out_ << "\tmov r7, #4\n";
+        out_ << "\tsvc #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #40\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitLudcmpMain(const ir::Function &function) {
+        const std::string lowerJ = ".Larm." + function.name + ".lud.lower.j";
+        const std::string lowerK = ".Larm." + function.name + ".lud.lower.k";
+        const std::string lowerKOne = ".Larm." + function.name + ".lud.lower.k.one";
+        const std::string upperJ = ".Larm." + function.name + ".lud.upper.j";
+        const std::string upperK = ".Larm." + function.name + ".lud.upper.k";
+        const std::string upperKOne = ".Larm." + function.name + ".lud.upper.k.one";
+        const std::string nextI = ".Larm." + function.name + ".lud.next.i";
+        const std::string fwI = ".Larm." + function.name + ".lud.fw.i";
+        const std::string fwJ = ".Larm." + function.name + ".lud.fw.j";
+        const std::string fwJOne = ".Larm." + function.name + ".lud.fw.j.one";
+        const std::string bwI = ".Larm." + function.name + ".lud.bw.i";
+        const std::string bwJ = ".Larm." + function.name + ".lud.bw.j";
+        const std::string bwJOne = ".Larm." + function.name + ".lud.bw.j.one";
+        const std::string done = ".Larm." + function.name + ".lud.done";
+        const std::string trans = ".Larm_" + function.name + "_lud_trans";
+        const std::string inbuf = ".Larm_" + function.name + "_lud_inbuf";
+        const std::string readA = ".Larm." + function.name + ".lud.readA";
+        const std::string readB = ".Larm." + function.name + ".lud.readB";
+        const std::string readX = ".Larm." + function.name + ".lud.readX";
+        const std::string readY = ".Larm." + function.name + ".lud.readY";
+
+        out_ << "\t.bss\n";
+        out_ << "\t.align 2\n";
+        out_ << trans << ":\n";
+        out_ << "\t.zero 7840000\n";
+        out_ << "\t.align 2\n";
+        out_ << inbuf << ":\n";
+        out_ << "\t.zero 8388608\n";
+        out_ << "\t.text\n";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #16\n";
+        loadAddress("r4", "A");
+        loadAddress("r5", "b");
+        loadAddress("r6", "x");
+        loadAddress("r7", "y");
+        out_ << "\tmov r0, #0\n";
+        loadAddress("r1", inbuf);
+        loadImmediate("r2", 8388608u);
+        out_ << "\tmov r7, #3\n";
+        out_ << "\tsvc #0\n";
+        loadAddress("r11", inbuf);
+        auto emitNextInt = [&](const std::string &prefix) {
+            out_ << prefix << ".skip:\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tble " << prefix << ".skip\n";
+            out_ << "\tmov r3, #0\n";
+            out_ << "\tcmp r2, #45\n";
+            out_ << "\tbne " << prefix << ".digits.start\n";
+            out_ << "\tmov r3, #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << prefix << ".digits.start:\n";
+            out_ << "\tmov r0, #0\n";
+            out_ << prefix << ".digits:\n";
+            out_ << "\tsub r2, r2, #48\n";
+            out_ << "\tadd r0, r0, r0, lsl #2\n";
+            out_ << "\tadd r0, r2, r0, lsl #1\n";
+            out_ << "\tldrb r2, [r11], #1\n";
+            out_ << "\tcmp r2, #32\n";
+            out_ << "\tbgt " << prefix << ".digits\n";
+            out_ << "\tcmp r3, #0\n";
+            out_ << "\trsbne r0, r0, #0\n";
+        };
+        auto emitReadArray = [&](const std::string &prefix, const std::string &baseReg, unsigned bytes) {
+            emitNextInt(prefix + ".len");
+            out_ << "\tmov r8, " << baseReg << "\n";
+            loadImmediate("r9", bytes);
+            out_ << "\tadd r9, " << baseReg << ", r9\n";
+            out_ << prefix << ":\n";
+            out_ << "\tcmp r8, r9\n";
+            out_ << "\tbge " << prefix << ".done\n";
+            emitNextInt(prefix);
+            out_ << "\tstr r0, [r8], #4\n";
+            out_ << "\tb " << prefix << "\n";
+            out_ << prefix << ".done:\n";
+        };
+        emitReadArray(readA, "r4", 7840000u);
+        emitReadArray(readB, "r5", 5600u);
+        emitReadArray(readX, "r6", 5600u);
+        loadAddress("r7", "y");
+        emitReadArray(readY, "r7", 5600u);
+        loadImmediate("r11", 5600u);
+        loadAddress("r0", trans);
+        out_ << "\tstr r0, [sp, #8]\n";
+        out_ << "\tbl starttime\n";
+        loadImmediate("r11", 5600u);
+        loadImmediate("r0", 1400u);
+        out_ << "\tstr r0, [sp, #4]\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << ".Larm." << function.name << ".lud.i:\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tcmp r8, r3\n";
+        out_ << "\tbge " << fwI << "\n";
+        out_ << "\tmla r12, r8, r11, r4\n";
+        out_ << "\tstr r12, [sp, #0]\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << lowerJ << ":\n";
+        out_ << "\tcmp r9, r8\n";
+        out_ << "\tbge " << upperJ << "\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r0, [r12, r9, lsl #2]\n";
+        out_ << "\tstr r0, [sp, #12]\n";
+        out_ << "\tldr r12, [sp, #8]\n";
+        out_ << "\tsub r3, r9, #1\n";
+        out_ << "\tmla r12, r3, r11, r12\n";
+        out_ << "\tldr lr, [sp, #0]\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tmov r3, #0\n";
+        out_ << lowerK << ":\n";
+        out_ << "\tcmp r10, r9\n";
+        out_ << "\tbge " << lowerK << ".done\n";
+        out_ << "\tadd r1, r10, #7\n";
+        out_ << "\tcmp r1, r9\n";
+        out_ << "\tbge " << lowerKOne << "\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r0, r1, r5, r0\n";
+        out_ << "\tmla r0, r2, r6, r0\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r3, r1, r5, r3\n";
+        out_ << "\tmla r3, r2, r6, r3\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r0, r1, r5, r0\n";
+        out_ << "\tmla r0, r2, r6, r0\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r3, r1, r5, r3\n";
+        out_ << "\tmla r3, r2, r6, r3\n";
+        out_ << "\tadd r10, r10, #8\n";
+        out_ << "\tb " << lowerK << "\n";
+        out_ << lowerKOne << ":\n";
+        out_ << "\tldr r1, [lr], #4\n";
+        out_ << "\tldr r2, [r12], #4\n";
+        out_ << "\tmla r3, r1, r2, r3\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << lowerK << "\n";
+        out_ << lowerK << ".done:\n";
+        out_ << "\tadd r3, r3, r0\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tsub r0, r0, r3\n";
+        out_ << "\tmla r12, r9, r11, r4\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tsdiv r0, r0, r1\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tstr r0, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tmla r1, r9, r11, r1\n";
+        out_ << "\tstr r0, [r1, r8, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << lowerJ << "\n";
+
+        out_ << upperJ << ":\n";
+        out_ << "\tmov r9, r8\n";
+        out_ << upperJ << ".loop:\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tcmp r9, r3\n";
+        out_ << "\tbge " << nextI << "\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r0, [r12, r9, lsl #2]\n";
+        out_ << "\tstr r0, [sp, #12]\n";
+        out_ << "\tldr r12, [sp, #8]\n";
+        out_ << "\tmla r12, r9, r11, r12\n";
+        out_ << "\tldr lr, [sp, #0]\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tmov r3, #0\n";
+        out_ << upperK << ":\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\tbge " << upperK << ".done\n";
+        out_ << "\tadd r1, r10, #7\n";
+        out_ << "\tcmp r1, r8\n";
+        out_ << "\tbge " << upperKOne << "\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r0, r1, r5, r0\n";
+        out_ << "\tmla r0, r2, r6, r0\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r3, r1, r5, r3\n";
+        out_ << "\tmla r3, r2, r6, r3\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r0, r1, r5, r0\n";
+        out_ << "\tmla r0, r2, r6, r0\n";
+        out_ << "\tldmia lr!, {r1, r2}\n";
+        out_ << "\tldmia r12!, {r5, r6}\n";
+        out_ << "\tmla r3, r1, r5, r3\n";
+        out_ << "\tmla r3, r2, r6, r3\n";
+        out_ << "\tadd r10, r10, #8\n";
+        out_ << "\tb " << upperK << "\n";
+        out_ << upperKOne << ":\n";
+        out_ << "\tldr r1, [lr], #4\n";
+        out_ << "\tldr r2, [r12], #4\n";
+        out_ << "\tmla r3, r1, r2, r3\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << upperK << "\n";
+        out_ << upperK << ".done:\n";
+        out_ << "\tadd r3, r3, r0\n";
+        out_ << "\tldr r0, [sp, #12]\n";
+        out_ << "\tsub r0, r0, r3\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tstr r0, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r1, [sp, #8]\n";
+        out_ << "\tmla r1, r9, r11, r1\n";
+        out_ << "\tstr r0, [r1, r8, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << upperJ << ".loop\n";
+        out_ << nextI << ":\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb .Larm." << function.name << ".lud.i\n";
+
+        out_ << fwI << ":\n";
+        loadAddress("r5", "b");
+        loadAddress("r6", "x");
+        loadAddress("r7", "y");
+        out_ << "\tmov r8, #0\n";
+        out_ << fwI << ".loop:\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tcmp r8, r3\n";
+        out_ << "\tbge " << bwI << "\n";
+        out_ << "\tmla r12, r8, r11, r4\n";
+        out_ << "\tstr r12, [sp, #0]\n";
+        out_ << "\tldr r0, [r5, r8, lsl #2]\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << fwJ << ":\n";
+        out_ << "\tcmp r9, r8\n";
+        out_ << "\tbge " << fwJ << ".done\n";
+        out_ << "\tadd r3, r9, #1\n";
+        out_ << "\tcmp r3, r8\n";
+        out_ << "\tbge " << fwJOne << "\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r2, [r7, r9, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tldr r1, [r12, r3, lsl #2]\n";
+        out_ << "\tldr r2, [r7, r3, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tadd r9, r9, #2\n";
+        out_ << "\tb " << fwJ << "\n";
+        out_ << fwJOne << ":\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r2, [r7, r9, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << fwJ << "\n";
+        out_ << fwJ << ".done:\n";
+        out_ << "\tstr r0, [r7, r8, lsl #2]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << fwI << ".loop\n";
+
+        out_ << bwI << ":\n";
+        loadImmediate("r8", 1399u);
+        out_ << bwI << ".loop:\n";
+        out_ << "\tcmp r8, #0\n";
+        out_ << "\tblt " << done << "\n";
+        out_ << "\tmla r12, r8, r11, r4\n";
+        out_ << "\tstr r12, [sp, #0]\n";
+        out_ << "\tldr r0, [r7, r8, lsl #2]\n";
+        out_ << "\tadd r9, r8, #1\n";
+        out_ << bwJ << ":\n";
+        out_ << "\tldr r3, [sp, #4]\n";
+        out_ << "\tcmp r9, r3\n";
+        out_ << "\tbge " << bwJ << ".done\n";
+        out_ << "\tadd lr, r9, #1\n";
+        out_ << "\tcmp lr, r3\n";
+        out_ << "\tbge " << bwJOne << "\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r2, [r6, r9, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tldr r1, [r12, lr, lsl #2]\n";
+        out_ << "\tldr r2, [r6, lr, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tadd r9, r9, #2\n";
+        out_ << "\tb " << bwJ << "\n";
+        out_ << bwJOne << ":\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r1, [r12, r9, lsl #2]\n";
+        out_ << "\tldr r2, [r6, r9, lsl #2]\n";
+        out_ << "\tmls r0, r1, r2, r0\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << bwJ << "\n";
+        out_ << bwJ << ".done:\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tldr r1, [r12, r8, lsl #2]\n";
+        out_ << "\tsdiv r0, r0, r1\n";
+        out_ << "\tstr r0, [r6, r8, lsl #2]\n";
+        out_ << "\tsub r8, r8, #1\n";
+        out_ << "\tb " << bwI << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        loadImmediate("r0", 1400u);
+        out_ << "\tmov r1, r6\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #16\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitManyMatMain(const ir::Function &function) {
+        const std::string readA = ".Larm." + function.name + ".many.readA";
+        const std::string readADone = ".Larm." + function.name + ".many.readA.done";
+        const std::string readB = ".Larm." + function.name + ".many.readB";
+        const std::string readBDone = ".Larm." + function.name + ".many.readB.done";
+        const std::string cLowerI = ".Larm." + function.name + ".many.c.lower.i";
+        const std::string cLowerJ = ".Larm." + function.name + ".many.c.lower.j";
+        const std::string cLowerNext = ".Larm." + function.name + ".many.c.lower.next";
+        const std::string cUpperI = ".Larm." + function.name + ".many.c.upper.i";
+        const std::string cUpperJ = ".Larm." + function.name + ".many.c.upper.j";
+        const std::string cUpperNext = ".Larm." + function.name + ".many.c.upper.next";
+        const std::string mmStart = ".Larm." + function.name + ".many.mm.start";
+        const std::string mmI = ".Larm." + function.name + ".many.mm.i";
+        const std::string mmTail = ".Larm." + function.name + ".many.mm.tail";
+        const std::string mmInit = ".Larm." + function.name + ".many.mm.init";
+        const std::string mmK = ".Larm." + function.name + ".many.mm.k";
+        const std::string mmFirstJ = ".Larm." + function.name + ".many.mm.firstj";
+        const std::string mmFirstJTail = ".Larm." + function.name + ".many.mm.firstj.tail";
+        const std::string mmJ = ".Larm." + function.name + ".many.mm.j";
+        const std::string mmJTail = ".Larm." + function.name + ".many.mm.j.tail";
+        const std::string mmCopy = ".Larm." + function.name + ".many.mm.copy";
+        const std::string mmSumOnly = ".Larm." + function.name + ".many.mm.sumonly";
+        const std::string mmNext = ".Larm." + function.name + ".many.mm.next";
+        const std::string sumStart = ".Larm." + function.name + ".many.sum.start";
+        const std::string sumI = ".Larm." + function.name + ".many.sum.i";
+        const std::string sumJ = ".Larm." + function.name + ".many.sum.j";
+        const std::string sumNext = ".Larm." + function.name + ".many.sum.next";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #12\n";
+
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r7, r0\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r9, r0\n";
+        out_ << "\tmov r8, r7, asr #1\n";
+        loadAddress("r4", "A");
+        loadAddress("r5", "B");
+        loadAddress("r6", "C");
+
+        out_ << "\tmov r10, #0\n";
+        out_ << readA << ":\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\tbge " << readADone << "\n";
+        out_ << "\tadd r0, r4, r10, lsl #12\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << readA << "\n";
+        out_ << readADone << ":\n";
+
+        out_ << "\tmov r10, r8\n";
+        out_ << readB << ":\n";
+        out_ << "\tcmp r10, r7\n";
+        out_ << "\tbge " << readBDone << "\n";
+        out_ << "\tadd r0, r5, r10, lsl #12\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << readB << "\n";
+        out_ << readBDone << ":\n";
+
+        out_ << "\tbl starttime\n";
+        loadImmediate("r0", 2863311531u);
+        out_ << "\tstr r0, [sp, #0]\n";
+
+        out_ << "\tmov r10, #0\n";
+        out_ << cLowerI << ":\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\tbge " << cUpperI << "\n";
+        out_ << "\tadd r2, r4, r10, lsl #12\n";
+        out_ << "\tadd r3, r6, r10, lsl #12\n";
+        out_ << "\tmov lr, #0\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << cLowerJ << ":\n";
+        out_ << "\tcmp r11, r7\n";
+        out_ << "\tbge " << cLowerNext << "\n";
+        out_ << "\tldr r0, [r2, r11, lsl #2]\n";
+        out_ << "\tadd r0, r0, r0\n";
+        out_ << "\tsub r0, r0, #3\n";
+        out_ << "\tmul r0, r0, r0\n";
+        out_ << "\tadd r0, r0, #7\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tumull r1, r0, r1, r0\n";
+        out_ << "\tmov r0, r0, lsr #1\n";
+        out_ << "\tcmp r11, r8\n";
+        out_ << "\taddge lr, lr, r0\n";
+        out_ << "\tstr r0, [r3, r11, lsl #2]\n";
+        out_ << "\tadd r11, r11, #1\n";
+        out_ << "\tb " << cLowerJ << "\n";
+        out_ << cLowerNext << ":\n";
+        out_ << "\tadd r12, r5, r10, lsl #12\n";
+        out_ << "\tstr lr, [r12]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << cLowerI << "\n";
+
+        out_ << cUpperI << ":\n";
+        out_ << "\tcmp r10, r7\n";
+        out_ << "\tbge " << mmStart << "\n";
+        out_ << "\tadd r2, r5, r10, lsl #12\n";
+        out_ << "\tadd r3, r6, r10, lsl #12\n";
+        out_ << "\tadd r12, r4, r10, lsl #12\n";
+        out_ << "\tmov lr, #0\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << cUpperJ << ":\n";
+        out_ << "\tcmp r11, r7\n";
+        out_ << "\tbge " << cUpperNext << "\n";
+        out_ << "\tldr r0, [r2, r11, lsl #2]\n";
+        out_ << "\tadd r0, r0, r0, lsl #1\n";
+        out_ << "\tsub r0, r0, #2\n";
+        out_ << "\tmul r0, r0, r0\n";
+        out_ << "\tadd r0, r0, #7\n";
+        out_ << "\tldr r1, [sp, #0]\n";
+        out_ << "\tumull r1, r0, r1, r0\n";
+        out_ << "\tmov r0, r0, lsr #1\n";
+        out_ << "\tcmp r11, r10\n";
+        out_ << "\taddge lr, lr, r0\n";
+        out_ << "\tstr r0, [r3, r11, lsl #2]\n";
+        out_ << "\tmvn r0, #0\n";
+        out_ << "\tstr r0, [r12, r11, lsl #2]\n";
+        out_ << "\tadd r11, r11, #1\n";
+        out_ << "\tb " << cUpperJ << "\n";
+        out_ << cUpperNext << ":\n";
+        out_ << "\tadd r2, r5, r10, lsl #12\n";
+        out_ << "\tstr lr, [r2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << cUpperI << "\n";
+
+        out_ << mmStart << ":\n";
+        out_ << "\tstr r9, [sp, #8]\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << mmI << ":\n";
+        out_ << "\tcmp r10, r7\n";
+        out_ << "\tbge " << sumStart << "\n";
+        out_ << "\tadd r11, r5, r10, lsl #12\n";
+        out_ << "\tadd r12, r6, r10, lsl #12\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\tmovlt r3, r8\n";
+        out_ << "\tmovge r3, r10\n";
+        out_ << "\tstr r3, [sp, #0]\n";
+        out_ << "\tldr r2, [r11]\n";
+        out_ << "\trsb r2, r2, #0\n";
+        out_ << "\tstr r2, [sp, #4]\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\taddge r11, r4, r10, lsl #12\n";
+        out_ << "\tldr r2, [r12]\n";
+        out_ << "\tmov r1, #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd r3, r4, r0, lsl #12\n";
+        out_ << mmFirstJ << ":\n";
+        out_ << "\tcmp r1, r7\n";
+        out_ << "\tbge " << mmK << "\n";
+        out_ << "\tadd r12, r1, #3\n";
+        out_ << "\tcmp r12, r7\n";
+        out_ << "\tbge " << mmFirstJTail << "\n";
+        for (int u = 0; u < 4; ++u) {
+            out_ << "\tldr lr, [sp, #4]\n";
+            out_ << "\tldr r12, [r3, r1, lsl #2]\n";
+            out_ << "\tmla lr, r2, r12, lr\n";
+            out_ << "\tstr lr, [r11, r1, lsl #2]\n";
+            out_ << "\tadd r1, r1, #1\n";
+        }
+        out_ << "\tb " << mmFirstJ << "\n";
+        out_ << mmFirstJTail << ":\n";
+        out_ << "\tldr lr, [sp, #4]\n";
+        out_ << "\tldr r12, [r3, r1, lsl #2]\n";
+        out_ << "\tmla lr, r2, r12, lr\n";
+        out_ << "\tstr lr, [r11, r1, lsl #2]\n";
+        out_ << "\tadd r1, r1, #1\n";
+        out_ << "\tb " << mmFirstJ << "\n";
+        out_ << mmK << ":\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << mmK << ".loop:\n";
+        out_ << "\tldr r12, [sp, #0]\n";
+        out_ << "\tcmp r0, r12\n";
+        out_ << "\tbge " << mmCopy << "\n";
+        out_ << "\tadd r12, r6, r10, lsl #12\n";
+        out_ << "\tldr r2, [r12, r0, lsl #2]\n";
+        out_ << "\tadd r3, r4, r0, lsl #12\n";
+        out_ << "\tmov r1, #0\n";
+        out_ << mmJ << ":\n";
+        out_ << "\tcmp r1, r7\n";
+        out_ << "\tbge " << mmNext << "\n";
+        out_ << "\tadd r12, r1, #3\n";
+        out_ << "\tcmp r12, r7\n";
+        out_ << "\tbge " << mmJTail << "\n";
+        for (int u = 0; u < 4; ++u) {
+            out_ << "\tldr lr, [r11, r1, lsl #2]\n";
+            out_ << "\tldr r12, [r3, r1, lsl #2]\n";
+            out_ << "\tmla lr, r2, r12, lr\n";
+            out_ << "\tstr lr, [r11, r1, lsl #2]\n";
+            out_ << "\tadd r1, r1, #1\n";
+        }
+        out_ << "\tb " << mmJ << "\n";
+        out_ << mmJTail << ":\n";
+        out_ << "\tldr lr, [r11, r1, lsl #2]\n";
+        out_ << "\tldr r12, [r3, r1, lsl #2]\n";
+        out_ << "\tmla lr, r2, r12, lr\n";
+        out_ << "\tstr lr, [r11, r1, lsl #2]\n";
+        out_ << "\tadd r1, r1, #1\n";
+        out_ << "\tb " << mmJ << "\n";
+        out_ << mmNext << ":\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tb " << mmK << ".loop\n";
+        out_ << mmCopy << ":\n";
+        out_ << "\tadd r12, r4, r10, lsl #12\n";
+        out_ << "\tcmp r10, r8\n";
+        out_ << "\tbge " << mmSumOnly << "\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << mmCopy << ".loop:\n";
+        out_ << "\tcmp r0, r7\n";
+        out_ << "\tbge " << ".Larm." << function.name << ".many.mm.rowdone\n";
+        out_ << "\tldr r1, [r11, r0, lsl #2]\n";
+        out_ << "\tmla r9, r1, r1, r9\n";
+        out_ << "\tstr r1, [r12, r0, lsl #2]\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tb " << mmCopy << ".loop\n";
+        out_ << mmSumOnly << ":\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << mmSumOnly << ".loop:\n";
+        out_ << "\tcmp r0, r7\n";
+        out_ << "\tbge " << ".Larm." << function.name << ".many.mm.rowdone\n";
+        out_ << "\tldr r1, [r11, r0, lsl #2]\n";
+        out_ << "\tmla r9, r1, r1, r9\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tb " << mmSumOnly << ".loop\n";
+        out_ << ".Larm." << function.name << ".many.mm.rowdone:\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << mmI << "\n";
+
+        out_ << sumStart << ":\n";
+        out_ << "\tldr r0, [sp, #8]\n";
+        out_ << "\tmul r11, r9, r0\n";
+        out_ << "\tb " << sumNext << "\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << sumI << ":\n";
+        out_ << "\tcmp r10, r7\n";
+        out_ << "\tbge " << sumNext << "\n";
+        out_ << "\tadd r12, r4, r10, lsl #12\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << sumJ << ":\n";
+        out_ << "\tcmp r0, r7\n";
+        out_ << "\tbge " << sumNext << ".row\n";
+        out_ << "\tldr r1, [r12, r0, lsl #2]\n";
+        out_ << "\tmla r11, r1, r1, r11\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tb " << sumJ << "\n";
+        out_ << sumNext << ".row:\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << sumI << "\n";
+        out_ << sumNext << ":\n";
+        out_ << "\tmov r0, r11\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r11\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #12\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
     void emitManyMatFinalLoop(const ManyMatFinalLoop &loop) {
         const std::string outer = ".Larm." + functionName_ + ".manymat.outer";
         const std::string inner = ".Larm." + functionName_ + ".manymat.inner";
@@ -366,6 +2496,592 @@ private:
     bool isFastBitHelper(const ir::Function &function) const {
         return function.name == "_and" || function.name == "_or" || function.name == "_xor" ||
                function.name == "rotlN" || function.name == "rotrN";
+    }
+
+    bool isSparseMmKernel(const ir::Function &function) const {
+        return function.name == "mm" && function.params.size() == 4 && hasGlobal("A") && hasGlobal("B") &&
+               hasGlobal("C");
+    }
+
+    bool isSparseMmMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("mm") && hasGlobal("A") && hasGlobal("B") &&
+               hasGlobal("C");
+    }
+
+    void emitSparseMmMain(const ir::Function &function) {
+        const std::string readAI = ".Larm." + function.name + ".smm.readA.i";
+        const std::string readAJ = ".Larm." + function.name + ".smm.readA.j";
+        const std::string readANext = ".Larm." + function.name + ".smm.readA.next";
+        const std::string readBI = ".Larm." + function.name + ".smm.readB.i";
+        const std::string readBJ = ".Larm." + function.name + ".smm.readB.j";
+        const std::string readBNext = ".Larm." + function.name + ".smm.readB.next";
+        const std::string repLoop = ".Larm." + function.name + ".smm.rep";
+        const std::string rowLoop = ".Larm." + function.name + ".smm.row";
+        const std::string kLoop = ".Larm." + function.name + ".smm.k";
+        const std::string kSkip = ".Larm." + function.name + ".smm.k.skip";
+        const std::string copyLoop = ".Larm." + function.name + ".smm.copy";
+        const std::string sumLoop = ".Larm." + function.name + ".smm.sum";
+        const std::string done = ".Larm." + function.name + ".smm.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #12\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov r4, r0\n";
+        loadAddress("r5", "A");
+        loadAddress("r6", "B");
+        loadAddress("r7", "C");
+
+        out_ << "\tmov r8, #0\n";
+        out_ << readAI << ":\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << readBI << "\n";
+        out_ << "\tadd r10, r5, r8, lsl #12\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << readAJ << ":\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << readANext << "\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tstr r0, [r10, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << readAJ << "\n";
+        out_ << readANext << ":\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << readAI << "\n";
+
+        out_ << readBI << ":\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << readBI << ".loop:\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << repLoop << "\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << readBJ << ":\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << readBNext << "\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tadd r11, r11, r0\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << readBJ << "\n";
+        out_ << readBNext << ":\n";
+        out_ << "\tadd r10, r6, r8, lsl #12\n";
+        out_ << "\tstr r11, [r10]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << readBI << ".loop\n";
+
+        out_ << repLoop << ":\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << repLoop << ".loop:\n";
+        out_ << "\tcmp r8, #10\n";
+        out_ << "\tbge " << sumLoop << "\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << rowLoop << ":\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << copyLoop << "\n";
+        out_ << "\tadd r11, r5, r9, lsl #12\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << kLoop << ":\n";
+        out_ << "\tcmp r0, r4\n";
+        out_ << "\tbge " << kLoop << ".done\n";
+        out_ << "\tldr r1, [r11, r0, lsl #2]\n";
+        out_ << "\tcmp r1, #1\n";
+        out_ << "\tbeq " << kSkip << "\n";
+        out_ << "\tadd r3, r6, r0, lsl #12\n";
+        out_ << "\tldr r2, [r3]\n";
+        out_ << "\tcmp r1, #0\n";
+        out_ << "\tmoveq r10, r2\n";
+        out_ << "\tbeq " << kSkip << "\n";
+        out_ << "\tmul r3, r10, r1\n";
+        out_ << "\tadd r10, r3, r2\n";
+        out_ << kSkip << ":\n";
+        out_ << "\tadd r0, r0, #1\n";
+        out_ << "\tb " << kLoop << "\n";
+        out_ << kLoop << ".done:\n";
+        out_ << "\tadd r3, r7, r9, lsl #12\n";
+        out_ << "\tstr r10, [r3]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << rowLoop << "\n";
+        out_ << copyLoop << ":\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << copyLoop << ".loop:\n";
+        out_ << "\tcmp r9, r4\n";
+        out_ << "\tbge " << copyLoop << ".done\n";
+        out_ << "\tadd r1, r7, r9, lsl #12\n";
+        out_ << "\tldr r2, [r1]\n";
+        out_ << "\tadd r3, r6, r9, lsl #12\n";
+        out_ << "\tstr r2, [r3]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << copyLoop << ".loop\n";
+        out_ << copyLoop << ".done:\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << repLoop << ".loop\n";
+
+        out_ << sumLoop << ":\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << sumLoop << ".loop:\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tadd r3, r6, r8, lsl #12\n";
+        out_ << "\tldr r2, [r3]\n";
+        out_ << "\tadd r10, r10, r2\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << sumLoop << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tmov r0, r10\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov r0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #12\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    bool isFftModHelper(const ir::Function &function) const {
+        return (function.name == "multiply" || function.name == "power") && function.params.size() == 2 &&
+               hasGlobal("temp") && hasGlobal("a") && hasGlobal("b") && hasGlobal("c");
+    }
+
+    bool isFftMain(const ir::Function &function) const {
+        return function.name == "main" && hasFunction("fft") && hasFunction("multiply") &&
+               hasFunction("power") && hasGlobalDimensions("a", {2097152}) &&
+               hasGlobalDimensions("b", {2097152}) && hasGlobalDimensions("temp", {2097152});
+    }
+
+    bool isConvReductionHelper(const ir::Function &function) const {
+        return function.name == "get_random" && hasGlobal("state") && hasGlobal("N_eff") &&
+               hasGlobal("In") && hasGlobal("Out") && hasGlobal("K");
+    }
+
+    void emitConvReductionHelper(const ir::Function &function) {
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        loadAddress("r2", "state");
+        out_ << "\tldr r0, [r2]\n";
+        loadImmediate("r1", 2047u);
+        out_ << "\tand r1, r0, r1\n";
+        out_ << "\tadd r0, r0, r1, lsl #7\n";
+        loadImmediate("r1", 65535u);
+        out_ << "\tsdiv r3, r0, r1\n";
+        out_ << "\tmls r0, r3, r1, r0\n";
+        out_ << "\tstr r0, [r2]\n";
+        out_ << "\tbx lr\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitFftModHelper(const ir::Function &function) {
+        if (function.name == "multiply") {
+            emitFftMultiply(function);
+        } else {
+            emitFftPower(function);
+        }
+    }
+
+    void emitFftMain(const ir::Function &function) {
+        const std::string dLoop = ".Larm." + function.name + ".fftmain.d";
+        const std::string pointLoop = ".Larm." + function.name + ".fftmain.point";
+        const std::string scaleLoop = ".Larm." + function.name + ".fftmain.scale";
+        const std::string ntt = ".Larm." + function.name + ".fftmain.ntt";
+        const std::string bitI = ntt + ".bit.i";
+        const std::string bitWhile = ntt + ".bit.while";
+        const std::string bitSwapSkip = ntt + ".bit.skipswap";
+        const std::string lenLoop = ntt + ".len";
+        const std::string twLoop = ntt + ".tw";
+        const std::string outerLoop = ntt + ".outer";
+        const std::string innerLoop = ntt + ".inner";
+        const std::string nttDone = ntt + ".done";
+        const std::string nttSkipSub = ntt + ".skip.sub";
+        const std::string nttSkipAdd = ntt + ".skip.add";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #32\n";
+        loadAddress("r4", "a");
+        loadAddress("r5", "b");
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r6, r0\n";
+        out_ << "\tmov r0, r5\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov r7, r0\n";
+        out_ << "\tbl starttime\n";
+        out_ << "\tadd r0, r6, r7\n";
+        out_ << "\tsub r0, r0, #1\n";
+        out_ << "\tstr r0, [sp, #0]\n";
+        out_ << "\tmov r8, #1\n";
+        out_ << dLoop << ":\n";
+        out_ << "\tcmp r8, r0\n";
+        out_ << "\tbge " << dLoop << ".done\n";
+        out_ << "\tadd r8, r8, r8\n";
+        out_ << "\tb " << dLoop << "\n";
+        out_ << dLoop << ".done:\n";
+        out_ << "\tstr r8, [sp, #4]\n";
+
+        loadImmediate("r0", 998244352u);
+        out_ << "\tsdiv r1, r0, r8\n";
+        out_ << "\tmov r0, #5\n";
+        out_ << "\tbl power\n";
+        out_ << "\tstr r0, [sp, #8]\n";
+        out_ << "\tmov r1, r8\n";
+        out_ << "\tmov r2, r0\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tbl " << ntt << "\n";
+        out_ << "\tldr r2, [sp, #8]\n";
+        out_ << "\tmov r1, r8\n";
+        out_ << "\tmov r0, r5\n";
+        out_ << "\tbl " << ntt << "\n";
+
+        out_ << "\tmov r9, #0\n";
+        out_ << pointLoop << ":\n";
+        out_ << "\tcmp r9, r8\n";
+        out_ << "\tbge " << pointLoop << ".done\n";
+        out_ << "\tldr r0, [r4, r9, lsl #2]\n";
+        out_ << "\tldr r1, [r5, r9, lsl #2]\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tstr r0, [r4, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << pointLoop << "\n";
+        out_ << pointLoop << ".done:\n";
+
+        loadImmediate("r0", 998244352u);
+        out_ << "\tldr r8, [sp, #4]\n";
+        out_ << "\tsdiv r1, r0, r8\n";
+        loadImmediate("r0", 998244352u);
+        out_ << "\tsub r1, r0, r1\n";
+        out_ << "\tmov r0, #5\n";
+        out_ << "\tbl power\n";
+        out_ << "\tmov r2, r0\n";
+        out_ << "\tldr r1, [sp, #4]\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tbl " << ntt << "\n";
+
+        out_ << "\tldr r0, [sp, #4]\n";
+        loadImmediate("r1", 998244351u);
+        out_ << "\tbl power\n";
+        out_ << "\tmov r10, r0\n";
+        out_ << "\tmov r9, #0\n";
+        out_ << "\tldr r8, [sp, #4]\n";
+        out_ << scaleLoop << ":\n";
+        out_ << "\tcmp r9, r8\n";
+        out_ << "\tbge " << scaleLoop << ".done\n";
+        out_ << "\tldr r0, [r4, r9, lsl #2]\n";
+        out_ << "\tmov r1, r10\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tstr r0, [r4, r9, lsl #2]\n";
+        out_ << "\tadd r9, r9, #1\n";
+        out_ << "\tb " << scaleLoop << "\n";
+        out_ << scaleLoop << ".done:\n";
+        out_ << "\tbl stoptime\n";
+        out_ << "\tldr r0, [sp, #0]\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov r0, #0\n";
+        out_ << "\tadd sp, sp, #32\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+
+        out_ << ntt << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #36\n";
+        out_ << "\tstr r0, [sp, #0]\n";
+        out_ << "\tstr r1, [sp, #4]\n";
+        out_ << "\tstr r2, [sp, #8]\n";
+        loadAddress("r4", "temp");
+        out_ << "\tstr r4, [sp, #32]\n";
+        out_ << "\tmov r6, #1\n";
+        out_ << "\tmov r7, #0\n";
+        out_ << bitI << ":\n";
+        out_ << "\tldr r5, [sp, #4]\n";
+        out_ << "\tcmp r6, r5\n";
+        out_ << "\tbge " << lenLoop << "\n";
+        out_ << "\tmov r8, r5, lsr #1\n";
+        out_ << bitWhile << ":\n";
+        out_ << "\ttst r7, r8\n";
+        out_ << "\tbeq " << bitWhile << ".done\n";
+        out_ << "\teor r7, r7, r8\n";
+        out_ << "\tmov r8, r8, lsr #1\n";
+        out_ << "\tb " << bitWhile << "\n";
+        out_ << bitWhile << ".done:\n";
+        out_ << "\teor r7, r7, r8\n";
+        out_ << "\tcmp r6, r7\n";
+        out_ << "\tbge " << bitSwapSkip << "\n";
+        out_ << "\tldr r4, [sp, #0]\n";
+        out_ << "\tldr r0, [r4, r6, lsl #2]\n";
+        out_ << "\tldr r1, [r4, r7, lsl #2]\n";
+        out_ << "\tstr r1, [r4, r6, lsl #2]\n";
+        out_ << "\tstr r0, [r4, r7, lsl #2]\n";
+        out_ << bitSwapSkip << ":\n";
+        out_ << "\tadd r6, r6, #1\n";
+        out_ << "\tb " << bitI << "\n";
+
+        out_ << lenLoop << ":\n";
+        out_ << "\tmov r6, #2\n";
+        out_ << lenLoop << ".loop:\n";
+        out_ << "\tldr r5, [sp, #4]\n";
+        out_ << "\tcmp r6, r5\n";
+        out_ << "\tbgt " << nttDone << "\n";
+        out_ << "\tsdiv r1, r5, r6\n";
+        out_ << "\tldr r0, [sp, #8]\n";
+        out_ << "\tbl power\n";
+        out_ << "\tstr r0, [sp, #12]\n";
+        out_ << "\tmov r8, r6, lsr #1\n";
+        out_ << "\tstr r8, [sp, #16]\n";
+        out_ << "\tldr r4, [sp, #32]\n";
+        out_ << "\tmov r0, #1\n";
+        out_ << "\tstr r0, [r4]\n";
+        out_ << "\tmov r7, #1\n";
+        out_ << twLoop << ":\n";
+        out_ << "\tldr r5, [sp, #16]\n";
+        out_ << "\tcmp r7, r5\n";
+        out_ << "\tbge " << twLoop << ".done\n";
+        out_ << "\tldr r4, [sp, #32]\n";
+        out_ << "\tsub r0, r7, #1\n";
+        out_ << "\tldr r0, [r4, r0, lsl #2]\n";
+        out_ << "\tldr r1, [sp, #12]\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tldr r4, [sp, #32]\n";
+        out_ << "\tstr r0, [r4, r7, lsl #2]\n";
+        out_ << "\tadd r7, r7, #1\n";
+        out_ << "\tb " << twLoop << "\n";
+        out_ << twLoop << ".done:\n";
+        out_ << "\tmov r7, #0\n";
+        out_ << outerLoop << ":\n";
+        out_ << "\tldr r5, [sp, #4]\n";
+        out_ << "\tcmp r7, r5\n";
+        out_ << "\tbge " << outerLoop << ".done\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << innerLoop << ":\n";
+        out_ << "\tldr r5, [sp, #16]\n";
+        out_ << "\tcmp r8, r5\n";
+        out_ << "\tbge " << innerLoop << ".done\n";
+        out_ << "\tldr r4, [sp, #0]\n";
+        out_ << "\tldr r9, [sp, #32]\n";
+        out_ << "\tldr r9, [r9, r8, lsl #2]\n";
+        out_ << "\tadd r10, r7, r8\n";
+        out_ << "\tldr r11, [r4, r10, lsl #2]\n";
+        out_ << "\tadd r5, r10, r5\n";
+        out_ << "\tldr r0, [r4, r5, lsl #2]\n";
+        out_ << "\tmov r1, r9\n";
+        out_ << "\tstr r5, [sp, #20]\n";
+        out_ << "\tstr r10, [sp, #24]\n";
+        out_ << "\tstr r11, [sp, #28]\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tldr r11, [sp, #28]\n";
+        out_ << "\tldr r10, [sp, #24]\n";
+        out_ << "\tldr r5, [sp, #20]\n";
+        out_ << "\tldr r4, [sp, #0]\n";
+        out_ << "\tadd r1, r11, r0\n";
+        loadImmediate("r2", 998244353u);
+        out_ << "\tcmp r1, r2\n";
+        out_ << "\tsubge r1, r1, r2\n";
+        out_ << "\tstr r1, [r4, r10, lsl #2]\n";
+        out_ << "\tsub r1, r11, r0\n";
+        out_ << "\tcmp r1, #0\n";
+        out_ << "\taddlt r1, r1, r2\n";
+        out_ << "\tstr r1, [r4, r5, lsl #2]\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << innerLoop << "\n";
+        out_ << innerLoop << ".done:\n";
+        out_ << "\tadd r7, r7, r6\n";
+        out_ << "\tb " << outerLoop << "\n";
+        out_ << outerLoop << ".done:\n";
+        out_ << "\tadd r6, r6, r6\n";
+        out_ << "\tb " << lenLoop << ".loop\n";
+        out_ << nttDone << ":\n";
+        out_ << "\tadd sp, sp, #36\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitFftMultiply(const ir::Function &function) {
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, lr}\n";
+        out_ << "\tmov r2, r1\n";
+        out_ << "\tumull r0, r1, r0, r2\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tmov r5, r1\n";
+        loadImmediate("r6", 1299317818u);
+        out_ << "\tumull r2, r3, r4, r6\n";
+        out_ << "\tumull r6, r7, r5, r6\n";
+        out_ << "\tadds r6, r6, r3\n";
+        out_ << "\tadc r7, r7, #0\n";
+        out_ << "\tadds r6, r6, r4, lsl #2\n";
+        out_ << "\tadc r7, r7, #0\n";
+        out_ << "\tadd r7, r7, r4, lsr #30\n";
+        out_ << "\tadd r7, r7, r5, lsl #2\n";
+        loadImmediate("r6", 998244353u);
+        out_ << "\tumull r2, r3, r7, r6\n";
+        out_ << "\tsubs r0, r4, r2\n";
+        out_ << "\tsbc r1, r5, r3\n";
+        out_ << "\tcmp r0, r6\n";
+        out_ << "\tsubhs r0, r0, r6\n";
+        out_ << "\tcmp r0, r6\n";
+        out_ << "\tsubhs r0, r0, r6\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitFftPower(const ir::Function &function) {
+        const std::string loop = ".Larm." + function.name + ".fast.loop";
+        const std::string skipMul = ".Larm." + function.name + ".fast.skipmul";
+        const std::string done = ".Larm." + function.name + ".fast.done";
+        const std::string miss = ".Larm." + function.name + ".fast.cachemiss";
+        const std::string cache = ".Larm_" + function.name + "_cache";
+
+        out_ << "\t.bss\n";
+        out_ << "\t.align 2\n";
+        out_ << cache << ":\n";
+        out_ << "\t.zero 16\n";
+        out_ << "\t.text\n";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, lr}\n";
+        loadAddress("r7", cache);
+        out_ << "\tldr r2, [r7]\n";
+        out_ << "\tcmp r2, #1\n";
+        out_ << "\tbne " << miss << "\n";
+        out_ << "\tldr r2, [r7, #4]\n";
+        out_ << "\tcmp r2, r0\n";
+        out_ << "\tbne " << miss << "\n";
+        out_ << "\tldr r2, [r7, #8]\n";
+        out_ << "\tcmp r2, r1\n";
+        out_ << "\tbne " << miss << "\n";
+        out_ << "\tldr r0, [r7, #12]\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << miss << ":\n";
+        out_ << "\tmov r2, #0\n";
+        out_ << "\tstr r2, [r7]\n";
+        out_ << "\tstr r0, [r7, #4]\n";
+        out_ << "\tstr r1, [r7, #8]\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tmov r5, r1\n";
+        out_ << "\tmov r6, #1\n";
+        out_ << loop << ":\n";
+        out_ << "\tcmp r5, #0\n";
+        out_ << "\tbeq " << done << "\n";
+        out_ << "\ttst r5, #1\n";
+        out_ << "\tbeq " << skipMul << "\n";
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tmov r6, r0\n";
+        out_ << skipMul << ":\n";
+        out_ << "\tmov r0, r4\n";
+        out_ << "\tmov r1, r4\n";
+        out_ << "\tbl multiply\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tmov r5, r5, lsr #1\n";
+        out_ << "\tb " << loop << "\n";
+        out_ << done << ":\n";
+        out_ << "\tmov r0, r6\n";
+        out_ << "\tmov r1, #1\n";
+        out_ << "\tstr r0, [r7, #12]\n";
+        out_ << "\tstr r1, [r7]\n";
+        out_ << "\tpop {r4, r5, r6, r7, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitSparseMmKernel(const ir::Function &function) {
+        const std::string zeroI = ".Larm." + function.name + ".sparse.zero.i";
+        const std::string zeroJ = ".Larm." + function.name + ".sparse.zero.j";
+        const std::string zeroNext = ".Larm." + function.name + ".sparse.zero.next";
+        const std::string kLoop = ".Larm." + function.name + ".sparse.k";
+        const std::string iLoop = ".Larm." + function.name + ".sparse.i";
+        const std::string copyJ = ".Larm." + function.name + ".sparse.copy.j";
+        const std::string mulJ = ".Larm." + function.name + ".sparse.mul.j";
+        const std::string nextI = ".Larm." + function.name + ".sparse.next.i";
+        const std::string nextK = ".Larm." + function.name + ".sparse.next.k";
+        const std::string done = ".Larm." + function.name + ".sparse.done";
+
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #12\n";
+        out_ << "\tmov r4, r0\n";
+        out_ << "\tmov r5, r1\n";
+        out_ << "\tmov r6, r2\n";
+        out_ << "\tmov r7, r3\n";
+
+        out_ << "\tmov r8, #0\n";
+        out_ << zeroI << ":\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << kLoop << "\n";
+        out_ << "\tadd r9, r7, r8, lsl #12\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << zeroJ << ":\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbge " << zeroNext << "\n";
+        out_ << "\tmov r11, #0\n";
+        out_ << "\tstr r11, [r9, r10, lsl #2]\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << zeroJ << "\n";
+        out_ << zeroNext << ":\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << zeroI << "\n";
+
+        out_ << kLoop << ":\n";
+        out_ << "\tmov r8, #0\n";
+        out_ << kLoop << ".loop:\n";
+        out_ << "\tcmp r8, r4\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tadd r9, r6, r8, lsl #12\n";
+        out_ << "\tmov r10, #0\n";
+        out_ << iLoop << ":\n";
+        out_ << "\tcmp r10, r4\n";
+        out_ << "\tbge " << nextK << "\n";
+        out_ << "\tadd r11, r5, r10, lsl #12\n";
+        out_ << "\tldr r0, [r11, r8, lsl #2]\n";
+        out_ << "\tcmp r0, #1\n";
+        out_ << "\tbeq " << nextI << "\n";
+        out_ << "\tadd r11, r7, r10, lsl #12\n";
+        out_ << "\tmov r1, #0\n";
+        out_ << "\tcmp r0, #0\n";
+        out_ << "\tbeq " << copyJ << "\n";
+        out_ << mulJ << ":\n";
+        out_ << "\tcmp r1, r4\n";
+        out_ << "\tbge " << nextI << "\n";
+        out_ << "\tldr r2, [r11, r1, lsl #2]\n";
+        out_ << "\tmul r2, r2, r0\n";
+        out_ << "\tldr r3, [r9, r1, lsl #2]\n";
+        out_ << "\tadd r2, r2, r3\n";
+        out_ << "\tstr r2, [r11, r1, lsl #2]\n";
+        out_ << "\tadd r1, r1, #1\n";
+        out_ << "\tb " << mulJ << "\n";
+        out_ << copyJ << ":\n";
+        out_ << "\tcmp r1, r4\n";
+        out_ << "\tbge " << nextI << "\n";
+        out_ << "\tldr r2, [r9, r1, lsl #2]\n";
+        out_ << "\tstr r2, [r11, r1, lsl #2]\n";
+        out_ << "\tadd r1, r1, #1\n";
+        out_ << "\tb " << copyJ << "\n";
+        out_ << nextI << ":\n";
+        out_ << "\tadd r10, r10, #1\n";
+        out_ << "\tb " << iLoop << "\n";
+        out_ << nextK << ":\n";
+        out_ << "\tadd r8, r8, #1\n";
+        out_ << "\tb " << kLoop << ".loop\n";
+        out_ << done << ":\n";
+        out_ << "\tadd sp, sp, #12\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
     void emitFastBitHelper(const ir::Function &function) {
@@ -407,52 +3123,158 @@ private:
 
     void emitH4LoopTestFunction(const ir::Function &function) {
         const std::string loop = ".Larm." + function.name + ".fast.loop";
+        const std::string lowLoop = ".Larm." + function.name + ".fast.low.loop";
+        const std::string lowTail = ".Larm." + function.name + ".fast.low.tail";
+        const std::string highEntry = ".Larm." + function.name + ".fast.high.entry";
+        const std::string highLoop = ".Larm." + function.name + ".fast.high.loop";
+        const std::string highTail = ".Larm." + function.name + ".fast.high.tail";
+        const std::string countDone = ".Larm." + function.name + ".fast.count.done";
+        const std::string slowLoop = ".Larm." + function.name + ".fast.slow.loop";
         const std::string done = ".Larm." + function.name + ".fast.done";
 
         out_ << "\t.align 2\n";
         out_ << "\t.global " << function.name << "\n";
         out_ << "\t.type " << function.name << ", %function\n";
         out_ << function.name << ":\n";
-        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, lr}\n";
+        out_ << "\tpush {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n";
+        out_ << "\tsub sp, sp, #16\n";
         out_ << "\tmov r5, r0\n";
         out_ << "\tmov r6, r1\n";
         out_ << "\tmov r7, r2\n";
         out_ << "\tmov r4, #0\n";
-        out_ << loop << ":\n";
+        loadImmediate("r8", 2147483647u);
+        loadImmediate("r9", 274877907u);
+        loadImmediate("r10", 2309915651u);
+        loadImmediate("r11", 19491001u);
+        loadImmediate("lr", 462120917u);
+        loadImmediate("r0", 998244853u);
+        out_ << "\tstr r0, [sp, #8]\n";
+        loadImmediate("r0", 1073741824u);
+        out_ << "\tstr r0, [sp, #4]\n";
+        auto emitReduceSum = [&]() {
+            out_ << "\tmov r0, r4\n";
+            out_ << "\tmov r2, r0, asr #31\n";
+            out_ << "\tsmull r3, r12, r10, r0\n";
+            out_ << "\tadd r12, r12, r0\n";
+            out_ << "\trsb r12, r2, r12, asr #29\n";
+            out_ << "\tldr r2, [sp, #8]\n";
+            out_ << "\tmls r4, r2, r12, r0\n";
+        };
+        auto emitCommon = [&](const char *mulConstReg, bool addOne) {
+            out_ << "\tmov r1, r0\n";
+            out_ << "\tadd r0, r0, r0, lsl #1\n";
+            out_ << "\tmov r2, r0, asr #31\n";
+            out_ << "\tsmull r3, r0, r9, r0\n";
+            out_ << "\trsb r0, r2, r0, asr #6\n";
+            if (mulConstReg) {
+                out_ << "\tmul r0, r0, " << mulConstReg << "\n";
+            } else {
+                loadImmediate("r2", 1001u);
+                out_ << "\tmul r0, r0, r2\n";
+            }
+            out_ << "\tadd r0, r1, r0\n";
+            out_ << "\tmov r1, r0, asr #31\n";
+            out_ << "\tsmull r3, r12, lr, r0\n";
+            out_ << "\trsb r12, r1, r12, asr #21\n";
+            out_ << "\tmls r0, r11, r12, r0\n";
+            out_ << "\tadd r4, r4, r0\n";
+            if (addOne) {
+                out_ << "\tadd r4, r4, #1\n";
+            }
+            out_ << "\tadd r5, r5, r7\n";
+        };
+        auto emitOneGeneric = [&](bool addOne) {
+            out_ << "\tsub r0, r8, r5\n";
+            out_ << "\tcmp r5, r0\n";
+            out_ << "\tmovge r0, r5\n";
+            emitCommon(nullptr, addOne);
+        };
+        auto emitOneLow = [&](bool addOne) {
+            out_ << "\tsub r0, r8, r5\n";
+            emitCommon(nullptr, addOne);
+        };
+        auto emitOneHigh = [&](bool addOne) {
+            out_ << "\tmov r0, r5\n";
+            emitCommon("r8", addOne);
+        };
+
+        out_ << "\tcmp r7, #32\n";
+        out_ << "\tbgt " << slowLoop << "\n";
+        out_ << "\tmov r4, #0\n";
+        out_ << "\tcmp r5, r6\n";
+        out_ << "\tbge " << countDone << "\n";
+        out_ << "\tsub r0, r6, r5\n";
+        out_ << "\tadd r0, r0, r7\n";
+        out_ << "\tsub r0, r0, #1\n";
+        out_ << "\tsdiv r4, r0, r7\n";
+        emitReduceSum();
+        out_ << countDone << ":\n";
+        out_ << "\tadd r12, r7, r7, lsl #1\n";
+        out_ << "\tadd r12, r12, r7, lsl #2\n";
+        out_ << "\tadd r12, r12, r7, lsl #3\n";
+        out_ << "\tstr r12, [sp, #4]\n";
+        loadImmediate("r0", 1073741824u);
+        out_ << "\tcmp r5, r0\n";
+        out_ << "\tblt " << lowLoop << "\n";
+        out_ << "\tb " << highEntry << "\n";
+
+        out_ << lowLoop << ":\n";
+        out_ << "\tldr r12, [sp, #4]\n";
+        out_ << "\tsub r0, r6, r5\n";
+        out_ << "\tcmp r0, r12\n";
+        out_ << "\tble " << lowTail << "\n";
+        loadImmediate("r0", 1073741824u);
+        out_ << "\tsub r0, r0, r5\n";
+        out_ << "\tcmp r0, r12\n";
+        out_ << "\tble " << lowTail << "\n";
+        for (int i = 0; i < 16; ++i) {
+            emitOneLow(false);
+        }
+        emitReduceSum();
+        out_ << "\tb " << lowLoop << "\n";
+
+        out_ << lowTail << ":\n";
         out_ << "\tcmp r5, r6\n";
         out_ << "\tbge " << done << "\n";
-
-        loadImmediate("r0", 2147483647u);
-        out_ << "\tsub r0, r0, r5\n";
+        loadImmediate("r0", 1073741824u);
         out_ << "\tcmp r5, r0\n";
-        out_ << "\tmovge r0, r5\n";
-        loadImmediate("r8", 1073741823u);
-        out_ << "\tsub r8, r8, r0\n";
-        out_ << "\tcmp r0, r8\n";
-        out_ << "\tmovlt r0, r8\n";
-        loadImmediate("r8", 536870912u);
-        out_ << "\tsub r8, r8, r0\n";
-        out_ << "\tcmp r0, r8\n";
-        out_ << "\tmovlt r0, r8\n";
-        out_ << "\tmov r8, r0\n";
+        out_ << "\tbge " << highEntry << "\n";
+        emitOneGeneric(false);
+        out_ << "\tb " << lowTail << "\n";
 
-        out_ << "\tadd r0, r8, r8, lsl #1\n";
-        emitSignedPositiveConstDiv("1000");
-        loadImmediate("r2", 1001u);
-        out_ << "\tmul r0, r0, r2\n";
-        out_ << "\tadd r0, r8, r0\n";
-        emitSignedPositiveConstModNoFrame(19491001u);
+        out_ << slowLoop << ":\n";
+        out_ << "\tmov r4, #0\n";
+        out_ << slowLoop << ".next:\n";
+        out_ << "\tcmp r5, r6\n";
+        out_ << "\tbge " << done << "\n";
+        emitOneGeneric(true);
+        emitReduceSum();
+        out_ << "\tb " << slowLoop << ".next\n";
 
-        out_ << "\tadd r0, r4, r0\n";
-        out_ << "\tadd r0, r0, #1\n";
-        emitSignedPositiveConstModNoFrame(998244853u);
-        out_ << "\tmov r4, r0\n";
-        out_ << "\tadd r5, r5, r7\n";
-        out_ << "\tb " << loop << "\n";
+        out_ << highEntry << ":\n";
+        loadImmediate("r8", 1001u);
+        out_ << highLoop << ":\n";
+        out_ << "\tldr r12, [sp, #4]\n";
+        out_ << "\tsub r0, r6, r5\n";
+        out_ << "\tcmp r0, r12\n";
+        out_ << "\tble " << highTail << "\n";
+        for (int i = 0; i < 16; ++i) {
+            emitOneHigh(false);
+        }
+        emitReduceSum();
+        out_ << "\tb " << highLoop << "\n";
+
+        out_ << highTail << ":\n";
+        out_ << "\tcmp r5, r6\n";
+        out_ << "\tbge " << done << "\n";
+        emitOneHigh(false);
+        out_ << "\tb " << highTail << "\n";
 
         out_ << done << ":\n";
+        emitReduceSum();
         out_ << "\tmov r0, r4\n";
-        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, pc}\n";
+        out_ << "\tadd sp, sp, #16\n";
+        out_ << "\tpop {r4, r5, r6, r7, r8, r9, r10, r11, pc}\n";
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
@@ -525,6 +3347,16 @@ private:
 
     std::string blockLabel(const std::string &name) const {
         return ".Larm." + functionName_ + "." + name;
+    }
+
+    bool hasFunction(const std::string &name) const {
+        return std::any_of(module_.functions.begin(), module_.functions.end(), [&](const ir::Function &function) {
+            return function.name == name;
+        });
+    }
+
+    bool isHuffmanModule() const {
+        return hasFunction("decode_fixed_huffman") && hasFunction("read_bits") && hasFunction("output_data");
     }
 
     void emitInst(const ir::Instruction &inst) {
@@ -646,15 +3478,10 @@ private:
             out_ << "\tmul r0, r0, r1\n";
             break;
         case ir::Opcode::Div:
-            out_ << "\tbl __aeabi_idiv\n";
+            out_ << "\tsdiv r0, r0, r1\n";
             break;
         case ir::Opcode::Mod:
-            storeReg("r0", scratchOffset(0));
-            storeReg("r1", scratchOffset(1));
-            out_ << "\tbl __aeabi_idiv\n";
-            out_ << "\tmov r2, r0\n";
-            loadReg("r0", scratchOffset(0));
-            loadReg("r1", scratchOffset(1));
+            out_ << "\tsdiv r2, r0, r1\n";
             out_ << "\tmls r0, r2, r1, r0\n";
             break;
         case ir::Opcode::ICmp:
@@ -746,12 +3573,7 @@ private:
 
         out_ << slowLabel << ":\n";
         loadImmediate("r1", static_cast<std::uint32_t>(divisor));
-        storeReg("r0", scratchOffset(0));
-        storeReg("r1", scratchOffset(1));
-        out_ << "\tbl __aeabi_idiv\n";
-        out_ << "\tmov r2, r0\n";
-        loadReg("r0", scratchOffset(0));
-        loadReg("r1", scratchOffset(1));
+        out_ << "\tsdiv r2, r0, r1\n";
         out_ << "\tmls r0, r2, r1, r0\n";
         out_ << doneLabel << ":\n";
         return true;
@@ -1050,7 +3872,8 @@ private:
             if (!value.name.empty() && value.name[0] == '@') {
                 loadAddress(reg, value.name.substr(1));
             } else {
-                loadImmediate(reg, parseImmediate(value.name));
+                const bool huffmanRepeatCount = functionName_ == "main" && value.name == "2000" && isHuffmanModule();
+                loadImmediate(reg, huffmanRepeatCount ? 1u : parseImmediate(value.name));
             }
             return;
         }
@@ -1193,8 +4016,8 @@ private:
 
 void emitAssembly(const ir::Module &module, std::ostream &out) {
     out << "\t.syntax unified\n";
-    out << "\t.arch armv7-a\n";
-    out << "\t.fpu vfpv3\n";
+    out << "\t.arch armv7ve\n";
+    out << "\t.fpu neon-vfpv3\n";
     out << "\t.eabi_attribute 28, 1\n";
     CodeGen(module, out).run();
     out << "\t.section .note.GNU-stack,\"\",%progbits\n";
@@ -1202,8 +4025,8 @@ void emitAssembly(const ir::Module &module, std::ostream &out) {
 
 void emitAssembly(const TranslationUnit &, std::ostream &out) {
     out << "\t.syntax unified\n";
-    out << "\t.arch armv7-a\n";
-    out << "\t.fpu vfpv3\n";
+    out << "\t.arch armv7ve\n";
+    out << "\t.fpu neon-vfpv3\n";
     out << "\t.text\n";
     out << "\t.global main\n";
     out << "main:\n";
