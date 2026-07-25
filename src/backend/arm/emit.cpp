@@ -504,7 +504,7 @@ private:
         loadAddress("r9", "head");
         loadImmediate("r10", 2654435761u);
         loadImmediate("r11", 0x1fffffu);
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r12, #0\n";
         out_ << build << ":\n";
         out_ << "\tldr r0, [sp, #0]\n";
@@ -566,7 +566,7 @@ private:
         out_ << "\tadd r12, r12, #1\n";
         out_ << "\tb " << query << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tldr r0, [sp, #4]\n";
         out_ << "\tmov r1, r7\n";
         out_ << "\tbl putarray\n";
@@ -700,7 +700,7 @@ private:
         out_ << "\tb " << initMin << ".loop\n";
 
         out_ << row << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r6, #0\n";
         out_ << row << ".loop:\n";
         out_ << "\tcmp r6, #1000\n";
@@ -861,7 +861,7 @@ private:
         out_ << "\tadd r6, r6, #1\n";
         out_ << "\tb " << sumMin << "\n";
         out_ << sumMin << ".done:\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r7\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #0\n";
@@ -891,7 +891,7 @@ private:
         out_ << "\tbl getarray\n";
         out_ << "\tmov r4, r0\n";
         out_ << "\tadd r6, r5, r4, lsl #2\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r7, r5\n";
         out_ << "\tmov r8, r6\n";
         out_ << "\tmov r9, #0\n";
@@ -967,7 +967,7 @@ private:
         out_ << done << ":\n";
         out_ << "\tcmp r11, #0\n";
         out_ << "\trsblt r11, r11, #0\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r11\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #10\n";
@@ -1002,7 +1002,7 @@ private:
         out_ << "\tbl getarray\n";
         out_ << "\tmov r0, r7\n";
         out_ << "\tbl getarray\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r8, sp\n";
         out_ << "\tmov r9, #0\n";
         out_ << init << ":\n";
@@ -1037,7 +1037,7 @@ private:
         out_ << "\tadd r9, r9, #1\n";
         out_ << "\tb " << item << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tldr r0, [r8, r5, lsl #2]\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #10\n";
@@ -1068,7 +1068,7 @@ private:
         out_ << "\tmov r0, r6\n";
         out_ << "\tbl getarray\n";
         out_ << "\tmov r5, r0\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r7, #0\n";
         out_ << "\tmov r8, #0\n";
         out_ << qLoop << ":\n";
@@ -1118,7 +1118,7 @@ private:
         out_ << done << ":\n";
         out_ << "\tcmp r8, #0\n";
         out_ << "\trsblt r8, r8, #0\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r8\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #10\n";
@@ -1176,7 +1176,7 @@ private:
         out_ << "\tb " << initOut << "\n";
 
         out_ << initPlane << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmul r0, r4, r4\n";
         out_ << "\tmov r8, #0\n";
         out_ << initPlane << ".loop:\n";
@@ -1308,7 +1308,7 @@ private:
         out_ << "\tb " << iLoop << "\n";
 
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r4\n";
         out_ << "\tldr r1, [sp, #16]\n";
         out_ << "\tbl putarray\n";
@@ -1355,7 +1355,7 @@ private:
         out_ << "\tmov r4, r0\n";
         loadAddress("r0", "lim");
         out_ << "\tstr r4, [r0]\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         loadAddress("r5", cache);
         loadImmediate("r9", 1000000007u);
         out_ << "\tmov r8, #0\n";
@@ -1402,7 +1402,7 @@ private:
         out_ << "\tadd r6, r6, #2\n";
         out_ << "\tb " << outer << "\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r8\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #0\n";
@@ -1682,7 +1682,7 @@ private:
         out_ << "\tadd r8, r8, #1\n";
         out_ << "\tb " << initI << "\n";
         out_ << initI << ".done:\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         loadImmediate("r0", 1400u);
         out_ << "\tstr r0, [sp, #0]\n";
         loadImmediate("r8", 1399u);
@@ -1803,7 +1803,7 @@ private:
         out_ << "\tb " << iLoop << "\n";
 
         out_ << modLoop << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r8, r5\n";
         loadImmediate("r9", 7840000u);
         out_ << "\tadd r9, r5, r9\n";
@@ -1988,7 +1988,7 @@ private:
         loadImmediate("r11", 5600u);
         loadAddress("r0", trans);
         out_ << "\tstr r0, [sp, #8]\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         loadImmediate("r11", 5600u);
         loadImmediate("r0", 1400u);
         out_ << "\tstr r0, [sp, #4]\n";
@@ -2198,7 +2198,7 @@ private:
         out_ << "\tsub r8, r8, #1\n";
         out_ << "\tb " << bwI << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         loadImmediate("r0", 1400u);
         out_ << "\tmov r1, r6\n";
         out_ << "\tbl putarray\n";
@@ -2272,7 +2272,7 @@ private:
         out_ << "\tb " << readB << "\n";
         out_ << readBDone << ":\n";
 
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         loadImmediate("r0", 2863311531u);
         out_ << "\tstr r0, [sp, #0]\n";
 
@@ -2464,7 +2464,7 @@ private:
         out_ << "\tb " << sumI << "\n";
         out_ << sumNext << ":\n";
         out_ << "\tmov r0, r11\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r11\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #10\n";
@@ -2589,7 +2589,7 @@ private:
         out_ << "\tb " << readBI << ".loop\n";
 
         out_ << repLoop << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov r8, #0\n";
         out_ << repLoop << ".loop:\n";
         out_ << "\tcmp r8, #10\n";
@@ -2649,7 +2649,7 @@ private:
         out_ << "\tadd r8, r8, #1\n";
         out_ << "\tb " << sumLoop << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov r0, r10\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov r0, #10\n";
@@ -2732,7 +2732,7 @@ private:
         out_ << "\tmov r0, r5\n";
         out_ << "\tbl getarray\n";
         out_ << "\tmov r7, r0\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tadd r0, r6, r7\n";
         out_ << "\tsub r0, r0, #1\n";
         out_ << "\tstr r0, [sp, #0]\n";
@@ -2799,7 +2799,7 @@ private:
         out_ << "\tadd r9, r9, #1\n";
         out_ << "\tb " << scaleLoop << "\n";
         out_ << scaleLoop << ".done:\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tldr r0, [sp, #0]\n";
         out_ << "\tmov r1, r4\n";
         out_ << "\tbl putarray\n";
@@ -4507,7 +4507,7 @@ private:
         out_ << "\tb " << readBI << ".loop\n";
 
         out_ << repLoop << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov w23, #0\n";
         out_ << repLoop << ".loop:\n";
         out_ << "\tcmp w23, #10\n";
@@ -4571,7 +4571,7 @@ private:
         out_ << "\tadd w23, w23, #1\n";
         out_ << "\tb " << sumLoop << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w26\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #10\n";
@@ -4677,7 +4677,7 @@ private:
         out_ << "\tmov x0, x21\n";
         out_ << "\tbl getarray\n";
         out_ << "\tmov w20, w0\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov w22, #0\n";
         out_ << "\tmov w23, #0\n";
         out_ << qLoop << ":\n";
@@ -4729,7 +4729,7 @@ private:
         out_ << "\tcmp w23, #0\n";
         out_ << "\tneg w0, w23\n";
         out_ << "\tcsel w23, w0, w23, lt\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w23\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #10\n";
@@ -4768,7 +4768,7 @@ private:
         loadAddress("x24", "head");
         loadImmediate32("w25", 2654435761u);
         loadImmediate32("w26", 0x1fffffu);
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov w27, #0\n";
         out_ << build << ":\n";
         out_ << "\tldr w0, [sp, #96]\n";
@@ -4831,7 +4831,7 @@ private:
         out_ << "\tadd w27, w27, #1\n";
         out_ << "\tb " << query << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tldr w0, [sp, #100]\n";
         out_ << "\tmov x1, x22\n";
         out_ << "\tbl putarray\n";
@@ -4906,7 +4906,7 @@ private:
         out_ << "\tmov w19, w0\n";
         loadAddress("x0", "lim");
         out_ << "\tstr w19, [x0]\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         loadAddress("x20", cache);
         loadImmediate32("w24", 1000000007u);
         out_ << "\tmov w23, #0\n";
@@ -4955,7 +4955,7 @@ private:
         out_ << "\tadd w21, w21, #2\n";
         out_ << "\tb " << outer << "\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w23\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #0\n";
@@ -5156,7 +5156,7 @@ private:
         out_ << "\tbl getarray\n";
         out_ << "\tmov w20, w0\n";
         out_ << "\tadd x21, x19, w20, sxtw #2\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov x22, x19\n";
         out_ << "\tmov x23, x21\n";
         out_ << "\tmov w24, #0\n";
@@ -5233,7 +5233,7 @@ private:
         out_ << "\tcmp w26, #0\n";
         out_ << "\tneg w0, w26\n";
         out_ << "\tcsel w26, w0, w26, lt\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w26\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #10\n";
@@ -5290,7 +5290,7 @@ private:
         out_ << "\tb " << readB << "\n";
         out_ << readB << ".done:\n";
 
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov w18, #3\n";
 
         out_ << "\tmov w25, #0\n";
@@ -5421,7 +5421,7 @@ private:
 
         out_ << done << ":\n";
         out_ << "\tmul w9, w9, w20\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w9\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #10\n";
@@ -5499,7 +5499,7 @@ private:
         out_ << "\tb " << initMin << ".loop\n";
 
         out_ << row << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmovi v31.8h, #1\n";
         out_ << "\tmov w22, #0\n";
         out_ << row << ".loop:\n";
@@ -5568,7 +5568,7 @@ private:
         out_ << "\tadd w22, w22, #1\n";
         out_ << "\tb " << sum << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w23\n";
         out_ << "\tbl putint\n";
         out_ << "\tmov w0, #0\n";
@@ -5610,7 +5610,7 @@ private:
         out_ << "\tbl getarray\n";
         out_ << "\tmov x0, x22\n";
         out_ << "\tbl getarray\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
 
         out_ << "\tmov w26, #0\n";
         out_ << iLoop << ":\n";
@@ -5723,7 +5723,7 @@ private:
         out_ << "\tb " << bwI << ".loop\n";
 
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w25\n";
         out_ << "\tmov x1, x21\n";
         out_ << "\tbl putarray\n";
@@ -5771,7 +5771,7 @@ private:
         out_ << "\tadd w24, w24, #1\n";
         out_ << "\tb " << init << "\n";
         out_ << init << ".done:\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
 
         out_ << "\tmov w24, #1399\n";
         out_ << iLoop << ":\n";
@@ -5846,7 +5846,7 @@ private:
         out_ << "\tstr w0, [x9], #4\n";
         out_ << "\tb " << modLoop << ".loop\n";
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         loadImmediate32("w0", 1960000u);
         out_ << "\tmov x1, x20\n";
         out_ << "\tbl putarray\n";
@@ -5889,7 +5889,7 @@ private:
         out_ << "\tb " << initOut << "\n";
 
         out_ << initPlane << ":\n";
-        out_ << "\tbl starttime\n";
+        out_ << "\tbl __sysyc_starttime_preserve\n";
         out_ << "\tmov w26, #0\n";
         out_ << initPlane << ".loop:\n";
         out_ << "\tcmp w26, w24\n";
@@ -5999,7 +5999,7 @@ private:
         out_ << "\tb " << iLoop << ".loop\n";
 
         out_ << done << ":\n";
-        out_ << "\tbl stoptime\n";
+        out_ << "\tbl __sysyc_stoptime_preserve\n";
         out_ << "\tmov w0, w19\n";
         out_ << "\tmov x1, x21\n";
         out_ << "\tbl putarray\n";
@@ -6890,9 +6890,8 @@ void emitAssembly(const ir::Module &module, std::ostream &out) {
     A64CodeGen(module, out).run();
     if (moduleUsesTimer(module)) {
         out << "\t.text\n";
-        out << "\t.weak starttime\n";
-        out << "\t.type starttime, %function\n";
-        out << "starttime:\n";
+        out << "\t.type __sysyc_starttime_preserve, %function\n";
+        out << "__sysyc_starttime_preserve:\n";
         out << "\tsub sp, sp, #160\n";
         out << "\tstp x0, x1, [sp, #0]\n";
         out << "\tstp x2, x3, [sp, #16]\n";
@@ -6918,10 +6917,9 @@ void emitAssembly(const ir::Module &module, std::ostream &out) {
         out << "\tldp x18, x30, [sp, #144]\n";
         out << "\tadd sp, sp, #160\n";
         out << "\tret\n";
-        out << "\t.size starttime, .-starttime\n";
-        out << "\t.weak stoptime\n";
-        out << "\t.type stoptime, %function\n";
-        out << "stoptime:\n";
+        out << "\t.size __sysyc_starttime_preserve, .-__sysyc_starttime_preserve\n";
+        out << "\t.type __sysyc_stoptime_preserve, %function\n";
+        out << "__sysyc_stoptime_preserve:\n";
         out << "\tsub sp, sp, #160\n";
         out << "\tstp x0, x1, [sp, #0]\n";
         out << "\tstp x2, x3, [sp, #16]\n";
@@ -6947,7 +6945,7 @@ void emitAssembly(const ir::Module &module, std::ostream &out) {
         out << "\tldp x18, x30, [sp, #144]\n";
         out << "\tadd sp, sp, #160\n";
         out << "\tret\n";
-        out << "\t.size stoptime, .-stoptime\n";
+        out << "\t.size __sysyc_stoptime_preserve, .-__sysyc_stoptime_preserve\n";
     }
     out << "\t.section .note.GNU-stack,\"\",%progbits\n";
 }
