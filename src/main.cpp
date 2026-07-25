@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -34,12 +35,20 @@ void printUsage(const char *argv0) {
 }
 
 bool parseArgs(int argc, char **argv, Options &options) {
+    auto hasSuffix = [](const std::string &text, const std::string &suffix) {
+        return text.size() >= suffix.size() &&
+               text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
+    std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-S") {
             options.emitAssembly = true;
-        } else if (arg == "-O1") {
+        } else if (arg == "-O1" || arg == "-O2" || arg == "-O3" || arg == "-Ofast") {
             options.optimize = true;
+        } else if (arg == "-O0") {
+            options.optimize = false;
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
         } else if (arg == "--parse-only") {
@@ -59,17 +68,36 @@ bool parseArgs(int argc, char **argv, Options &options) {
             }
             options.outputPath = argv[++i];
         } else if (!arg.empty() && arg[0] == '-') {
-            std::cerr << "unknown option: " << arg << '\n';
-            return false;
-        } else if (options.inputPath.empty()) {
-            options.inputPath = arg;
-        } else if (options.outputPath.empty() && !options.dumpTokens && !options.parseOnly &&
-                   !options.semaOnly && !options.dumpIr) {
-            options.outputPath = arg;
-            options.emitAssembly = true;
+            continue;
         } else {
-            std::cerr << "unexpected extra input: " << arg << '\n';
-            return false;
+            positional.push_back(arg);
+        }
+    }
+
+    for (const auto &arg : positional) {
+        if (hasSuffix(arg, ".sy") || hasSuffix(arg, ".sysy")) {
+            options.inputPath = arg;
+        }
+    }
+    if (options.inputPath.empty() && !positional.empty()) {
+        options.inputPath = positional.front();
+    }
+
+    if (!options.dumpTokens && !options.parseOnly && !options.semaOnly && !options.dumpIr) {
+        if (options.outputPath.empty()) {
+            for (const auto &arg : positional) {
+                if (hasSuffix(arg, ".s") || hasSuffix(arg, ".asm")) {
+                    options.outputPath = arg;
+                }
+            }
+        }
+        if (options.outputPath.empty()) {
+            for (auto it = positional.rbegin(); it != positional.rend(); ++it) {
+                if (*it != options.inputPath) {
+                    options.outputPath = *it;
+                    break;
+                }
+            }
         }
     }
 
@@ -79,9 +107,10 @@ bool parseArgs(int argc, char **argv, Options &options) {
     if (options.dumpTokens || options.parseOnly || options.semaOnly || options.dumpIr) {
         return true;
     }
-    if (options.outputPath.empty() || !options.emitAssembly) {
+    if (options.outputPath.empty()) {
         return false;
     }
+    options.emitAssembly = true;
     return true;
 }
 
