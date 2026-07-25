@@ -58,6 +58,21 @@ std::vector<std::string> splitLabels(const std::string &text) {
     return labels;
 }
 
+bool moduleUsesTimer(const ir::Module &module) {
+    for (const auto &function : module.functions) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call &&
+                    (inst.text == "starttime" || inst.text == "stoptime" ||
+                     inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime")) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 class CodeGen {
 public:
     CodeGen(const ir::Module &module, std::ostream &out) : module_(module), out_(out) {}
@@ -405,7 +420,7 @@ private:
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::Call) {
-                    callsStart = callsStart || inst.text == "starttime";
+                    callsStart = callsStart || inst.text == "starttime" || inst.text == "_sysy_starttime";
                     callsPutInt = callsPutInt || inst.text == "putint";
                 }
             }
@@ -4313,7 +4328,7 @@ private:
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::Call) {
-                    callsStart = callsStart || inst.text == "starttime";
+                    callsStart = callsStart || inst.text == "starttime" || inst.text == "_sysy_starttime";
                     callsPutInt = callsPutInt || inst.text == "putint";
                 }
             }
@@ -6873,6 +6888,67 @@ private:
 void emitAssembly(const ir::Module &module, std::ostream &out) {
     out << "\t.arch armv8-a\n";
     A64CodeGen(module, out).run();
+    if (moduleUsesTimer(module)) {
+        out << "\t.text\n";
+        out << "\t.weak starttime\n";
+        out << "\t.type starttime, %function\n";
+        out << "starttime:\n";
+        out << "\tsub sp, sp, #160\n";
+        out << "\tstp x0, x1, [sp, #0]\n";
+        out << "\tstp x2, x3, [sp, #16]\n";
+        out << "\tstp x4, x5, [sp, #32]\n";
+        out << "\tstp x6, x7, [sp, #48]\n";
+        out << "\tstp x8, x9, [sp, #64]\n";
+        out << "\tstp x10, x11, [sp, #80]\n";
+        out << "\tstp x12, x13, [sp, #96]\n";
+        out << "\tstp x14, x15, [sp, #112]\n";
+        out << "\tstp x16, x17, [sp, #128]\n";
+        out << "\tstp x18, x30, [sp, #144]\n";
+        out << "\tmov w0, #0\n";
+        out << "\tbl _sysy_starttime\n";
+        out << "\tldp x0, x1, [sp, #0]\n";
+        out << "\tldp x2, x3, [sp, #16]\n";
+        out << "\tldp x4, x5, [sp, #32]\n";
+        out << "\tldp x6, x7, [sp, #48]\n";
+        out << "\tldp x8, x9, [sp, #64]\n";
+        out << "\tldp x10, x11, [sp, #80]\n";
+        out << "\tldp x12, x13, [sp, #96]\n";
+        out << "\tldp x14, x15, [sp, #112]\n";
+        out << "\tldp x16, x17, [sp, #128]\n";
+        out << "\tldp x18, x30, [sp, #144]\n";
+        out << "\tadd sp, sp, #160\n";
+        out << "\tret\n";
+        out << "\t.size starttime, .-starttime\n";
+        out << "\t.weak stoptime\n";
+        out << "\t.type stoptime, %function\n";
+        out << "stoptime:\n";
+        out << "\tsub sp, sp, #160\n";
+        out << "\tstp x0, x1, [sp, #0]\n";
+        out << "\tstp x2, x3, [sp, #16]\n";
+        out << "\tstp x4, x5, [sp, #32]\n";
+        out << "\tstp x6, x7, [sp, #48]\n";
+        out << "\tstp x8, x9, [sp, #64]\n";
+        out << "\tstp x10, x11, [sp, #80]\n";
+        out << "\tstp x12, x13, [sp, #96]\n";
+        out << "\tstp x14, x15, [sp, #112]\n";
+        out << "\tstp x16, x17, [sp, #128]\n";
+        out << "\tstp x18, x30, [sp, #144]\n";
+        out << "\tmov w0, #0\n";
+        out << "\tbl _sysy_stoptime\n";
+        out << "\tldp x0, x1, [sp, #0]\n";
+        out << "\tldp x2, x3, [sp, #16]\n";
+        out << "\tldp x4, x5, [sp, #32]\n";
+        out << "\tldp x6, x7, [sp, #48]\n";
+        out << "\tldp x8, x9, [sp, #64]\n";
+        out << "\tldp x10, x11, [sp, #80]\n";
+        out << "\tldp x12, x13, [sp, #96]\n";
+        out << "\tldp x14, x15, [sp, #112]\n";
+        out << "\tldp x16, x17, [sp, #128]\n";
+        out << "\tldp x18, x30, [sp, #144]\n";
+        out << "\tadd sp, sp, #160\n";
+        out << "\tret\n";
+        out << "\t.size stoptime, .-stoptime\n";
+    }
     out << "\t.section .note.GNU-stack,\"\",%progbits\n";
 }
 

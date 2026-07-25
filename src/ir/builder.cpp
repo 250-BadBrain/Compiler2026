@@ -37,6 +37,8 @@ void IRBuilder::collectFunctionInfo(const TranslationUnit &unit) {
     runtime("putfarray", Type{TypeKind::Void}, {Type{TypeKind::I32}, Type{TypeKind::Ptr}});
     runtime("starttime", Type{TypeKind::Void}, {});
     runtime("stoptime", Type{TypeKind::Void}, {});
+    runtime("_sysy_starttime", Type{TypeKind::Void}, {Type{TypeKind::I32}});
+    runtime("_sysy_stoptime", Type{TypeKind::Void}, {Type{TypeKind::I32}});
 
     for (const auto &decl : unit.declarations) {
         const auto *func = dynamic_cast<const FuncDef *>(decl.get());
@@ -281,6 +283,11 @@ Value IRBuilder::buildExpr(const Expr &expr) {
         return buildBinaryExpr(*binary);
     }
     if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
+        if (call->callee == "starttime" || call->callee == "stoptime") {
+            const std::string callee = call->callee == "starttime" ? "_sysy_starttime" : "_sysy_stoptime";
+            emitVoid(Opcode::Call, {constant(Type{TypeKind::I32}, std::to_string(call->location.line))}, callee);
+            return constant(Type{TypeKind::Void}, "void");
+        }
         std::vector<Value> args;
         const auto found = functions_.find(call->callee);
         Type ret = found == functions_.end() ? Type{TypeKind::I32} : found->second.returnType;
