@@ -7,20 +7,20 @@ cases_dir="$root/compiler2026/2026初赛ARM赛道功能用例/functional"
 tmp_dir="${TMPDIR:-/tmp}/compiler2026-public-smoke"
 mkdir -p "$tmp_dir"
 
-cc="${ARM_CC:-arm-linux-gnueabihf-gcc}"
-qemu="${QEMU_ARM:-qemu-arm}"
+cc="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+qemu="${QEMU_AARCH64:-qemu-aarch64}"
 
 if ! command -v "$cc" >/dev/null; then
-    echo "missing ARM compiler: $cc" >&2
+    echo "missing AArch64 compiler: $cc" >&2
     exit 1
 fi
 if ! command -v "$qemu" >/dev/null; then
-    echo "missing ARM qemu: $qemu" >&2
+    echo "missing AArch64 qemu: $qemu" >&2
     exit 1
 fi
 
 make -C "$root" >/dev/null
-"$cc" -static -c "$root/tests/runtime/sylib.c" -o "$tmp_dir/sylib.o"
+"$cc" -static -march=armv8-a -c "$root/tests/runtime/sylib.c" -o "$tmp_dir/sylib.o"
 
 passed=0
 total=0
@@ -36,13 +36,13 @@ while IFS= read -r case_file; do
     expected="${case_file%.sy}.out"
 
     "$root/compiler" "$case_file" -S -o "$asm"
-    "$cc" -static "$asm" "$tmp_dir/sylib.o" -o "$exe"
+    "$cc" -static -march=armv8-a "$asm" "$tmp_dir/sylib.o" -o "$exe"
 
     set +e
     if [[ -f "$input_file" ]]; then
-        "$qemu" "$exe" <"$input_file" >"$stdout_file"
+        "$qemu" -L /usr/aarch64-linux-gnu "$exe" <"$input_file" >"$stdout_file"
     else
-        "$qemu" "$exe" >"$stdout_file"
+        "$qemu" -L /usr/aarch64-linux-gnu "$exe" >"$stdout_file"
     fi
     status=$?
     set -e

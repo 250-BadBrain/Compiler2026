@@ -1,6 +1,6 @@
 # Compiler2026
 
-SysY2026 到 ARM 汇编的 C++17 编译器项目。
+SysY2026 到 ARMv8-A/AArch64 汇编的 C++17 编译器项目。
 
 ## 团队
 
@@ -30,7 +30,7 @@ make
 ARM 链接运行测试需要：
 
 ```bash
-sudo apt install gcc-arm-linux-gnueabihf qemu-user
+sudo apt install gcc-aarch64-linux-gnu qemu-user
 ```
 
 ```bash
@@ -38,4 +38,11 @@ sudo apt install gcc-arm-linux-gnueabihf qemu-user
 ./tests/run_all.sh
 ./tests/run_public_functional.sh compiler2026/2026初赛ARM赛道功能用例
 ./tests/run_public_functional.sh compiler2026/2026初赛ARM赛道性能用例
+```
+
+官方 ARM 赛道目标为 ARMv8-A 64 位，汇编/链接口径应使用：
+
+```bash
+aarch64-linux-gnu-gcc -march=armv8-a output.s tests/runtime/sylib.c -o output
+qemu-aarch64 -L /usr/aarch64-linux-gnu ./output
 ```

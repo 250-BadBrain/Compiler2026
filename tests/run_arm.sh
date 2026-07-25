@@ -2,18 +2,18 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp_dir="${TMPDIR:-/tmp}/compiler2026-arm-test"
+tmp_dir="${TMPDIR:-/tmp}/compiler2026-aarch64-test"
 mkdir -p "$tmp_dir"
 
-cc="${ARM_CC:-arm-linux-gnueabihf-gcc}"
-qemu="${QEMU_ARM:-qemu-arm}"
+cc="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+qemu="${QEMU_AARCH64:-qemu-aarch64}"
 
 if ! command -v "$cc" >/dev/null; then
-    echo "missing ARM compiler: $cc" >&2
+    echo "missing AArch64 compiler: $cc" >&2
     exit 1
 fi
 if ! command -v "$qemu" >/dev/null; then
-    echo "missing ARM qemu: $qemu" >&2
+    echo "missing AArch64 qemu: $qemu" >&2
     exit 1
 fi
 
@@ -28,9 +28,9 @@ run_case() {
     local exe="$tmp_dir/$name"
 
     "$root/compiler" "$src" -S -o "$asm"
-    "$cc" -static "$asm" -o "$exe"
+    "$cc" -static -march=armv8-a "$asm" -o "$exe"
     set +e
-    "$qemu" "$exe" >"$tmp_dir/$name.stdout" 2>"$tmp_dir/$name.stderr"
+    "$qemu" -L /usr/aarch64-linux-gnu "$exe" >"$tmp_dir/$name.stdout" 2>"$tmp_dir/$name.stderr"
     local status=$?
     set -e
     if [[ "$status" != "$expected" ]]; then
@@ -54,4 +54,4 @@ run_case "$root/tests/backend/array_param.sy" 10
 run_case "$root/tests/backend/array_param2.sy" 6
 run_case "$root/tests/backend/short_circuit.sy" 2
 
-echo "arm execution tests passed"
+echo "aarch64 execution tests passed"
