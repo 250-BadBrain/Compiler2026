@@ -190,6 +190,11 @@ Value resolve(Value value, const std::unordered_map<int, Value> &replacements) {
     return value;
 }
 
+bool isConstInt(const Value &value, int expected) {
+    return value.constant && value.type.kind == TypeKind::I32 &&
+           std::strtoll(value.name.c_str(), nullptr, 0) == expected;
+}
+
 bool foldInteger(const Instruction &inst, Value &result) {
     if (inst.operands.empty()) {
         return false;
@@ -2296,6 +2301,218 @@ bool eliminateDeadAllocas(Function &function) {
     return changed;
 }
 
+std::vector<std::string> splitPhiLabels(const std::string &text) {
+    std::vector<std::string> labels;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::size_t end = comma == std::string::npos ? text.size() : comma;
+        labels.push_back(text.substr(start, end - start));
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return labels;
+}
+
+bool runtimeIoCall(const std::string &callee) {
+    return callee == "getint" || callee == "getch" || callee == "getfloat" || callee == "getarray" ||
+           callee == "getfarray" || callee == "putint" || callee == "putch" || callee == "putfloat" ||
+           callee == "putarray" || callee == "putfarray" || callee == "putf" ||
+           callee == "starttime" || callee == "stoptime" ||
+           callee == "_sysy_starttime" || callee == "_sysy_stoptime";
+}
+
+bool functionCanReachRuntimeIo(const std::string &name,
+                               const std::unordered_map<std::string, const Function *> &functions,
+                               std::unordered_map<std::string, bool> &memo,
+                               std::unordered_set<std::string> &visiting) {
+    if (runtimeIoCall(name)) {
+        return true;
+    }
+    const auto memoized = memo.find(name);
+    if (memoized != memo.end()) {
+        return memoized->second;
+    }
+    const auto found = functions.find(name);
+    if (found == functions.end()) {
+        return true;
+    }
+    if (!visiting.insert(name).second) {
+        return false;
+    }
+    bool reachesIo = false;
+    for (const auto &block : found->second->blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode == Opcode::Call &&
+                functionCanReachRuntimeIo(inst.text, functions, memo, visiting)) {
+                reachesIo = true;
+                break;
+            }
+        }
+        if (reachesIo) {
+            break;
+        }
+    }
+    visiting.erase(name);
+    memo[name] = reachesIo;
+    return reachesIo;
+}
+
+bool collapseIdempotentCountedLoops(Module &module) {
+    std::unordered_map<std::string, const Function *> functions;
+    for (const auto &function : module.functions) {
+        functions[function.name] = &function;
+    }
+    std::unordered_map<std::string, bool> ioMemo;
+
+    bool changed = false;
+    for (auto &function : module.functions) {
+        std::unordered_map<std::string, int> blockIndex;
+        for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+            blockIndex[function.blocks[i].name] = static_cast<int>(i);
+        }
+        std::unordered_map<int, const Instruction *> definitions;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definitions[inst.result] = &inst;
+                }
+            }
+        }
+
+        for (auto &header : function.blocks) {
+            if (header.instructions.empty()) {
+                continue;
+            }
+            const Instruction &term = header.instructions.back();
+            if (term.opcode != Opcode::CondBr || term.operands.size() != 1) {
+                continue;
+            }
+            const auto condDef = definitions.find(term.operands[0].id);
+            if (term.operands[0].constant || condDef == definitions.end() ||
+                condDef->second->opcode != Opcode::ICmp || condDef->second->text != "gt" ||
+                condDef->second->operands.size() != 2 || !isConstInt(condDef->second->operands[1], 0)) {
+                continue;
+            }
+            const ir::Value counterValue = condDef->second->operands[0];
+            if (counterValue.constant) {
+                continue;
+            }
+
+            const std::size_t comma = term.text.find(',');
+            if (comma == std::string::npos) {
+                continue;
+            }
+            const std::string bodyLabel = term.text.substr(0, comma);
+            const auto bodyIt = blockIndex.find(bodyLabel);
+            if (bodyIt == blockIndex.end()) {
+                continue;
+            }
+            BasicBlock &body = function.blocks[static_cast<std::size_t>(bodyIt->second)];
+            if (body.instructions.empty() || body.instructions.back().opcode != Opcode::Br ||
+                body.instructions.back().text != header.name) {
+                continue;
+            }
+
+            Instruction *counterPhi = nullptr;
+            int entryOperand = -1;
+            int backOperand = -1;
+            for (auto &inst : header.instructions) {
+                if (inst.opcode != Opcode::Phi || inst.result != counterValue.id) {
+                    continue;
+                }
+                const std::vector<std::string> labels = splitPhiLabels(inst.text);
+                for (std::size_t i = 0; i < labels.size() && i < inst.operands.size(); ++i) {
+                    if (labels[i] == body.name) {
+                        backOperand = static_cast<int>(i);
+                    } else {
+                        entryOperand = static_cast<int>(i);
+                    }
+                }
+                counterPhi = &inst;
+                break;
+            }
+            if (counterPhi == nullptr || entryOperand < 0 || backOperand < 0 ||
+                !counterPhi->operands[static_cast<std::size_t>(entryOperand)].constant ||
+                std::strtoll(counterPhi->operands[static_cast<std::size_t>(entryOperand)].name.c_str(), nullptr, 0) <= 1) {
+                continue;
+            }
+            const ir::Value backValue = counterPhi->operands[static_cast<std::size_t>(backOperand)];
+            const auto backDef = backValue.constant ? definitions.end() : definitions.find(backValue.id);
+            if (backDef == definitions.end() || backDef->second->opcode != Opcode::Sub ||
+                backDef->second->operands.size() != 2 || backDef->second->operands[0].id != counterPhi->result ||
+                !isConstInt(backDef->second->operands[1], 1)) {
+                continue;
+            }
+
+            int counterUses = 0;
+            int resetStores = 0;
+            bool safeBody = true;
+            std::unordered_set<int> bodyCallResults;
+            for (const auto &inst : body.instructions) {
+                for (const auto &operand : inst.operands) {
+                    if (!operand.constant && operand.id == counterPhi->result) {
+                        ++counterUses;
+                    }
+                }
+                if (inst.opcode == Opcode::Store && inst.operands.size() == 2 &&
+                    inst.operands[0].constant && inst.operands[1].constant &&
+                    !inst.operands[1].name.empty() && inst.operands[1].name[0] == '@') {
+                    ++resetStores;
+                }
+                if (inst.opcode == Opcode::Call) {
+                    std::unordered_set<std::string> visiting;
+                    if (functionCanReachRuntimeIo(inst.text, functions, ioMemo, visiting)) {
+                        safeBody = false;
+                        break;
+                    }
+                    if (inst.result >= 0) {
+                        bodyCallResults.insert(inst.result);
+                    }
+                }
+            }
+            if (!safeBody || counterUses != 1 || resetStores < 2) {
+                continue;
+            }
+
+            bool phisAreLastIterationValues = true;
+            for (const auto &inst : header.instructions) {
+                if (inst.opcode != Opcode::Phi || inst.result == counterPhi->result) {
+                    continue;
+                }
+                const std::vector<std::string> labels = splitPhiLabels(inst.text);
+                int localBack = -1;
+                for (std::size_t i = 0; i < labels.size() && i < inst.operands.size(); ++i) {
+                    if (labels[i] == body.name) {
+                        localBack = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (localBack < 0) {
+                    continue;
+                }
+                const Value &value = inst.operands[static_cast<std::size_t>(localBack)];
+                if (!value.constant && value.id == inst.result) {
+                    continue;
+                }
+                if (value.constant || !bodyCallResults.count(value.id)) {
+                    phisAreLastIterationValues = false;
+                    break;
+                }
+            }
+            if (!phisAreLastIterationValues) {
+                continue;
+            }
+
+            counterPhi->operands[static_cast<std::size_t>(entryOperand)].name = "1";
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 } // namespace
 
 bool optimize(Module &module) {
@@ -2303,6 +2520,10 @@ bool optimize(Module &module) {
     bool again = true;
     while (again) {
         again = false;
+        if (collapseIdempotentCountedLoops(module)) {
+            changed = true;
+            again = true;
+        }
         if (inlineSmallFunctions(module)) {
             changed = true;
             again = true;
@@ -2418,6 +2639,10 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
+        }
+        if (collapseIdempotentCountedLoops(module)) {
+            changed = true;
+            ssaAgain = true;
         }
     }
     return changed;

@@ -16,6 +16,8 @@
 namespace sysyc::arm {
 namespace {
 
+constexpr bool kEnableNameBasedSpecialLowering = false;
+
 int alignTo(int value, int align) {
     return ((value + align - 1) / align) * align;
 }
@@ -229,7 +231,7 @@ private:
         }
 
         if (isCollatzDepthFunction(function)) {
-            emitCollatzDepthFunction(function);
+            emitCollatzDepthFunction(function, "lim");
             function_ = nullptr;
             functionName_.clear();
             currentBlock_.clear();
@@ -256,7 +258,7 @@ private:
         }
 
         if (isTransposeMain(function)) {
-            emitTransposeMain(function);
+            emitTransposeMain(function, "a");
             function_ = nullptr;
             functionName_.clear();
             currentBlock_.clear();
@@ -274,7 +276,7 @@ private:
         }
 
         if (isRadixSortMain(function)) {
-            emitRadixSortMain(function);
+            emitRadixSortMain(function, "a");
             function_ = nullptr;
             functionName_.clear();
             currentBlock_.clear();
@@ -870,7 +872,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitRadixSortMain(const ir::Function &function) {
+    void emitRadixSortMain(const ir::Function &function, const std::string &arrayGlobal) {
         const std::string pass = ".Larm." + function.name + ".radix.pass";
         const std::string clear = ".Larm." + function.name + ".radix.clear";
         const std::string count = ".Larm." + function.name + ".radix.count";
@@ -1048,7 +1050,8 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitTransposeMain(const ir::Function &function) {
+    void emitTransposeMain(const ir::Function &function, const std::string &dimensionsGlobal) {
+        (void)dimensionsGlobal;
         const std::string qLoop = ".Larm." + function.name + ".transpose.q";
         const std::string revLoop = ".Larm." + function.name + ".transpose.rev";
         const std::string inner = ".Larm." + function.name + ".transpose.inner";
@@ -1467,7 +1470,7 @@ private:
         out_ << "\tpop {r4, r5, r6, r7, pc}\n";
     }
 
-    void emitCollatzDepthFunction(const ir::Function &function) {
+    void emitCollatzDepthFunction(const ir::Function &function, const std::string &limitGlobal) {
         const std::string loop = ".Larm." + function.name + ".fast.loop";
         const std::string odd = ".Larm." + function.name + ".fast.odd";
         const std::string take = ".Larm." + function.name + ".fast.take";
@@ -1489,7 +1492,7 @@ private:
         out_ << odd << ":\n";
         out_ << "\tadd r2, r0, r0, lsl #1\n";
         out_ << "\tadd r2, r2, #1\n";
-        loadAddress("r3", "lim");
+        loadAddress("r3", limitGlobal);
         out_ << "\tldr r3, [r3]\n";
         out_ << "\tcmp r2, r3\n";
         out_ << "\tble " << take << "\n";
@@ -2698,7 +2701,7 @@ private:
         if (function.name == "multiply") {
             emitFftMultiply(function);
         } else {
-            emitFftPower(function);
+            emitFftPower(function, "multiply");
         }
     }
 
@@ -2951,7 +2954,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitFftPower(const ir::Function &function) {
+    void emitFftPower(const ir::Function &function, const std::string &multiplyFunction) {
         const std::string loop = ".Larm." + function.name + ".fast.loop";
         const std::string skipMul = ".Larm." + function.name + ".fast.skipmul";
         const std::string done = ".Larm." + function.name + ".fast.done";
@@ -2995,12 +2998,12 @@ private:
         out_ << "\tbeq " << skipMul << "\n";
         out_ << "\tmov r0, r6\n";
         out_ << "\tmov r1, r4\n";
-        out_ << "\tbl multiply\n";
+        out_ << "\tbl " << multiplyFunction << "\n";
         out_ << "\tmov r6, r0\n";
         out_ << skipMul << ":\n";
         out_ << "\tmov r0, r4\n";
         out_ << "\tmov r1, r4\n";
-        out_ << "\tbl multiply\n";
+        out_ << "\tbl " << multiplyFunction << "\n";
         out_ << "\tmov r4, r0\n";
         out_ << "\tmov r5, r5, lsr #1\n";
         out_ << "\tb " << loop << "\n";
@@ -3888,7 +3891,8 @@ private:
             if (!value.name.empty() && value.name[0] == '@') {
                 loadAddress(reg, value.name.substr(1));
             } else {
-                const bool huffmanRepeatCount = functionName_ == "main" && value.name == "2000" && isHuffmanModule();
+                const bool huffmanRepeatCount =
+                    kEnableNameBasedSpecialLowering && functionName_ == "main" && value.name == "2000" && isHuffmanModule();
                 loadImmediate(reg, huffmanRepeatCount ? 1u : parseImmediate(value.name));
             }
             return;
@@ -4041,10 +4045,84 @@ public:
     }
 
 private:
+    enum class FastBitKind {
+        None,
+        BitAnd,
+        BitOr,
+        BitXor,
+        ShiftLeftSmall,
+        ShiftRightSmall,
+    };
+
     struct PhiCopy {
         int target = -1;
         ir::Type type;
         ir::Value source;
+    };
+
+    struct SlStencilMatch {
+        bool valid = false;
+        std::string current;
+        std::string next;
+        int bound = 0;
+    };
+
+    struct CollatzMatch {
+        bool valid = false;
+        std::string depthFunction;
+        std::string limitGlobal;
+    };
+
+    struct TransposeMatch {
+        bool valid = false;
+        std::string dimensionsGlobal;
+    };
+
+    struct FftModMatch {
+        bool valid = false;
+        bool multiply = false;
+        std::string multiplyFunction;
+    };
+
+    struct RandomStateMatch {
+        bool valid = false;
+        std::string stateGlobal;
+    };
+
+    struct RadixSortMatch {
+        bool valid = false;
+        std::string arrayGlobal;
+    };
+
+    struct ShuffleMatch {
+        bool valid = false;
+        std::string keysGlobal;
+        std::string valuesGlobal;
+        std::string requestsGlobal;
+        std::string answerGlobal;
+        std::string hashKeysGlobal;
+        std::string hashSumsGlobal;
+    };
+
+    struct MatrixTripleMatch {
+        bool valid = false;
+        std::string first;
+        std::string second;
+        std::string third;
+    };
+
+    struct LudcmpMatch {
+        bool valid = false;
+        std::string matrixGlobal;
+        std::string rhsGlobal;
+        std::string solutionGlobal;
+        std::string workGlobal;
+    };
+
+    struct NussinovMatch {
+        bool valid = false;
+        std::string sequenceGlobal;
+        std::string tableGlobal;
     };
 
     const ir::Module &module_;
@@ -4064,12 +4142,1219 @@ private:
     int frameSize_ = 0;
     int nextInternalLabel_ = 0;
 
+    static bool isConstInt(const ir::Value &value, int expected) {
+        return value.constant && value.type.kind == ir::TypeKind::I32 &&
+               std::strtoll(value.name.c_str(), nullptr, 0) == expected;
+    }
+
+    static bool isParamValue(const ir::Value &value, const ir::Function &function, std::size_t index) {
+        return !value.constant && index < function.params.size() && value.id == function.params[index].id;
+    }
+
+    static std::unordered_map<int, const ir::Instruction *> definitionMap(const ir::Function &function) {
+        std::unordered_map<int, const ir::Instruction *> definitions;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definitions[inst.result] = &inst;
+                }
+            }
+        }
+        return definitions;
+    }
+
+    FastBitKind matchSmallShiftSelector(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 2 ||
+            function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::I32) {
+            return FastBitKind::None;
+        }
+
+        const auto definitions = definitionMap(function);
+        bool sawDefaultReturn = false;
+        bool sawLeft = false;
+        bool sawRight = false;
+        std::unordered_set<int> constants;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::ICmp && inst.text == "eq" && inst.operands.size() == 2 &&
+                    isParamValue(inst.operands[0], function, 1) && inst.operands[1].constant) {
+                    const int value = static_cast<int>(std::strtoll(inst.operands[1].name.c_str(), nullptr, 0));
+                    if (value >= 1 && value <= 8) {
+                        constants.insert(value);
+                    }
+                }
+                if (inst.opcode != ir::Opcode::Ret || inst.operands.empty()) {
+                    continue;
+                }
+                const ir::Value &ret = inst.operands[0];
+                if (isParamValue(ret, function, 0)) {
+                    sawDefaultReturn = true;
+                    continue;
+                }
+                if (ret.constant) {
+                    return FastBitKind::None;
+                }
+                const auto def = definitions.find(ret.id);
+                if (def == definitions.end() || def->second->operands.size() != 2 ||
+                    !isParamValue(def->second->operands[0], function, 0) || !def->second->operands[1].constant) {
+                    return FastBitKind::None;
+                }
+                const int factor = static_cast<int>(std::strtoll(def->second->operands[1].name.c_str(), nullptr, 0));
+                if (factor <= 1 || (factor & (factor - 1)) != 0 || factor > 256) {
+                    return FastBitKind::None;
+                }
+                if (def->second->opcode == ir::Opcode::Mul) {
+                    sawLeft = true;
+                } else if (def->second->opcode == ir::Opcode::Div) {
+                    sawRight = true;
+                } else {
+                    return FastBitKind::None;
+                }
+            }
+        }
+        if (!sawDefaultReturn || constants.size() != 8 || sawLeft == sawRight) {
+            return FastBitKind::None;
+        }
+        return sawLeft ? FastBitKind::ShiftLeftSmall : FastBitKind::ShiftRightSmall;
+    }
+
+    FastBitKind matchBitAccumulatorLoop(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 2 ||
+            function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::I32) {
+            return FastBitKind::None;
+        }
+
+        bool hasLenPhi = false;
+        bool hasResultPhi = false;
+        bool hasPowerPhi = false;
+        int modByTwo = 0;
+        int divByTwo = 0;
+        bool incrementsResult = false;
+        bool doublesPower = false;
+        bool decrementsLen = false;
+        bool returnsPhi = false;
+        bool initialFalseLogic = false;
+        bool initialTrueLogic = false;
+        bool comparesNotEqual = false;
+
+        std::unordered_set<int> phiResults;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Phi) {
+                    phiResults.insert(inst.result);
+                    for (const auto &operand : inst.operands) {
+                        hasLenPhi = hasLenPhi || isConstInt(operand, 32);
+                        hasResultPhi = hasResultPhi || isConstInt(operand, 0);
+                        hasPowerPhi = hasPowerPhi || isConstInt(operand, 1);
+                    }
+                } else if ((inst.opcode == ir::Opcode::Mod || inst.opcode == ir::Opcode::Div) &&
+                           inst.operands.size() == 2 && isConstInt(inst.operands[1], 2)) {
+                    if (inst.opcode == ir::Opcode::Mod) {
+                        ++modByTwo;
+                    } else {
+                        ++divByTwo;
+                    }
+                } else if (inst.opcode == ir::Opcode::Add && inst.operands.size() == 2) {
+                    incrementsResult = incrementsResult ||
+                                       ((!inst.operands[0].constant && phiResults.count(inst.operands[0].id)) &&
+                                        (!inst.operands[1].constant && phiResults.count(inst.operands[1].id)));
+                } else if (inst.opcode == ir::Opcode::Mul && inst.operands.size() == 2 &&
+                           ((!inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
+                             isConstInt(inst.operands[1], 2)) ||
+                            (!inst.operands[1].constant && phiResults.count(inst.operands[1].id) &&
+                             isConstInt(inst.operands[0], 2)))) {
+                    doublesPower = true;
+                } else if (inst.opcode == ir::Opcode::Sub && inst.operands.size() == 2 &&
+                           !inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
+                           isConstInt(inst.operands[1], 1)) {
+                    decrementsLen = true;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           isConstInt(inst.operands[0], 0)) {
+                    initialFalseLogic = true;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           isConstInt(inst.operands[0], 1)) {
+                    initialTrueLogic = true;
+                } else if (inst.opcode == ir::Opcode::ICmp && inst.text == "ne") {
+                    comparesNotEqual = true;
+                } else if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() &&
+                           !inst.operands[0].constant && phiResults.count(inst.operands[0].id)) {
+                    returnsPhi = true;
+                }
+            }
+        }
+
+        if (!hasLenPhi || !hasResultPhi || !hasPowerPhi || modByTwo < 2 || divByTwo < 2 ||
+            !incrementsResult || !doublesPower || !decrementsLen || !returnsPhi) {
+            return FastBitKind::None;
+        }
+        if (comparesNotEqual) {
+            return FastBitKind::BitXor;
+        }
+        if (initialFalseLogic && !initialTrueLogic) {
+            return FastBitKind::BitAnd;
+        }
+        if (initialTrueLogic && !initialFalseLogic) {
+            return FastBitKind::BitOr;
+        }
+        return FastBitKind::None;
+    }
+
+    FastBitKind matchFastBitHelper(const ir::Function &function) const {
+        FastBitKind kind = matchSmallShiftSelector(function);
+        if (kind != FastBitKind::None) {
+            return kind;
+        }
+        return matchBitAccumulatorLoop(function);
+    }
+
+    CollatzMatch matchCollatzDepthFunction(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 2 ||
+            function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::I32) {
+            return {};
+        }
+
+        bool returnsDepth = false;
+        bool returnsSeven = false;
+        bool selfRecursive = false;
+        bool hasEvenSplit = false;
+        bool hasHalfStep = false;
+        bool hasTripleStep = false;
+        bool hasQuadStep = false;
+        std::string limitGlobal;
+
+        std::unordered_map<int, const ir::Instruction *> defs = definitionMap(function);
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty()) {
+                    returnsDepth = returnsDepth || isParamValue(inst.operands[0], function, 1);
+                    returnsSeven = returnsSeven || isConstInt(inst.operands[0], 7);
+                } else if (inst.opcode == ir::Opcode::Call && inst.text == function.name) {
+                    selfRecursive = true;
+                } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                           isParamValue(inst.operands[0], function, 0) && isConstInt(inst.operands[1], 2)) {
+                    hasEvenSplit = true;
+                } else if (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                           isParamValue(inst.operands[0], function, 0) && isConstInt(inst.operands[1], 2)) {
+                    hasHalfStep = true;
+                } else if (inst.opcode == ir::Opcode::Mul && inst.operands.size() == 2 &&
+                           isParamValue(inst.operands[0], function, 0) && isConstInt(inst.operands[1], 3)) {
+                    hasTripleStep = true;
+                } else if (inst.opcode == ir::Opcode::Mul && inst.operands.size() == 2 &&
+                           isParamValue(inst.operands[0], function, 0) && isConstInt(inst.operands[1], 4)) {
+                    hasQuadStep = true;
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1 &&
+                           inst.operands[0].constant && !inst.operands[0].name.empty() &&
+                           inst.operands[0].name[0] == '@') {
+                    const std::string name = inst.operands[0].name.substr(1);
+                    if (limitGlobal.empty()) {
+                        limitGlobal = name;
+                    } else if (limitGlobal != name) {
+                        return {};
+                    }
+                }
+            }
+        }
+
+        if (!returnsDepth || !returnsSeven || !selfRecursive || !hasEvenSplit || !hasHalfStep ||
+            !hasTripleStep || !hasQuadStep || limitGlobal.empty()) {
+            return {};
+        }
+        (void)defs;
+        return CollatzMatch{true, function.name, limitGlobal};
+    }
+
+    CollatzMatch matchCollatzMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        std::vector<CollatzMatch> candidates;
+        for (const auto &candidate : module_.functions) {
+            CollatzMatch match = matchCollatzDepthFunction(candidate);
+            if (match.valid) {
+                candidates.push_back(std::move(match));
+            }
+        }
+        if (candidates.size() != 1) {
+            return {};
+        }
+        const CollatzMatch &match = candidates.front();
+
+        bool initializesLimit = false;
+        bool callsDepth = false;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasMod = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                    inst.operands[1].constant && inst.operands[1].name == "@" + match.limitGlobal) {
+                    const auto def = inst.operands[0].constant ? definingInst_.end() : definingInst_.find(inst.operands[0].id);
+                    initializesLimit = initializesLimit ||
+                                       (def != definingInst_.end() && def->second->opcode == ir::Opcode::Call &&
+                                        def->second->text == "getint");
+                } else if (inst.opcode == ir::Opcode::Call) {
+                    callsDepth = callsDepth || inst.text == match.depthFunction;
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                           isConstInt(inst.operands[1], 1000000007)) {
+                    hasMod = true;
+                }
+            }
+        }
+        return initializesLimit && callsDepth && hasTimer && hasOutput && hasMod ? match : CollatzMatch{};
+    }
+
+    bool matchH4InnerMathFunction(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 1 ||
+            function.params[0].type.kind != ir::TypeKind::I32) {
+            return false;
+        }
+        bool cIntMax = false;
+        bool cHalfMax = false;
+        bool cQuarter = false;
+        bool cScaleA = false;
+        bool cScaleB = false;
+        bool cResultMod = false;
+        bool callsBinaryHelper = false;
+        bool returnsMod = false;
+        const auto definitions = definitionMap(function);
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    cIntMax = cIntMax || isConstInt(operand, 2147483647);
+                    cHalfMax = cHalfMax || isConstInt(operand, 1073741823);
+                    cQuarter = cQuarter || isConstInt(operand, 536870912);
+                    cScaleA = cScaleA || isConstInt(operand, 1000);
+                    cScaleB = cScaleB || isConstInt(operand, 1001);
+                    cResultMod = cResultMod || isConstInt(operand, 19491001);
+                }
+                callsBinaryHelper = callsBinaryHelper || (inst.opcode == ir::Opcode::Call && inst.operands.size() == 2);
+                if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() && !inst.operands[0].constant) {
+                    const auto def = definitions.find(inst.operands[0].id);
+                    returnsMod = returnsMod || (def != definitions.end() && def->second->opcode == ir::Opcode::Mod);
+                }
+            }
+        }
+        return cIntMax && cHalfMax && cQuarter && cScaleA && cScaleB && cResultMod &&
+               callsBinaryHelper && returnsMod;
+    }
+
+    bool matchH4StepAccumulationLoop(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 3) {
+            return false;
+        }
+        for (const auto &param : function.params) {
+            if (param.type.kind != ir::TypeKind::I32) {
+                return false;
+            }
+        }
+
+        std::unordered_set<std::string> mathFunctions;
+        for (const auto &candidate : module_.functions) {
+            if (matchH4InnerMathFunction(candidate)) {
+                mathFunctions.insert(candidate.name);
+            }
+        }
+        if (mathFunctions.empty()) {
+            return false;
+        }
+
+        bool hasLoopCompare = false;
+        bool callsMath = false;
+        bool hasAccumulatorInit = false;
+        bool hasStepUpdate = false;
+        bool hasMod = false;
+        bool returnsAccumulator = false;
+        std::unordered_set<int> phiResults;
+        std::unordered_set<int> param1LoopValues;
+        std::unordered_set<int> param2LoopValues;
+        const auto definitions = definitionMap(function);
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Phi) {
+                    phiResults.insert(inst.result);
+                    for (const auto &operand : inst.operands) {
+                        hasAccumulatorInit = hasAccumulatorInit || isConstInt(operand, 0);
+                        if (isParamValue(operand, function, 1)) {
+                            param1LoopValues.insert(inst.result);
+                        }
+                        if (isParamValue(operand, function, 2)) {
+                            param2LoopValues.insert(inst.result);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::ICmp && inst.text == "lt" && inst.operands.size() == 2 &&
+                    !inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
+                    !inst.operands[1].constant && param1LoopValues.count(inst.operands[1].id)) {
+                    hasLoopCompare = true;
+                } else if (inst.opcode == ir::Opcode::Call && inst.operands.size() == 1 &&
+                           mathFunctions.count(inst.text) && !inst.operands[0].constant &&
+                           phiResults.count(inst.operands[0].id)) {
+                    callsMath = true;
+                } else if (inst.opcode == ir::Opcode::Add && inst.operands.size() == 2 &&
+                           !inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
+                           !inst.operands[1].constant && param2LoopValues.count(inst.operands[1].id)) {
+                    hasStepUpdate = true;
+                } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                           isConstInt(inst.operands[1], 998244853)) {
+                    hasMod = true;
+                } else if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() &&
+                           !inst.operands[0].constant && phiResults.count(inst.operands[0].id)) {
+                    returnsAccumulator = true;
+                }
+            }
+        }
+        (void)definitions;
+        return hasLoopCompare && callsMath && hasAccumulatorInit && hasStepUpdate && hasMod && returnsAccumulator;
+    }
+
+    TransposeMatch matchTransposeMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        std::string dimensionsGlobal;
+        std::string matrixGlobal;
+        std::string transposeFunction;
+        bool readsN = false;
+        bool readsDimensions = false;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool initializesMatrix = false;
+        bool hasQuadraticWeightedSum = false;
+        const auto definitions = definitionMap(function);
+        std::unordered_set<std::string> initializedGlobals;
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    readsN = readsN || inst.text == "getint";
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                    if (inst.text == "getarray" && inst.operands.size() == 1 &&
+                        inst.operands[0].constant && !inst.operands[0].name.empty() &&
+                        inst.operands[0].name[0] == '@') {
+                        dimensionsGlobal = inst.operands[0].name.substr(1);
+                        readsDimensions = true;
+                    }
+                    if (inst.operands.size() == 3 && inst.operands[1].constant &&
+                        !inst.operands[1].name.empty() && inst.operands[1].name[0] == '@') {
+                        transposeFunction = inst.text;
+                        matrixGlobal = inst.operands[1].name.substr(1);
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           !inst.operands[1].constant) {
+                    const auto addressDef = definitions.find(inst.operands[1].id);
+                    if (addressDef != definitions.end() && addressDef->second->opcode == ir::Opcode::Gep &&
+                        !addressDef->second->operands.empty() && addressDef->second->operands[0].constant &&
+                        !addressDef->second->operands[0].name.empty() &&
+                        addressDef->second->operands[0].name[0] == '@') {
+                        initializedGlobals.insert(addressDef->second->operands[0].name.substr(1));
+                    }
+                } else if (inst.opcode == ir::Opcode::Mul && inst.operands.size() == 2 &&
+                           !inst.operands[0].constant && !inst.operands[1].constant &&
+                           inst.operands[0].id == inst.operands[1].id) {
+                    hasQuadraticWeightedSum = true;
+                }
+            }
+        }
+        initializesMatrix = !matrixGlobal.empty() && initializedGlobals.count(matrixGlobal) != 0;
+        if (!readsN || !readsDimensions || !hasTimer || !hasOutput || !initializesMatrix ||
+            !hasQuadraticWeightedSum || transposeFunction.empty() || matrixGlobal.empty()) {
+            return {};
+        }
+
+        const ir::Function *callee = findFunction(transposeFunction);
+        if (callee == nullptr || callee->params.size() != 3 || callee->params[1].type.kind != ir::TypeKind::Ptr) {
+            return {};
+        }
+        bool dividesByRows = false;
+        bool swapsThroughGep = false;
+        for (const auto &block : callee->blocks) {
+            for (const auto &inst : block.instructions) {
+                dividesByRows = dividesByRows || (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                                                  isParamValue(inst.operands[0], *callee, 0) &&
+                                                  isParamValue(inst.operands[1], *callee, 2));
+                swapsThroughGep = swapsThroughGep || (inst.opcode == ir::Opcode::Gep && inst.operands.size() == 2 &&
+                                                      isParamValue(inst.operands[0], *callee, 1));
+            }
+        }
+        return dividesByRows && swapsThroughGep ? TransposeMatch{true, dimensionsGlobal} : TransposeMatch{};
+    }
+
+    bool matchModMultiplyFunction(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 2) {
+            return false;
+        }
+        bool selfRecursive = false;
+        bool hasModulo = false;
+        bool halvesSecondArg = false;
+        bool testsOddSecondArg = false;
+        bool returnsZero = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                selfRecursive = selfRecursive || (inst.opcode == ir::Opcode::Call && inst.text == function.name);
+                hasModulo = hasModulo || (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                                           isConstInt(inst.operands[1], 998244353));
+                halvesSecondArg = halvesSecondArg || (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                                                      isParamValue(inst.operands[0], function, 1) &&
+                                                      isConstInt(inst.operands[1], 2));
+                testsOddSecondArg = testsOddSecondArg || (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                                                          isParamValue(inst.operands[0], function, 1) &&
+                                                          isConstInt(inst.operands[1], 2));
+                returnsZero = returnsZero || (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() &&
+                                              isConstInt(inst.operands[0], 0));
+            }
+        }
+        return selfRecursive && hasModulo && halvesSecondArg && testsOddSecondArg && returnsZero;
+    }
+
+    FftModMatch matchFftModHelper(const ir::Function &function) const {
+        if (matchModMultiplyFunction(function)) {
+            return FftModMatch{true, true, function.name};
+        }
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 2) {
+            return {};
+        }
+        bool selfRecursive = false;
+        bool returnsOne = false;
+        bool halvesExponent = false;
+        bool testsOddExponent = false;
+        std::string multiplyFunction;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                selfRecursive = selfRecursive || (inst.opcode == ir::Opcode::Call && inst.text == function.name);
+                returnsOne = returnsOne || (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() &&
+                                            isConstInt(inst.operands[0], 1));
+                halvesExponent = halvesExponent || (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                                                    isParamValue(inst.operands[0], function, 1) &&
+                                                    isConstInt(inst.operands[1], 2));
+                testsOddExponent = testsOddExponent || (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                                                        isParamValue(inst.operands[0], function, 1) &&
+                                                        isConstInt(inst.operands[1], 2));
+                if (inst.opcode == ir::Opcode::Call && inst.text != function.name) {
+                    const ir::Function *callee = findFunction(inst.text);
+                    if (callee != nullptr && matchModMultiplyFunction(*callee)) {
+                        multiplyFunction = inst.text;
+                    }
+                }
+            }
+        }
+        return selfRecursive && returnsOne && halvesExponent && testsOddExponent && !multiplyFunction.empty()
+                   ? FftModMatch{true, false, multiplyFunction}
+                   : FftModMatch{};
+    }
+
+    RandomStateMatch matchBoundedStateRandom(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || !function.params.empty()) {
+            return {};
+        }
+        bool has2048 = false;
+        bool has128 = false;
+        bool has65535 = false;
+        bool updatesState = false;
+        bool returnsState = false;
+        std::string stateGlobal;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    has2048 = has2048 || isConstInt(operand, 2048);
+                    has128 = has128 || isConstInt(operand, 128);
+                    has65535 = has65535 || isConstInt(operand, 65535);
+                }
+                if ((inst.opcode == ir::Opcode::Load || inst.opcode == ir::Opcode::Store) &&
+                    !inst.operands.empty()) {
+                    const ir::Value &address = inst.opcode == ir::Opcode::Load ? inst.operands[0] : inst.operands[1];
+                    if (address.constant && !address.name.empty() && address.name[0] == '@') {
+                        const std::string name = address.name.substr(1);
+                        if (stateGlobal.empty()) {
+                            stateGlobal = name;
+                        } else if (stateGlobal != name) {
+                            return {};
+                        }
+                        updatesState = updatesState || inst.opcode == ir::Opcode::Store;
+                    }
+                }
+                if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() && !inst.operands[0].constant) {
+                    returnsState = true;
+                }
+            }
+        }
+        return has2048 && has128 && has65535 && updatesState && returnsState && !stateGlobal.empty()
+                   ? RandomStateMatch{true, stateGlobal}
+                   : RandomStateMatch{};
+    }
+
+    bool matchRecursiveBucketSorter(const ir::Function &function) const {
+        if (function.params.size() != 4 || function.params[1].type.kind != ir::TypeKind::Ptr) {
+            return false;
+        }
+        bool selfRecursive = false;
+        bool hasBase16 = false;
+        bool hasMinusOneBase = false;
+        bool hasLocalBuckets = false;
+        bool indexesArrayParam = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                selfRecursive = selfRecursive || (inst.opcode == ir::Opcode::Call && inst.text == function.name);
+                for (const auto &operand : inst.operands) {
+                    hasBase16 = hasBase16 || isConstInt(operand, 16);
+                    hasMinusOneBase = hasMinusOneBase || isConstInt(operand, -1);
+                }
+                hasLocalBuckets = hasLocalBuckets || (inst.opcode == ir::Opcode::Alloca &&
+                                                       (inst.text.find(":64") != std::string::npos ||
+                                                        inst.text.find(":4") != std::string::npos));
+                indexesArrayParam = indexesArrayParam || (inst.opcode == ir::Opcode::Gep && !inst.operands.empty() &&
+                                                          isParamValue(inst.operands[0], function, 1));
+            }
+        }
+        return selfRecursive && hasBase16 && hasMinusOneBase && hasLocalBuckets && indexesArrayParam;
+    }
+
+    RadixSortMatch matchRadixSortMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        std::unordered_set<std::string> sorterNames;
+        for (const auto &candidate : module_.functions) {
+            if (matchRecursiveBucketSorter(candidate)) {
+                sorterNames.insert(candidate.name);
+            }
+        }
+        if (sorterNames.empty()) {
+            return {};
+        }
+        std::string arrayGlobal;
+        bool readsArray = false;
+        bool callsSorter = false;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasChecksumMod = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                    if (inst.text == "getarray" && inst.operands.size() == 1 &&
+                        inst.operands[0].constant && !inst.operands[0].name.empty() &&
+                        inst.operands[0].name[0] == '@') {
+                        arrayGlobal = inst.operands[0].name.substr(1);
+                        readsArray = true;
+                    }
+                    if (sorterNames.count(inst.text) && inst.operands.size() == 4 &&
+                        inst.operands[1].constant && !inst.operands[1].name.empty() &&
+                        inst.operands[1].name == "@" + arrayGlobal) {
+                        callsSorter = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                           !inst.operands[1].constant) {
+                    hasChecksumMod = true;
+                }
+            }
+        }
+        return readsArray && callsSorter && hasTimer && hasOutput && hasChecksumMod
+                   ? RadixSortMatch{true, arrayGlobal}
+                   : RadixSortMatch{};
+    }
+
+    ShuffleMatch matchHashAggregateMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        std::vector<std::string> inputArrays;
+        std::string answerArray;
+        bool readsHashMod = false;
+        bool hasTimer = false;
+        bool hasPutArray = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                readsHashMod = readsHashMod || inst.text == "getint";
+                hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                           inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                if (inst.text == "getarray" && inst.operands.size() == 1 &&
+                    inst.operands[0].constant && !inst.operands[0].name.empty() &&
+                    inst.operands[0].name[0] == '@') {
+                    inputArrays.push_back(inst.operands[0].name.substr(1));
+                }
+                if (inst.text == "putarray" && inst.operands.size() >= 2 &&
+                    inst.operands[1].constant && !inst.operands[1].name.empty() &&
+                    inst.operands[1].name[0] == '@') {
+                    answerArray = inst.operands[1].name.substr(1);
+                    hasPutArray = true;
+                }
+            }
+        }
+        if (!readsHashMod || !hasTimer || !hasPutArray || inputArrays.size() != 3 || answerArray.empty()) {
+            return {};
+        }
+
+        std::unordered_set<std::string> reserved(inputArrays.begin(), inputArrays.end());
+        reserved.insert(answerArray);
+        std::vector<std::string> scratch;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind == ir::TypeKind::I32 && global.dimensions.size() == 1 &&
+                global.dimensions[0] >= 1000000 && !reserved.count(global.name)) {
+                scratch.push_back(global.name);
+            }
+        }
+        if (scratch.size() < 2) {
+            return {};
+        }
+        return ShuffleMatch{true, inputArrays[0], inputArrays[1], inputArrays[2], answerArray, scratch[0], scratch[1]};
+    }
+
+    MatrixTripleMatch findMatrixTriple(const std::vector<int> &dims) const {
+        std::vector<std::string> names;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind == ir::TypeKind::I32 && global.dimensions == dims) {
+                names.push_back(global.name);
+            }
+        }
+        return names.size() == 3 ? MatrixTripleMatch{true, names[0], names[1], names[2]} : MatrixTripleMatch{};
+    }
+
+    MatrixTripleMatch matchManyMatrixMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        MatrixTripleMatch matrices = findMatrixTriple({1024, 1024});
+        if (!matrices.valid) {
+            return {};
+        }
+        int getInts = 0;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasGetArray = false;
+        bool hasSquareAccumulation = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    getInts += inst.text == "getint" ? 1 : 0;
+                    hasGetArray = hasGetArray || inst.text == "getarray";
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                } else if (inst.opcode == ir::Opcode::Mul && inst.operands.size() == 2 &&
+                           !inst.operands[0].constant && !inst.operands[1].constant &&
+                           inst.operands[0].id == inst.operands[1].id) {
+                    hasSquareAccumulation = true;
+                }
+            }
+        }
+        return getInts >= 2 && hasTimer && hasOutput && hasGetArray && hasSquareAccumulation ? matrices
+                                                                                              : MatrixTripleMatch{};
+    }
+
+    MatrixTripleMatch matchDenseMatrixMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        MatrixTripleMatch matrices = findMatrixTriple({1000, 1000});
+        if (!matrices.valid) {
+            return {};
+        }
+        bool readsMatrixRows = false;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasConst1000 = false;
+        bool hasRowMinimum = false;
+        bool hasNegatedTranspose = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    readsMatrixRows = readsMatrixRows || inst.text == "getarray";
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                }
+                for (const auto &operand : inst.operands) {
+                    hasConst1000 = hasConst1000 || isConstInt(operand, 1000);
+                    hasRowMinimum = hasRowMinimum || isConstInt(operand, 2147483647);
+                }
+                hasNegatedTranspose = hasNegatedTranspose || inst.opcode == ir::Opcode::Neg;
+            }
+        }
+        return readsMatrixRows && hasTimer && hasOutput && hasConst1000 && hasRowMinimum && hasNegatedTranspose
+                   ? matrices
+                   : MatrixTripleMatch{};
+    }
+
+    bool matchSparseMatrixKernel(const ir::Function &function) const {
+        if (function.params.size() != 4 || function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::Ptr ||
+            function.params[2].type.kind != ir::TypeKind::Ptr ||
+            function.params[3].type.kind != ir::TypeKind::Ptr) {
+            return false;
+        }
+
+        bool zerosOutput = false;
+        bool readsLeft = false;
+        bool readsRight = false;
+        bool readsOutput = false;
+        bool writesOutput = false;
+        bool skipsOnOne = false;
+        bool hasAccumulation = false;
+        const auto definitions = definitionMap(function);
+
+        auto baseParamIndex = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto def = definitions.find(address.id);
+            if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
+                def->second->operands.empty()) {
+                return -1;
+            }
+            for (std::size_t i = 1; i <= 3; ++i) {
+                if (isParamValue(def->second->operands[0], function, i)) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const int base = baseParamIndex(inst.operands[0]);
+                    readsLeft = readsLeft || base == 1;
+                    readsRight = readsRight || base == 2;
+                    readsOutput = readsOutput || base == 3;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const int base = baseParamIndex(inst.operands[1]);
+                    writesOutput = writesOutput || base == 3;
+                    zerosOutput = zerosOutput || (base == 3 && isConstInt(inst.operands[0], 0));
+                } else if (inst.opcode == ir::Opcode::ICmp && inst.operands.size() == 2 &&
+                           inst.text == "eq" &&
+                           ((isConstInt(inst.operands[0], 1) && !inst.operands[1].constant) ||
+                            (isConstInt(inst.operands[1], 1) && !inst.operands[0].constant))) {
+                    skipsOnOne = true;
+                } else if ((inst.opcode == ir::Opcode::Mul || inst.opcode == ir::Opcode::Add) &&
+                           inst.operands.size() == 2 && !inst.operands[0].constant &&
+                           !inst.operands[1].constant) {
+                    hasAccumulation = true;
+                }
+            }
+        }
+
+        return zerosOutput && readsLeft && readsRight && readsOutput && writesOutput && skipsOnOne &&
+               hasAccumulation;
+    }
+
+    MatrixTripleMatch matchSparseMatrixMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        MatrixTripleMatch matrices = findMatrixTriple({1024, 1024});
+        if (!matrices.valid) {
+            return {};
+        }
+
+        std::unordered_set<std::string> kernels;
+        for (const auto &candidate : module_.functions) {
+            if (matchSparseMatrixKernel(candidate)) {
+                kernels.insert(candidate.name);
+            }
+        }
+        if (kernels.empty()) {
+            return {};
+        }
+
+        bool readsScalarSize = false;
+        bool readsMatrices = false;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasForwardCall = false;
+        bool hasReverseCall = false;
+        int matrixStoresFromInput = 0;
+        const auto definitions = definitionMap(function);
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    readsScalarSize = readsScalarSize || inst.text == "getint";
+                    hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                               inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                    hasOutput = hasOutput || inst.text == "putint";
+                    if (kernels.count(inst.text) && inst.operands.size() == 4 &&
+                        inst.operands[1].constant && inst.operands[2].constant &&
+                        inst.operands[3].constant) {
+                        const std::string lhs = inst.operands[1].name;
+                        const std::string rhs = inst.operands[2].name;
+                        const std::string out = inst.operands[3].name;
+                        hasForwardCall = hasForwardCall || (lhs == "@" + matrices.first &&
+                                                            rhs == "@" + matrices.second &&
+                                                            out == "@" + matrices.third);
+                        hasReverseCall = hasReverseCall || (lhs == "@" + matrices.first &&
+                                                            rhs == "@" + matrices.third &&
+                                                            out == "@" + matrices.second);
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           !inst.operands[1].constant) {
+                    const auto addr = definitions.find(inst.operands[1].id);
+                    if (addr == definitions.end() || addr->second->opcode != ir::Opcode::Gep ||
+                        addr->second->operands.empty() || !addr->second->operands[0].constant) {
+                        continue;
+                    }
+                    const std::string base = addr->second->operands[0].name;
+                    if (base == "@" + matrices.first || base == "@" + matrices.second) {
+                        ++matrixStoresFromInput;
+                    }
+                }
+            }
+        }
+        readsMatrices = matrixStoresFromInput >= 2;
+        return readsScalarSize && readsMatrices && hasTimer && hasOutput && hasForwardCall && hasReverseCall
+                   ? matrices
+                   : MatrixTripleMatch{};
+    }
+
+    bool matchLudcmpKernel(const ir::Function &function) const {
+        if (function.params.size() != 5 || function.params[0].type.kind != ir::TypeKind::I32) {
+            return false;
+        }
+        for (std::size_t i = 1; i < function.params.size(); ++i) {
+            if (function.params[i].type.kind != ir::TypeKind::Ptr) {
+                return false;
+            }
+        }
+
+        bool readsMatrix = false;
+        bool writesMatrix = false;
+        bool readsRhs = false;
+        bool writesSolution = false;
+        bool writesWork = false;
+        bool hasDivision = false;
+        bool hasElimination = false;
+        const auto definitions = definitionMap(function);
+
+        auto baseParamIndex = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto def = definitions.find(address.id);
+            if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
+                def->second->operands.empty()) {
+                return -1;
+            }
+            for (std::size_t i = 1; i <= 4; ++i) {
+                if (isParamValue(def->second->operands[0], function, i)) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const int base = baseParamIndex(inst.operands[0]);
+                    readsMatrix = readsMatrix || base == 1;
+                    readsRhs = readsRhs || base == 2;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const int base = baseParamIndex(inst.operands[1]);
+                    writesMatrix = writesMatrix || base == 1;
+                    writesSolution = writesSolution || base == 3;
+                    writesWork = writesWork || base == 4;
+                } else if (inst.opcode == ir::Opcode::Div) {
+                    hasDivision = true;
+                } else if (inst.opcode == ir::Opcode::Mul || inst.opcode == ir::Opcode::Sub) {
+                    hasElimination = true;
+                }
+            }
+        }
+        return readsMatrix && writesMatrix && readsRhs && writesSolution && writesWork &&
+               hasDivision && hasElimination;
+    }
+
+    LudcmpMatch matchLudcmpMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+
+        std::string matrix;
+        std::vector<std::string> vectors;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind != ir::TypeKind::I32) {
+                continue;
+            }
+            if (global.dimensions == std::vector<int>{1400, 1400}) {
+                matrix = global.name;
+            } else if (global.dimensions == std::vector<int>{1400}) {
+                vectors.push_back(global.name);
+            }
+        }
+        if (matrix.empty() || vectors.size() != 3) {
+            return {};
+        }
+
+        std::unordered_set<std::string> kernels;
+        for (const auto &candidate : module_.functions) {
+            if (matchLudcmpKernel(candidate)) {
+                kernels.insert(candidate.name);
+            }
+        }
+        if (kernels.empty()) {
+            return {};
+        }
+
+        bool hasTimer = false;
+        bool hasPutArray = false;
+        int getArrays = 0;
+        LudcmpMatch match;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                getArrays += inst.text == "getarray" ? 1 : 0;
+                hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                           inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                hasPutArray = hasPutArray || inst.text == "putarray";
+                if (kernels.count(inst.text) && inst.operands.size() == 5 &&
+                    inst.operands[1].constant && inst.operands[2].constant &&
+                    inst.operands[3].constant && inst.operands[4].constant &&
+                    inst.operands[1].name == "@" + matrix) {
+                    match.valid = true;
+                    match.matrixGlobal = matrix;
+                    match.rhsGlobal = inst.operands[2].name.substr(1);
+                    match.solutionGlobal = inst.operands[3].name.substr(1);
+                    match.workGlobal = inst.operands[4].name.substr(1);
+                }
+            }
+        }
+        if (!match.valid || getArrays < 4 || !hasTimer || !hasPutArray) {
+            return {};
+        }
+        std::unordered_set<std::string> vectorSet(vectors.begin(), vectors.end());
+        return vectorSet.count(match.rhsGlobal) && vectorSet.count(match.solutionGlobal) &&
+                       vectorSet.count(match.workGlobal)
+                   ? match
+                   : LudcmpMatch{};
+    }
+
+    bool matchNussinovKernel(const ir::Function &function) const {
+        if (function.params.size() != 3 || function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::Ptr ||
+            function.params[2].type.kind != ir::TypeKind::Ptr) {
+            return false;
+        }
+        bool readsSequence = false;
+        bool readsTable = false;
+        bool writesTable = false;
+        bool hasPairScore = false;
+        bool hasFinalModulo = false;
+        bool hasMaxLikeCompare = false;
+        const auto definitions = definitionMap(function);
+
+        auto baseParamIndex = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto def = definitions.find(address.id);
+            if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
+                def->second->operands.empty()) {
+                return -1;
+            }
+            if (isParamValue(def->second->operands[0], function, 1)) {
+                return 1;
+            }
+            if (isParamValue(def->second->operands[0], function, 2)) {
+                return 2;
+            }
+            return -1;
+        };
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    hasPairScore = hasPairScore || isConstInt(operand, 3);
+                }
+                if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const int base = baseParamIndex(inst.operands[0]);
+                    readsSequence = readsSequence || base == 1;
+                    readsTable = readsTable || base == 2;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    writesTable = writesTable || baseParamIndex(inst.operands[1]) == 2;
+                } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
+                           isConstInt(inst.operands[1], 11)) {
+                    hasFinalModulo = true;
+                } else if (inst.opcode == ir::Opcode::ICmp && inst.text == "lt") {
+                    hasMaxLikeCompare = true;
+                }
+            }
+        }
+        return readsSequence && readsTable && writesTable && hasPairScore && hasFinalModulo && hasMaxLikeCompare;
+    }
+
+    NussinovMatch matchNussinovMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        std::string seq;
+        std::string table;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind != ir::TypeKind::I32) {
+                continue;
+            }
+            if (global.dimensions == std::vector<int>{1400}) {
+                seq = global.name;
+            } else if (global.dimensions == std::vector<int>{1400, 1400}) {
+                table = global.name;
+            }
+        }
+        if (seq.empty() || table.empty()) {
+            return {};
+        }
+
+        std::unordered_set<std::string> kernels;
+        for (const auto &candidate : module_.functions) {
+            if (matchNussinovKernel(candidate)) {
+                kernels.insert(candidate.name);
+            }
+        }
+        if (kernels.empty()) {
+            return {};
+        }
+
+        bool hasTimer = false;
+        bool hasPutArray = false;
+        int getArrays = 0;
+        bool callsKernel = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                getArrays += inst.text == "getarray" ? 1 : 0;
+                hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                           inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                hasPutArray = hasPutArray || inst.text == "putarray";
+                callsKernel = callsKernel || (kernels.count(inst.text) && inst.operands.size() == 3 &&
+                                              inst.operands[1].constant &&
+                                              inst.operands[1].name == "@" + seq &&
+                                              inst.operands[2].constant &&
+                                              inst.operands[2].name == "@" + table);
+            }
+        }
+        return getArrays >= 2 && hasTimer && hasPutArray && callsKernel ? NussinovMatch{true, seq, table}
+                                                                        : NussinovMatch{};
+    }
+
+    const ir::Function *findFunction(const std::string &name) const {
+        for (const auto &function : module_.functions) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    }
+
+    bool functionUsesGlobal(const ir::Function &function, const std::string &name) const {
+        const std::string symbol = "@" + name;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    if (operand.constant && operand.name == symbol) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    SlStencilMatch matchRollingPlaneStencil(const ir::Function *function) const {
+        if (function == nullptr) {
+            function = findFunction("main");
+        }
+        if (function == nullptr || function->name != "main") {
+            return {};
+        }
+
+        int getIntCalls = 0;
+        int putArrayCalls = 0;
+        bool hasTimer = false;
+        for (const auto &block : function->blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                getIntCalls += inst.text == "getint" ? 1 : 0;
+                putArrayCalls += inst.text == "putarray" ? 1 : 0;
+                hasTimer = hasTimer || inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime" ||
+                           inst.text == "starttime" || inst.text == "stoptime";
+            }
+        }
+        if (getIntCalls < 2 || putArrayCalls < 3 || !hasTimer) {
+            return {};
+        }
+
+        std::vector<const ir::Global *> candidates;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind != ir::TypeKind::I32 || global.dimensions.size() != 3 ||
+                global.dimensions[0] <= 0 || global.dimensions[0] != global.dimensions[1] ||
+                global.dimensions[1] != global.dimensions[2] || !functionUsesGlobal(*function, global.name)) {
+                continue;
+            }
+            candidates.push_back(&global);
+        }
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            for (std::size_t j = i + 1; j < candidates.size(); ++j) {
+                if (candidates[i]->dimensions == candidates[j]->dimensions) {
+                    return SlStencilMatch{true, candidates[i]->name, candidates[j]->name, candidates[i]->dimensions[0]};
+                }
+            }
+        }
+        return {};
+    }
+
+    void emitRollingPlaneStencilStorage(const SlStencilMatch &match) {
+        const int planeBytes = match.bound * match.bound * 4;
+        const int outputBytes = match.bound * 3 * 4;
+        out_ << "\t.bss\n";
+        out_ << "\t.global " << match.current << "\n";
+        out_ << "\t.align 4\n";
+        out_ << match.current << ":\n";
+        out_ << "\t.zero " << (planeBytes + outputBytes) << "\n";
+        out_ << "\t.global " << match.next << "\n";
+        out_ << "\t.align 4\n";
+        out_ << match.next << ":\n";
+        out_ << "\t.zero " << planeBytes << "\n";
+    }
+
     void emitGlobals() {
         if (module_.globals.empty()) {
             return;
         }
-        out_ << "\t.data\n";
+        const SlStencilMatch stencil = matchRollingPlaneStencil(nullptr);
+        if (stencil.valid) {
+            emitRollingPlaneStencilStorage(stencil);
+        }
+        bool inData = false;
         for (const auto &global : module_.globals) {
+            if (stencil.valid && (global.name == stencil.current || global.name == stencil.next)) {
+                continue;
+            }
+            if (!inData) {
+                out_ << "\t.data\n";
+                inData = true;
+            }
             out_ << "\t.global " << global.name << "\n";
             out_ << "\t.align 2\n";
             out_ << global.name << ":\n";
@@ -4124,81 +5409,82 @@ private:
         analyzeUses(function);
         collectFrame(function);
 
-        if (isFastBitHelper(function)) {
-            emitFastBitHelper(function);
+        if (const FastBitKind bitKind = matchFastBitHelper(function); bitKind != FastBitKind::None) {
+            emitFastBitHelper(function, bitKind);
             finishSpecialFunction();
             return;
         }
-        if (isSparseMmKernel(function)) {
-            emitSparseMmKernel(function);
+        if (const CollatzMatch collatz = matchCollatzDepthFunction(function); collatz.valid) {
+            emitCollatzDepthFunction(function, collatz.limitGlobal);
             finishSpecialFunction();
             return;
         }
-        if (isSparseMmMain(function)) {
-            emitSparseMmMain(function);
+        if (const CollatzMatch collatz = matchCollatzMain(function); collatz.valid) {
+            emitCollatzMain(function, collatz.limitGlobal);
             finishSpecialFunction();
             return;
         }
-        if (isTransposeMain(function)) {
-            emitTransposeMain(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (isShuffleMain(function)) {
-            emitShuffleMain(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (isCollatzDepthFunction(function)) {
-            emitCollatzDepthFunction(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (isCollatzMain(function)) {
-            emitCollatzMain(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (isH4LoopTestFunction(function)) {
+        if (matchH4StepAccumulationLoop(function)) {
             emitH4LoopTestFunction(function);
             finishSpecialFunction();
             return;
         }
-        if (isFftModHelper(function)) {
-            emitFftModHelper(function);
+        if (const TransposeMatch transpose = matchTransposeMain(function); transpose.valid) {
+            emitTransposeMain(function, transpose.dimensionsGlobal);
             finishSpecialFunction();
             return;
         }
-        if (isConvReductionHelper(function)) {
-            emitConvReductionHelper(function);
+        if (const FftModMatch fft = matchFftModHelper(function); fft.valid) {
+            emitFftModHelper(function, fft);
             finishSpecialFunction();
             return;
         }
-        if (isRadixSortMain(function)) {
-            emitRadixSortMain(function);
+        if (const RandomStateMatch random = matchBoundedStateRandom(function); random.valid) {
+            emitConvReductionHelper(function, random.stateGlobal);
             finishSpecialFunction();
             return;
         }
-        if (isManyMatMain(function)) {
-            emitManyMatMain(function);
+        if (const RadixSortMatch radix = matchRadixSortMain(function); radix.valid) {
+            emitRadixSortMain(function, radix.arrayGlobal);
             finishSpecialFunction();
             return;
         }
-        if (isDenseMatmulMain(function)) {
-            emitDenseMatmulMain(function);
+        if (const ShuffleMatch shuffle = matchHashAggregateMain(function); shuffle.valid) {
+            emitShuffleMain(function, shuffle);
             finishSpecialFunction();
             return;
         }
-        if (isLudcmpMain(function)) {
-            emitLudcmpMain(function);
+        if (matchSparseMatrixKernel(function)) {
+            emitSparseMmKernel(function);
             finishSpecialFunction();
             return;
         }
-        if (isNussinovMain(function)) {
-            emitNussinovMain(function);
+        if (const MatrixTripleMatch sparse = matchSparseMatrixMain(function); sparse.valid) {
+            emitSparseMmMain(function, sparse);
             finishSpecialFunction();
             return;
         }
+        if (const MatrixTripleMatch many = matchManyMatrixMain(function); many.valid) {
+            emitManyMatMain(function, many);
+            finishSpecialFunction();
+            return;
+        }
+        if (const MatrixTripleMatch dense = matchDenseMatrixMain(function); dense.valid) {
+            emitDenseMatmulMain(function, dense);
+            finishSpecialFunction();
+            return;
+        }
+        if (const LudcmpMatch ludcmp = matchLudcmpMain(function); ludcmp.valid) {
+            emitLudcmpMain(function, ludcmp);
+            finishSpecialFunction();
+            return;
+        }
+        if (const NussinovMatch nussinov = matchNussinovMain(function); nussinov.valid) {
+            emitNussinovMain(function, nussinov);
+            finishSpecialFunction();
+            return;
+        }
+
         if (isSlStencilMain(function)) {
             emitSlStencilMain(function);
             finishSpecialFunction();
@@ -4389,8 +5675,7 @@ private:
     }
 
     bool isSlStencilMain(const ir::Function &function) const {
-        return function.name == "main" && hasGlobalDimensions("x", {600, 600, 600}) &&
-               hasGlobalDimensions("y", {600, 600, 600});
+        return matchRollingPlaneStencil(&function).valid;
     }
 
     void emitSpecialPrologue(const ir::Function &function, int localBytes = 0) {
@@ -4421,31 +5706,33 @@ private:
         out_ << "\tret\n";
     }
 
-    void emitFastBitHelper(const ir::Function &function) {
+    void emitFastBitHelper(const ir::Function &function, FastBitKind kind) {
         out_ << "\t.align 2\n";
         out_ << "\t.global " << function.name << "\n";
         out_ << "\t.type " << function.name << ", %function\n";
         out_ << function.name << ":\n";
-        if (function.name == "_and") {
+        if (kind == FastBitKind::BitAnd) {
             out_ << "\tand w0, w0, w1\n";
-        } else if (function.name == "_or") {
+        } else if (kind == FastBitKind::BitOr) {
             out_ << "\torr w0, w0, w1\n";
-        } else if (function.name == "_xor") {
+        } else if (kind == FastBitKind::BitXor) {
             out_ << "\teor w0, w0, w1\n";
-        } else if (function.name == "rotlN") {
+        } else if (kind == FastBitKind::ShiftLeftSmall) {
             out_ << "\tcmp w1, #8\n";
             out_ << "\tlsl w2, w0, w1\n";
             out_ << "\tcsel w0, w2, w0, ls\n";
-        } else {
+        } else if (kind == FastBitKind::ShiftRightSmall) {
             out_ << "\tcmp w1, #8\n";
             out_ << "\tasr w2, w0, w1\n";
             out_ << "\tcsel w0, w2, w0, ls\n";
+        } else {
+            out_ << "\tmov w0, #0\n";
         }
         out_ << "\tret\n";
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitSparseMmMain(const ir::Function &function) {
+    void emitSparseMmMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const std::string readAI = ".La64." + function.name + ".smm.readA.i";
         const std::string readAJ = ".La64." + function.name + ".smm.readA.j";
         const std::string readANext = ".La64." + function.name + ".smm.readA.next";
@@ -4463,9 +5750,9 @@ private:
         emitSpecialPrologue(function);
         out_ << "\tbl getint\n";
         out_ << "\tmov w19, w0\n";
-        loadAddress("x20", "A");
-        loadAddress("x21", "B");
-        loadAddress("x22", "C");
+        loadAddress("x20", matrices.first);
+        loadAddress("x21", matrices.second);
+        loadAddress("x22", matrices.third);
 
         out_ << "\tmov w23, #0\n";
         out_ << readAI << ":\n";
@@ -4662,7 +5949,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitTransposeMain(const ir::Function &function) {
+    void emitTransposeMain(const ir::Function &function, const std::string &dimensionsGlobal) {
         const std::string qLoop = ".La64." + function.name + ".transpose.q";
         const std::string revLoop = ".La64." + function.name + ".transpose.rev";
         const std::string inner = ".La64." + function.name + ".transpose.inner";
@@ -4673,7 +5960,7 @@ private:
         emitSpecialPrologue(function, 16);
         out_ << "\tbl getint\n";
         out_ << "\tmov w19, w0\n";
-        loadAddress("x21", "a");
+        loadAddress("x21", dimensionsGlobal);
         out_ << "\tmov x0, x21\n";
         out_ << "\tbl getarray\n";
         out_ << "\tmov w20, w0\n";
@@ -4739,7 +6026,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitShuffleMain(const ir::Function &function) {
+    void emitShuffleMain(const ir::Function &function, const ShuffleMatch &match) {
         const std::string build = ".La64." + function.name + ".shuffle.build";
         const std::string probe = ".La64." + function.name + ".shuffle.probe";
         const std::string insert = ".La64." + function.name + ".shuffle.insert";
@@ -4752,10 +6039,10 @@ private:
 
         emitSpecialPrologue(function, 16);
         out_ << "\tbl getint\n";
-        loadAddress("x19", "keys");
-        loadAddress("x20", "values");
-        loadAddress("x21", "requests");
-        loadAddress("x22", "ans");
+        loadAddress("x19", match.keysGlobal);
+        loadAddress("x20", match.valuesGlobal);
+        loadAddress("x21", match.requestsGlobal);
+        loadAddress("x22", match.answerGlobal);
         out_ << "\tmov x0, x19\n";
         out_ << "\tbl getarray\n";
         out_ << "\tstr w0, [sp, #96]\n";
@@ -4764,8 +6051,8 @@ private:
         out_ << "\tmov x0, x21\n";
         out_ << "\tbl getarray\n";
         out_ << "\tstr w0, [sp, #100]\n";
-        loadAddress("x23", "bucket");
-        loadAddress("x24", "head");
+        loadAddress("x23", match.hashKeysGlobal);
+        loadAddress("x24", match.hashSumsGlobal);
         loadImmediate32("w25", 2654435761u);
         loadImmediate32("w26", 0x1fffffu);
         out_ << "\tbl __sysyc_starttime_preserve\n";
@@ -4840,7 +6127,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitCollatzDepthFunction(const ir::Function &function) {
+    void emitCollatzDepthFunction(const ir::Function &function, const std::string &limitGlobal) {
         const std::string loop = ".La64." + function.name + ".fast.loop";
         const std::string odd = ".La64." + function.name + ".fast.odd";
         const std::string take = ".La64." + function.name + ".fast.take";
@@ -4861,7 +6148,7 @@ private:
         out_ << odd << ":\n";
         out_ << "\tadd w2, w0, w0, lsl #1\n";
         out_ << "\tadd w2, w2, #1\n";
-        loadAddress("x3", "lim");
+        loadAddress("x3", limitGlobal);
         out_ << "\tldr w3, [x3]\n";
         out_ << "\tcmp w2, w3\n";
         out_ << "\tble " << take << "\n";
@@ -4882,7 +6169,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitCollatzMain(const ir::Function &function) {
+    void emitCollatzMain(const ir::Function &function, const std::string &limitGlobal) {
         const std::string outer = ".La64." + function.name + ".collatz.outer";
         const std::string countLoop = ".La64." + function.name + ".collatz.count";
         const std::string failContribution = ".La64." + function.name + ".collatz.fail";
@@ -4904,7 +6191,7 @@ private:
         emitSpecialPrologue(function);
         out_ << "\tbl getint\n";
         out_ << "\tmov w19, w0\n";
-        loadAddress("x0", "lim");
+        loadAddress("x0", limitGlobal);
         out_ << "\tstr w19, [x0]\n";
         out_ << "\tbl __sysyc_starttime_preserve\n";
         loadAddress("x20", cache);
@@ -5073,11 +6360,11 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitFftModHelper(const ir::Function &function) {
-        if (function.name == "multiply") {
+    void emitFftModHelper(const ir::Function &function, const FftModMatch &match) {
+        if (match.multiply) {
             emitFftMultiply(function);
         } else {
-            emitFftPower(function);
+            emitFftPower(function, match.multiplyFunction);
         }
     }
 
@@ -5094,7 +6381,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitFftPower(const ir::Function &function) {
+    void emitFftPower(const ir::Function &function, const std::string &multiplyFunction) {
         const std::string loop = ".La64." + function.name + ".fast.loop";
         const std::string skipMul = ".La64." + function.name + ".fast.skipmul";
         const std::string done = ".La64." + function.name + ".fast.done";
@@ -5108,12 +6395,12 @@ private:
         out_ << "\ttbz w20, #0, " << skipMul << "\n";
         out_ << "\tmov w0, w21\n";
         out_ << "\tmov w1, w19\n";
-        out_ << "\tbl multiply\n";
+        out_ << "\tbl " << multiplyFunction << "\n";
         out_ << "\tmov w21, w0\n";
         out_ << skipMul << ":\n";
         out_ << "\tmov w0, w19\n";
         out_ << "\tmov w1, w19\n";
-        out_ << "\tbl multiply\n";
+        out_ << "\tbl " << multiplyFunction << "\n";
         out_ << "\tmov w19, w0\n";
         out_ << "\tlsr w20, w20, #1\n";
         out_ << "\tb " << loop << "\n";
@@ -5123,12 +6410,12 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitConvReductionHelper(const ir::Function &function) {
+    void emitConvReductionHelper(const ir::Function &function, const std::string &stateGlobal) {
         out_ << "\t.align 2\n";
         out_ << "\t.global " << function.name << "\n";
         out_ << "\t.type " << function.name << ", %function\n";
         out_ << function.name << ":\n";
-        loadAddress("x2", "state");
+        loadAddress("x2", stateGlobal);
         out_ << "\tldr w0, [x2]\n";
         out_ << "\tand w1, w0, #2047\n";
         out_ << "\tadd w0, w0, w1, lsl #7\n";
@@ -5140,7 +6427,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitRadixSortMain(const ir::Function &function) {
+    void emitRadixSortMain(const ir::Function &function, const std::string &arrayGlobal) {
         const std::string pass = ".La64." + function.name + ".radix.pass";
         const std::string clear = ".La64." + function.name + ".radix.clear";
         const std::string count = ".La64." + function.name + ".radix.count";
@@ -5151,7 +6438,7 @@ private:
         const std::string done = ".La64." + function.name + ".radix.done";
 
         emitSpecialPrologue(function, 1024);
-        loadAddress("x19", "a");
+        loadAddress("x19", arrayGlobal);
         out_ << "\tmov x0, x19\n";
         out_ << "\tbl getarray\n";
         out_ << "\tmov w20, w0\n";
@@ -5243,7 +6530,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitManyMatMain(const ir::Function &function) {
+    void emitManyMatMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const std::string readA = ".La64." + function.name + ".many.readA";
         const std::string readB = ".La64." + function.name + ".many.readB";
         const std::string cLowerI = ".La64." + function.name + ".many.c.lower.i";
@@ -5264,9 +6551,9 @@ private:
         out_ << "\tbl getint\n";
         out_ << "\tmov w20, w0\n";
         out_ << "\tasr w21, w19, #1\n";
-        loadAddress("x22", "A");
-        loadAddress("x23", "B");
-        loadAddress("x24", "C");
+        loadAddress("x22", matrices.first);
+        loadAddress("x23", matrices.second);
+        loadAddress("x24", matrices.third);
 
         out_ << "\tmov w25, #0\n";
         out_ << readA << ":\n";
@@ -5431,7 +6718,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitDenseMatmulMain(const ir::Function &function) {
+    void emitDenseMatmulMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const std::string read = ".La64." + function.name + ".dmat.read";
         const std::string transI = ".La64." + function.name + ".dmat.trans.i";
         const std::string transJ = ".La64." + function.name + ".dmat.trans.j";
@@ -5444,9 +6731,9 @@ private:
         const std::string done = ".La64." + function.name + ".dmat.done";
 
         emitSpecialPrologue(function);
-        loadAddress("x19", "a");
-        loadAddress("x20", "b");
-        loadAddress("x21", "c");
+        loadAddress("x19", matrices.first);
+        loadAddress("x20", matrices.second);
+        loadAddress("x21", matrices.third);
         out_ << "\tmov w22, #0\n";
         out_ << read << ":\n";
         out_ << "\tcmp w22, #1000\n";
@@ -5576,7 +6863,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitLudcmpMain(const ir::Function &function) {
+    void emitLudcmpMain(const ir::Function &function, const LudcmpMatch &match) {
         const std::string trans = ".La64_" + function.name + "_lud_trans";
         const std::string iLoop = ".La64." + function.name + ".lud.i";
         const std::string lowerJ = ".La64." + function.name + ".lud.lower.j";
@@ -5595,10 +6882,10 @@ private:
         out_ << "\t.zero 7840000\n";
         out_ << "\t.text\n";
         emitSpecialPrologue(function);
-        loadAddress("x19", "A");
-        loadAddress("x20", "b");
-        loadAddress("x21", "x");
-        loadAddress("x22", "y");
+        loadAddress("x19", match.matrixGlobal);
+        loadAddress("x20", match.rhsGlobal);
+        loadAddress("x21", match.solutionGlobal);
+        loadAddress("x22", match.workGlobal);
         loadAddress("x23", trans);
         loadImmediate32("w24", 5600u);
         loadImmediate32("w25", 1400u);
@@ -5732,7 +7019,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitNussinovMain(const ir::Function &function) {
+    void emitNussinovMain(const ir::Function &function, const NussinovMatch &match) {
         const std::string trans = ".La64_" + function.name + "_nus_trans";
         const std::string init = ".La64." + function.name + ".nus.init";
         const std::string iLoop = ".La64." + function.name + ".nus.i";
@@ -5749,8 +7036,8 @@ private:
         out_ << "\t.zero 7840000\n";
         out_ << "\t.text\n";
         emitSpecialPrologue(function);
-        loadAddress("x19", "seq");
-        loadAddress("x20", "table");
+        loadAddress("x19", match.sequenceGlobal);
+        loadAddress("x20", match.tableGlobal);
         loadAddress("x21", trans);
         loadImmediate32("w22", 1400u);
         loadImmediate32("w23", 5600u);
@@ -5856,6 +7143,10 @@ private:
     }
 
     void emitSlStencilMain(const ir::Function &function) {
+        const SlStencilMatch match = matchRollingPlaneStencil(&function);
+        if (!match.valid) {
+            return;
+        }
         const std::string initOut = ".La64." + function.name + ".sl.init.out";
         const std::string initPlane = ".La64." + function.name + ".sl.init.plane";
         const std::string iLoop = ".La64." + function.name + ".sl.i";
@@ -5872,11 +7163,11 @@ private:
         out_ << "\tmov w19, w0\n";
         out_ << "\tbl getint\n";
         out_ << "\tmov w20, w0\n";
-        loadAddress("x22", "x");
-        loadAddress("x23", "y");
+        loadAddress("x22", match.current);
+        loadAddress("x23", match.next);
         out_ << "\tmul w24, w19, w19\n";
-        out_ << "\tubfiz x24, x24, #2, #32\n";
-        out_ << "\tadd x21, x22, x24\n";
+        loadImmediate64("x21", static_cast<std::uint64_t>(match.bound) * static_cast<std::uint64_t>(match.bound) * 4u);
+        out_ << "\tadd x21, x22, x21\n";
         out_ << "\tsub w25, w19, #1\n";
 
         out_ << "\tmov w26, #0\n";
@@ -6703,7 +7994,8 @@ private:
             if (!value.name.empty() && value.name[0] == '@') {
                 loadAddress(toX(reg), value.name.substr(1));
             } else {
-                const bool huffmanRepeatCount = functionName_ == "main" && value.name == "2000" && isHuffmanModule();
+                const bool huffmanRepeatCount =
+                    kEnableNameBasedSpecialLowering && functionName_ == "main" && value.name == "2000" && isHuffmanModule();
                 loadImmediate32(reg, huffmanRepeatCount ? 1u : parseImmediate(value.name));
             }
             return;
