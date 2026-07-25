@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -4041,6 +4042,9 @@ private:
     std::unordered_map<int, int> valueOffset_;
     std::unordered_map<int, int> objectOffset_;
     std::unordered_map<std::string, std::vector<PhiCopy>> phiCopies_;
+    std::unordered_map<int, const ir::Instruction *> definingInst_;
+    std::unordered_map<int, int> useCount_;
+    std::unordered_set<int> suppressedMulResults_;
     int nextOffset_ = 0;
     int frameSize_ = 0;
     int nextInternalLabel_ = 0;
@@ -4094,11 +4098,15 @@ private:
         valueOffset_.clear();
         objectOffset_.clear();
         phiCopies_.clear();
+        definingInst_.clear();
+        useCount_.clear();
+        suppressedMulResults_.clear();
         nextOffset_ = 0;
         frameSize_ = 0;
         nextInternalLabel_ = 0;
 
         buildPhiCopies(function);
+        analyzeUses(function);
         collectFrame(function);
 
         if (isFastBitHelper(function)) {
@@ -6068,6 +6076,50 @@ private:
         }
     }
 
+    void analyzeUses(const ir::Function &function) {
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definingInst_[inst.result] = &inst;
+                }
+                for (const auto &operand : inst.operands) {
+                    if (!operand.constant && operand.id >= 0) {
+                        ++useCount_[operand.id];
+                    }
+                }
+            }
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if ((inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub) ||
+                    inst.resultType.kind == ir::TypeKind::F32) {
+                    continue;
+                }
+                if (inst.operands.size() != 2) {
+                    continue;
+                }
+                if (isSingleUseIntMul(inst.operands[0])) {
+                    suppressedMulResults_.insert(inst.operands[0].id);
+                } else if (isSingleUseIntMul(inst.operands[1])) {
+                    suppressedMulResults_.insert(inst.operands[1].id);
+                }
+            }
+        }
+    }
+
+    bool isSingleUseIntMul(const ir::Value &value) const {
+        if (value.constant || value.id < 0) {
+            return false;
+        }
+        const auto uses = useCount_.find(value.id);
+        if (uses == useCount_.end() || uses->second != 1) {
+            return false;
+        }
+        const auto def = definingInst_.find(value.id);
+        return def != definingInst_.end() && def->second->opcode == ir::Opcode::Mul &&
+               def->second->resultType.kind != ir::TypeKind::F32 && def->second->operands.size() == 2;
+    }
+
     static std::string edgeKey(const std::string &pred, const std::string &succ) {
         return pred + "\n" + succ;
     }
@@ -6098,6 +6150,9 @@ private:
         case ir::Opcode::Mod:
         case ir::Opcode::ICmp:
         case ir::Opcode::FCmp:
+            if (inst.opcode == ir::Opcode::Mul && suppressedMulResults_.count(inst.result) != 0) {
+                return;
+            }
             emitBinary(inst);
             return;
         case ir::Opcode::Neg:
@@ -6173,6 +6228,9 @@ private:
             emitFloatBinary(inst);
             return;
         }
+        if (emitFusedMulBinary(inst) || emitImmediateBinary(inst)) {
+            return;
+        }
         emitValueTo("w0", inst.operands[0]);
         emitValueTo("w1", inst.operands[1]);
         switch (inst.opcode) {
@@ -6200,6 +6258,147 @@ private:
             break;
         }
         storeWReg("w0", valueOffset_[inst.result]);
+    }
+
+    bool emitFusedMulBinary(const ir::Instruction &inst) {
+        if ((inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub) || inst.operands.size() != 2) {
+            return false;
+        }
+        const ir::Value *mulValue = nullptr;
+        const ir::Value *addend = nullptr;
+        bool mulIsLeft = false;
+        if (isSingleUseIntMul(inst.operands[0])) {
+            mulValue = &inst.operands[0];
+            addend = &inst.operands[1];
+            mulIsLeft = true;
+        } else if (isSingleUseIntMul(inst.operands[1])) {
+            mulValue = &inst.operands[1];
+            addend = &inst.operands[0];
+        }
+        if (mulValue == nullptr || addend == nullptr) {
+            return false;
+        }
+        const auto def = definingInst_.find(mulValue->id);
+        if (def == definingInst_.end()) {
+            return false;
+        }
+        const auto *mul = def->second;
+        emitValueTo("w0", mul->operands[0]);
+        emitValueTo("w1", mul->operands[1]);
+        emitValueTo("w2", *addend);
+        if (inst.opcode == ir::Opcode::Add) {
+            out_ << "\tmadd w0, w0, w1, w2\n";
+        } else if (mulIsLeft) {
+            out_ << "\tmsub w0, w0, w1, w2\n";
+            out_ << "\tneg w0, w0\n";
+        } else {
+            out_ << "\tmsub w0, w0, w1, w2\n";
+        }
+        storeWReg("w0", valueOffset_[inst.result]);
+        return true;
+    }
+
+    bool emitImmediateBinary(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+        const auto rhs = constantI32(inst.operands[1]);
+        const auto lhs = constantI32(inst.operands[0]);
+        switch (inst.opcode) {
+        case ir::Opcode::Add:
+            if (rhs && emitAddSubImmediate("add", inst.operands[0], *rhs, inst.result)) return true;
+            if (lhs && emitAddSubImmediate("add", inst.operands[1], *lhs, inst.result)) return true;
+            return false;
+        case ir::Opcode::Sub:
+            if (rhs && emitAddSubImmediate("sub", inst.operands[0], *rhs, inst.result)) return true;
+            return false;
+        case ir::Opcode::Mul:
+            if (rhs && emitMulImmediate(inst.operands[0], *rhs, inst.result)) return true;
+            if (lhs && emitMulImmediate(inst.operands[1], *lhs, inst.result)) return true;
+            return false;
+        case ir::Opcode::Div:
+            if (rhs && (*rhs == 1 || *rhs == -1)) {
+                emitValueTo("w0", inst.operands[0]);
+                if (*rhs == -1) {
+                    out_ << "\tneg w0, w0\n";
+                }
+                storeWReg("w0", valueOffset_[inst.result]);
+                return true;
+            }
+            return false;
+        case ir::Opcode::Mod:
+            if (rhs && (*rhs == 1 || *rhs == -1)) {
+                out_ << "\tmov w0, #0\n";
+                storeWReg("w0", valueOffset_[inst.result]);
+                return true;
+            }
+            return false;
+        case ir::Opcode::ICmp:
+            if (rhs && isA64AddSubImm(*rhs)) {
+                emitValueTo("w0", inst.operands[0]);
+                out_ << "\tcmp w0, #" << *rhs << "\n";
+                out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
+                storeWReg("w0", valueOffset_[inst.result]);
+                return true;
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+
+    bool emitAddSubImmediate(const std::string &op, const ir::Value &base, int imm, int result) {
+        if (imm < 0) {
+            return emitAddSubImmediate(op == "add" ? "sub" : "add", base, -imm, result);
+        }
+        if (!isA64AddSubImm(imm)) {
+            return false;
+        }
+        emitValueTo("w0", base);
+        out_ << "\t" << op << " w0, w0, #" << imm << "\n";
+        storeWReg("w0", valueOffset_[result]);
+        return true;
+    }
+
+    bool emitMulImmediate(const ir::Value &base, int imm, int result) {
+        const unsigned absImm = static_cast<unsigned>(imm < 0 ? -imm : imm);
+        const bool powerOfTwo = absImm != 0 && (absImm & (absImm - 1)) == 0;
+        if (imm != 0 && imm != 1 && imm != -1 && !powerOfTwo) {
+            return false;
+        }
+        emitValueTo("w0", base);
+        if (imm == 0) {
+            out_ << "\tmov w0, #0\n";
+        } else if (imm == 1) {
+        } else if (imm == -1) {
+            out_ << "\tneg w0, w0\n";
+        } else {
+            int shift = 0;
+            while ((1u << shift) != absImm) {
+                ++shift;
+            }
+            out_ << "\tlsl w0, w0, #" << shift << "\n";
+            if (imm < 0) {
+                out_ << "\tneg w0, w0\n";
+            }
+        }
+        storeWReg("w0", valueOffset_[result]);
+        return true;
+    }
+
+    static std::optional<int> constantI32(const ir::Value &value) {
+        if (!value.constant || (!value.name.empty() && value.name[0] == '@')) {
+            return std::nullopt;
+        }
+        return static_cast<int>(parseImmediate(value.name));
+    }
+
+    static bool isA64AddSubImm(int value) {
+        return value >= 0 && value <= 4095;
+    }
+
+    static bool isA64UnscaledImm(int value) {
+        return value >= -256 && value <= 255;
     }
 
     void emitFloatBinary(const ir::Instruction &inst) {
@@ -6527,31 +6726,55 @@ private:
     }
 
     void loadWReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
 
     void storeWReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tstr " << reg << ", [x16]\n";
     }
 
     void loadXReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
 
     void storeXReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tstr " << reg << ", [x16]\n";
     }
 
     void loadFReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
 
     void storeFReg(const std::string &reg, int offset) {
+        if (isA64UnscaledImm(offset)) {
+            out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tstr " << reg << ", [x16]\n";
     }
