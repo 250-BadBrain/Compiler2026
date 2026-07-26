@@ -22,7 +22,6 @@ struct Options {
     bool parseOnly = false;
     bool semaOnly = false;
     bool dumpIr = false;
-    bool astBackend = false;
 };
 
 void printUsage(const char *argv0) {
@@ -31,7 +30,6 @@ void printUsage(const char *argv0) {
     std::cerr << "       " << argv0 << " --parse-only input.sysy\n";
     std::cerr << "       " << argv0 << " --sema-only input.sysy\n";
     std::cerr << "       " << argv0 << " --dump-ir input.sysy\n";
-    std::cerr << "       " << argv0 << " input.sysy -S -o output.s --ast-backend [-O1]\n";
 }
 
 bool parseArgs(int argc, char **argv, Options &options) {
@@ -58,9 +56,7 @@ bool parseArgs(int argc, char **argv, Options &options) {
         } else if (arg == "--dump-ir") {
             options.dumpIr = true;
         } else if (arg == "--ir-backend") {
-            options.astBackend = false;
-        } else if (arg == "--ast-backend") {
-            options.astBackend = true;
+            continue;
         } else if (arg == "-o") {
             if (i + 1 >= argc) {
                 std::cerr << "missing output path after -o\n";
@@ -199,14 +195,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!options.astBackend) {
-        sysyc::ir::IRBuilder builder;
-        auto module = builder.build(unit);
-        sysyc::ir::optimize(module);
-        sysyc::arm::emitAssembly(module, out);
-    } else {
-        (void)options.optimize;
-        sysyc::arm::emitAssembly(unit, out);
-    }
+    sysyc::ir::IRBuilder builder;
+    auto module = builder.build(unit);
+    sysyc::ir::optimize(module);
+    sysyc::arm::emitAssembly(module, out);
     return 0;
 }
