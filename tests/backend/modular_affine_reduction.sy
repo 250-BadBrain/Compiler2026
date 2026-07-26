@@ -1,0 +1,29 @@
+int choose_larger(int a, int b) {
+    if (a < b) {
+        return b;
+    }
+    return a;
+}
+
+int transform_value(int x) {
+    int t1 = choose_larger(x, 2147483647 - x);
+    int t2 = choose_larger(t1, 1073741823 - t1);
+    int t3 = choose_larger(t2, 536870912 - t2);
+    return (t3 + t3 * 3 / 1000 * 1001) % 19491001;
+}
+
+const int reduction_mod = 998244853;
+
+int reduce_range(int start, int end, int step) {
+    int sum = 0;
+    int x = start;
+    while (x < end) {
+        sum = (sum + transform_value(x) + 1) % reduction_mod;
+        x = x + step;
+    }
+    return sum;
+}
+
+int main() {
+    return reduce_range(1, 100, 3);
+}

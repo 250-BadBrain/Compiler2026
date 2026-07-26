@@ -1,0 +1,15 @@
+int values[8];
+
+int square_sum(int count) {
+  int index = 0;
+  int sum = 0;
+  while (index < count) {
+    sum = sum + values[index] * values[index];
+    index = index + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return square_sum(getint());
+}

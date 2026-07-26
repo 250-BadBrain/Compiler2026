@@ -1,0 +1,20 @@
+int reset_a;
+int reset_b;
+int iterations;
+
+int step() {
+    iterations = iterations + 1;
+    return iterations;
+}
+
+int main() {
+    int countdown = 5;
+    int last = 0;
+    while (countdown > 0) {
+        reset_a = 0;
+        reset_b = 0;
+        last = step();
+        countdown = countdown - 1;
+    }
+    return iterations + last - 10;
+}

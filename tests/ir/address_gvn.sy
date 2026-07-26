@@ -1,0 +1,10 @@
+int data[4];
+
+int main() {
+  int index = getint();
+  data[index] = 7;
+  if (index >= 0) {
+    return data[index];
+  }
+  return 0;
+}

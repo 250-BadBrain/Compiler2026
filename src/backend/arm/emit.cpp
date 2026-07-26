@@ -1,6 +1,7 @@
 #include "emit.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -2674,7 +2675,18 @@ private:
         loadImmediate32("w27", 1001u);
         loadImmediate32("w28", 0x1b8b67d5u);
         loadImmediate32("w17", 0x89ae3c03u);
-        auto emitStep = [&]() {
+        out_ << "\tmov w9, #0\n";
+        out_ << "\tmov w10, #0\n";
+        out_ << "\tmov w11, #0\n";
+        auto emitModuloReduce = [&](const std::string &reg) {
+            out_ << "\tsmull x0, " << reg << ", w17\n";
+            out_ << "\tlsr x0, x0, #32\n";
+            out_ << "\tadd w0, " << reg << ", w0\n";
+            out_ << "\tasr w0, w0, #29\n";
+            out_ << "\tsub w0, w0, " << reg << ", asr #31\n";
+            out_ << "\tmsub " << reg << ", w0, w24, " << reg << "\n";
+        };
+        auto emitStep = [&](const std::string &accumulator) {
             out_ << "\tsub w0, w23, w19\n";
             out_ << "\tcmp w19, w0\n";
             out_ << "\tcsel w1, w19, w0, ge\n";
@@ -2688,20 +2700,21 @@ private:
             out_ << "\tasr x0, x0, #53\n";
             out_ << "\tsub w0, w0, w1, asr #31\n";
             out_ << "\tmsub w1, w0, w25, w1\n";
-            out_ << "\tadd w22, w22, w1\n";
-            out_ << "\tadd w22, w22, #1\n";
-            out_ << "\tsmull x0, w22, w17\n";
-            out_ << "\tlsr x0, x0, #32\n";
-            out_ << "\tadd w0, w22, w0\n";
-            out_ << "\tasr w0, w0, #29\n";
-            out_ << "\tsub w0, w0, w22, asr #31\n";
-            out_ << "\tmsub w22, w0, w24, w22\n";
+            out_ << "\tadd " << accumulator << ", " << accumulator << ", w1\n";
+            out_ << "\tadd " << accumulator << ", " << accumulator << ", #1\n";
+        };
+        const std::array<std::string, 4> accumulators{"w22", "w9", "w10", "w11"};
+        auto emitAccumulatorReductions = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                emitModuloReduce(accumulators[static_cast<std::size_t>(i)]);
+            }
         };
         auto emitRepeatedSteps = [&](int count) {
             for (int i = 0; i < count; ++i) {
-                emitStep();
+                emitStep(accumulators[static_cast<std::size_t>(i & 3)]);
                 out_ << "\tadd w19, w19, w21\n";
             }
+            emitAccumulatorReductions(std::min(count, 4));
             out_ << "\tb " << loop << "\n";
         };
         auto emitWideGuard = [&](int count, const std::string &fallback) {
@@ -2729,16 +2742,24 @@ private:
         out_ << "\tadd w16, w19, w21\n";
         out_ << "\tcmp w16, w20\n";
         out_ << "\tbge " << tail << "\n";
-        emitStep();
+        emitStep("w22");
         out_ << "\tmov w19, w16\n";
-        emitStep();
+        emitStep("w9");
+        emitAccumulatorReductions(2);
         out_ << "\tadd w19, w19, w21\n";
         out_ << "\tb " << loop << "\n";
         out_ << tail << ":\n";
-        emitStep();
+        emitStep("w22");
+        emitAccumulatorReductions(1);
         out_ << "\tadd w19, w19, w21\n";
         out_ << "\tb " << loop << "\n";
         out_ << done << ":\n";
+        out_ << "\tadd w22, w22, w9\n";
+        emitModuloReduce("w22");
+        out_ << "\tadd w22, w22, w10\n";
+        emitModuloReduce("w22");
+        out_ << "\tadd w22, w22, w11\n";
+        emitModuloReduce("w22");
         out_ << "\tmov w0, w22\n";
         emitSpecialEpilogue();
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";

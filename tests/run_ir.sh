@@ -25,4 +25,22 @@ grep -q 'const @N' "$tmp_dir/global.ir"
 grep -q 'global @g' "$tmp_dir/global.ir"
 grep -q 'gep @g' "$tmp_dir/global.ir"
 
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/store_forwarding.sy" >"$tmp_dir/store_forwarding.ir"
+grep -q 'func @main' "$tmp_dir/store_forwarding.ir"
+
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/cfg_merge.sy" >"$tmp_dir/cfg_merge.ir"
+grep -q 'ret 3' "$tmp_dir/cfg_merge.ir"
+
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/address_gvn.sy" >"$tmp_dir/address_gvn.ir"
+grep -q 'gep @data' "$tmp_dir/address_gvn.ir"
+
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/load_cse.sy" >"$tmp_dir/load_cse.ir"
+grep -q ' = load ' "$tmp_dir/load_cse.ir"
+
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/counted_loop_side_effect.sy" >"$tmp_dir/counted_loop_side_effect.ir"
+grep -q 'func @main' "$tmp_dir/counted_loop_side_effect.ir"
+
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/alias_store_invalidation.sy" >"$tmp_dir/alias_store_invalidation.ir"
+grep -q 'func @read_after_possible_alias' "$tmp_dir/alias_store_invalidation.ir"
+
 echo "ir tests passed"

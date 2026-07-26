@@ -1,0 +1,52 @@
+int bump(int value) {
+    return value + 1;
+}
+
+int allocate_values(int a, int b, int c, int d, int e, int f, int g, int h) {
+    int first = a + b;
+    int second = c + d;
+    int third = e + f;
+    int fourth = g + h;
+    int held = first * second;
+    int called = bump(third);
+    if (called < fourth) {
+        held = held + fourth;
+    } else {
+        held = held - called;
+    }
+    return held + first + second + third + fourth;
+}
+
+float blend(float a, float b, float c) {
+    float sum = a + b;
+    float product = b * c;
+    if (a < b) {
+        sum = sum + product;
+    }
+    return sum;
+}
+
+int pressure_call(int a, int b, int c, int d, int e, int f,
+                  int g, int h, int i, int j, int k, int l) {
+    int called = allocate_values(a, b, c, d, e, f, g, h);
+    if (a < 0) {
+        called = called + b + c + d + e + f + g;
+    }
+    if (b < 0) {
+        called = called + h + i + j + k + l;
+    }
+    if (c < 0) {
+        called = called - b - d - f - h - j - l;
+    }
+    if (d < 0) {
+        called = called + a - c + e - g + i - k;
+    }
+    return a + b + c + d + e + f + g + h + i + j + k + l + called;
+}
+
+int main() {
+    int integer_result = allocate_values(1, 2, 3, 4, 5, 6, 7, 8) % 200;
+    int float_result = blend(1.0, 2.0, 3.0);
+    int pressure_result = pressure_call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    return integer_result + float_result - 9 + pressure_result - 150;
+}

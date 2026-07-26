@@ -1,0 +1,7 @@
+int data[1];
+
+int main() {
+  data[0] = 17;
+  data[0] = 23;
+  return data[0];
+}

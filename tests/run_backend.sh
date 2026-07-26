@@ -27,4 +27,10 @@ grep -Eq 'add x[0-9]+, x[0-9]+, x[0-9]+, lsl #2|sub x[0-9]+, x29, #[0-9]+' "$tmp
 grep -q '^g:' "$tmp_dir/global_array.s"
 grep -Eq 'adrp x[0-9]+, g|adr x[0-9]+, g' "$tmp_dir/global_array.s"
 
+"$root/compiler" "$root/tests/backend/branch_frame_select.sy" -S -o "$tmp_dir/branch_frame_select.s"
+grep -q '^branch_nonzero:' "$tmp_dir/branch_frame_select.s"
+
+"$root/compiler" "$root/tests/backend/signed_constant_division.sy" -S -o "$tmp_dir/signed_constant_division.s"
+grep -q '^divide_by_two:' "$tmp_dir/signed_constant_division.s"
+
 echo "backend tests passed"

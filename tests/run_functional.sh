@@ -8,6 +8,15 @@ mkdir -p "$tmp_dir"
 
 make -C "$root" >/dev/null
 
+if [[ ! -d "$cases_dir" ]]; then
+    echo "case directory does not exist: $cases_dir" >&2
+    exit 1
+fi
+if [[ -z "$(find "$cases_dir" -type f -name '*.sy' -print -quit)" ]]; then
+    echo "case directory contains no .sy files: $cases_dir" >&2
+    exit 1
+fi
+
 total=0
 passed=0
 

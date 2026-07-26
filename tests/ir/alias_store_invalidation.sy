@@ -1,0 +1,14 @@
+int read_after_possible_alias(int first[], int second[], int flag) {
+    int before = first[0];
+    second[0] = 7;
+    int after = first[0];
+    if (flag) {
+        return after - before;
+    }
+    return after - before;
+}
+
+int main() {
+    int data[1] = {3};
+    return read_after_possible_alias(data, data, 1) - 4;
+}

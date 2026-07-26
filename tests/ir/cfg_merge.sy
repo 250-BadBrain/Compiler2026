@@ -1,0 +1,7 @@
+int main() {
+  int value = 1;
+  if (1) {
+    value = value + 2;
+  }
+  return value;
+}

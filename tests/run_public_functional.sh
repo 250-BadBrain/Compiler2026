@@ -9,6 +9,15 @@ mkdir -p "$tmp_dir"
 cc="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
 qemu="${QEMU_AARCH64:-qemu-aarch64}"
 
+if [[ ! -d "$cases_dir" ]]; then
+    echo "case directory does not exist: $cases_dir" >&2
+    exit 1
+fi
+if [[ -z "$(find "$cases_dir" -type f -name '*.sy' -print -quit)" ]]; then
+    echo "case directory contains no .sy files: $cases_dir" >&2
+    exit 1
+fi
+
 if ! command -v "$cc" >/dev/null; then
     echo "missing AArch64 compiler: $cc" >&2
     exit 1
