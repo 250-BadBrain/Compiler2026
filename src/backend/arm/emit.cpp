@@ -16,8 +16,6 @@
 namespace sysyc::arm {
 namespace {
 
-constexpr bool kEnableNameBasedSpecialLowering = false;
-
 int alignTo(int value, int align) {
     return ((value + align - 1) / align) * align;
 }
@@ -2003,16 +2001,6 @@ private:
         functionName_.clear();
         currentBlock_.clear();
         nextBlock_.clear();
-    }
-
-    bool isHuffmanModule() const {
-        auto hasNamedFunction = [&](const std::string &name) {
-            return std::any_of(module_.functions.begin(), module_.functions.end(), [&](const ir::Function &function) {
-                return function.name == name;
-            });
-        };
-        return hasNamedFunction("decode_fixed_huffman") && hasNamedFunction("read_bits") &&
-               hasNamedFunction("output_data");
     }
 
     bool isSlStencilMain(const ir::Function &function) const {
@@ -5377,9 +5365,7 @@ private:
             if (!value.name.empty() && value.name[0] == '@') {
                 loadAddress(toX(reg), value.name.substr(1));
             } else {
-                const bool huffmanRepeatCount =
-                    kEnableNameBasedSpecialLowering && functionName_ == "main" && value.name == "2000" && isHuffmanModule();
-                loadImmediate32(reg, huffmanRepeatCount ? 1u : parseImmediate(value.name));
+                loadImmediate32(reg, parseImmediate(value.name));
             }
             return;
         }
