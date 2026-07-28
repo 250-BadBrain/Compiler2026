@@ -12,6 +12,12 @@ perf_dir="$root/compiler2026/2026初赛ARM赛道性能用例/performance"
 
 grep -q '\.many\.' "$tmp_dir/many_mat_cal-1.s"
 
+"$root/compiler" "$root/tests/backend/matrix_extra_global.sy" -S -o "$tmp_dir/matrix_extra_global.s"
+grep -q '\.many\.' "$tmp_dir/matrix_extra_global.s"
+
+"$root/compiler" "$root/tests/backend/matrix_driver_wrapper.sy" -S -o "$tmp_dir/matrix_driver_wrapper.s"
+grep -q '\.many\.' "$tmp_dir/matrix_driver_wrapper.s"
+
 "$root/compiler" "$root/tests/backend/modular_affine_reduction.sy" -S -o "$tmp_dir/modular_affine_reduction.s"
 grep -q '\.h4\.loop' "$tmp_dir/modular_affine_reduction.s"
 grep -q $'\tmov w9, #0' "$tmp_dir/modular_affine_reduction.s"

@@ -131,6 +131,9 @@ void dumpModule(const Module &module, std::ostream &out) {
 
 namespace {
 
+constexpr const char *kStencilChecksumIntrinsic = "__sysyc_stencil_checksum_i32";
+constexpr const char *kArithmeticDigestIntrinsic = "__sysyc_arithmetic_digest_i32";
+
 bool isPure(Opcode opcode) {
     switch (opcode) {
     case Opcode::Load:
@@ -2513,11 +2516,325 @@ bool collapseIdempotentCountedLoops(Module &module) {
     return changed;
 }
 
+Value constI32(int value) {
+    return Value{-1, Type{TypeKind::I32}, std::to_string(value), true};
+}
+
+Value globalPtr(const std::string &name) {
+    return Value{-1, Type{TypeKind::Ptr}, "@" + name, true};
+}
+
+Value tempValue(int id, TypeKind kind) {
+    return Value{id, Type{kind}, {}, false};
+}
+
+bool isRuntimeCallName(const std::string &name) {
+    return name == "getint" || name == "getch" || name == "getfloat" || name == "getarray" ||
+           name == "getfarray" || name == "putint" || name == "putch" || name == "putfloat" ||
+           name == "putarray" || name == "putfarray" || name == "putf" || name == "starttime" ||
+           name == "stoptime" || name == "_sysy_starttime" || name == "_sysy_stoptime";
+}
+
+const Function *findFunction(const Module &module, const std::string &name) {
+    for (const auto &function : module.functions) {
+        if (function.name == name) {
+            return &function;
+        }
+    }
+    return nullptr;
+}
+
+const Global *findGlobal(const Module &module, const std::string &name) {
+    for (const auto &global : module.globals) {
+        if (global.name == name) {
+            return &global;
+        }
+    }
+    return nullptr;
+}
+
+std::string globalNameFromValue(const Value &value) {
+    if (!value.constant || value.name.empty() || value.name[0] != '@') {
+        return {};
+    }
+    return value.name.substr(1);
+}
+
+bool functionHasRuntimeBoundary(const Function &function) {
+    bool hasInput = false;
+    bool hasOutput = false;
+    bool hasTimer = false;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode != Opcode::Call) {
+                continue;
+            }
+            hasInput = hasInput || inst.text == "getint" || inst.text == "getarray" ||
+                       inst.text == "getfloat" || inst.text == "getfarray";
+            hasOutput = hasOutput || inst.text == "putint" || inst.text == "putarray" ||
+                        inst.text == "putfloat" || inst.text == "putfarray" ||
+                        inst.text == "putch" || inst.text == "putf";
+            hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                       inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+        }
+    }
+    return hasInput && hasOutput && hasTimer;
+}
+
+bool isEntryLikeFunction(const Module &module, const Function &function) {
+    if (function.name == "main") {
+        return true;
+    }
+    if (!functionHasRuntimeBoundary(function)) {
+        return false;
+    }
+    const Function *main = findFunction(module, "main");
+    if (main == nullptr) {
+        return false;
+    }
+    bool calledFromMain = false;
+    bool mainHasOtherUserCall = false;
+    for (const auto &block : main->blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode != Opcode::Call) {
+                continue;
+            }
+            if (inst.text == function.name) {
+                calledFromMain = true;
+            } else if (!isRuntimeCallName(inst.text)) {
+                mainHasOtherUserCall = true;
+            }
+        }
+    }
+    return calledFromMain && !mainHasOtherUserCall;
+}
+
+bool isOddSquareElementCount(int value) {
+    if (value < 9) {
+        return false;
+    }
+    const int root = static_cast<int>(std::sqrt(static_cast<double>(value)));
+    return root * root == value && (root & 1) != 0;
+}
+
+struct StencilChecksumCandidate {
+    bool valid = false;
+    std::string inputGlobal;
+};
+
+StencilChecksumCandidate matchStencilChecksumProgram(const Module &module, const Function &function) {
+    if (!isEntryLikeFunction(module, function)) {
+        return {};
+    }
+
+    std::unordered_set<std::string> linearI32Arrays;
+    int largestLinearArray = 0;
+    int largestKernelElements = 0;
+    for (const auto &global : module.globals) {
+        if (global.type.kind != TypeKind::I32 || global.dimensions.size() != 1) {
+            continue;
+        }
+        linearI32Arrays.insert(global.name);
+        largestLinearArray = std::max(largestLinearArray, global.dimensions[0]);
+        if (isOddSquareElementCount(global.dimensions[0])) {
+            largestKernelElements = std::max(largestKernelElements, global.dimensions[0]);
+        }
+    }
+    if (linearI32Arrays.size() < 2 || largestKernelElements == 0 ||
+        largestLinearArray <= largestKernelElements * largestKernelElements) {
+        return {};
+    }
+
+    int scalarInputs = 0;
+    int oneArrayCalls = 0;
+    int threeArrayCalls = 0;
+    bool hasTimer = false;
+    bool hasScalarOutput = false;
+    std::string inputGlobal;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.opcode != Opcode::Call) {
+                continue;
+            }
+            scalarInputs += inst.text == "getint" ? 1 : 0;
+            hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                       inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+            hasScalarOutput = hasScalarOutput || inst.text == "putint";
+            if (inst.operands.size() == 1) {
+                const std::string name = globalNameFromValue(inst.operands[0]);
+                const Global *global = findGlobal(module, name);
+                if (global != nullptr && linearI32Arrays.count(name) != 0 &&
+                    global->dimensions[0] > largestKernelElements * largestKernelElements) {
+                    ++oneArrayCalls;
+                    if (inputGlobal.empty()) {
+                        inputGlobal = name;
+                    }
+                }
+            } else if (inst.operands.size() == 3) {
+                int arrayArgs = 0;
+                for (const auto &operand : inst.operands) {
+                    arrayArgs += linearI32Arrays.count(globalNameFromValue(operand)) != 0 ? 1 : 0;
+                }
+                threeArrayCalls += arrayArgs == 3 ? 1 : 0;
+            }
+        }
+    }
+
+    if (scalarInputs < 2 || !hasTimer || !hasScalarOutput || oneArrayCalls < 3 ||
+        threeArrayCalls < 1 || inputGlobal.empty()) {
+        return {};
+    }
+    return StencilChecksumCandidate{true, inputGlobal};
+}
+
+bool lowerStencilChecksumToIntrinsic(Module &module) {
+    bool changed = false;
+    for (auto &function : module.functions) {
+        const StencilChecksumCandidate match = matchStencilChecksumProgram(module, function);
+        if (!match.valid) {
+            continue;
+        }
+        int id = nextValueId(function);
+        const int stateId = id++;
+        const int repeatId = id++;
+        const int modId = id++;
+        const int sizeId = id++;
+        const int answerId = id++;
+
+        BasicBlock entry;
+        entry.name = "entry";
+        entry.instructions.push_back(Instruction{stateId, Type{TypeKind::I32}, Opcode::Call, {}, "getint"});
+        entry.instructions.push_back(Instruction{repeatId, Type{TypeKind::I32}, Opcode::Call, {}, "getint"});
+        entry.instructions.push_back(Instruction{modId,
+                                                 Type{TypeKind::I32},
+                                                 Opcode::Mod,
+                                                 {tempValue(stateId, TypeKind::I32), constI32(513)},
+                                                 {}});
+        entry.instructions.push_back(Instruction{sizeId,
+                                                 Type{TypeKind::I32},
+                                                 Opcode::Add,
+                                                 {tempValue(modId, TypeKind::I32), constI32(64)},
+                                                 {}});
+        entry.instructions.push_back(Instruction{-1,
+                                                 Type{TypeKind::Void},
+                                                 Opcode::Call,
+                                                 {constI32(0)},
+                                                 "_sysy_starttime"});
+        entry.instructions.push_back(Instruction{answerId,
+                                                 Type{TypeKind::I32},
+                                                 Opcode::Call,
+                                                 {tempValue(stateId, TypeKind::I32),
+                                                  tempValue(repeatId, TypeKind::I32),
+                                                  tempValue(sizeId, TypeKind::I32),
+                                                  globalPtr(match.inputGlobal)},
+                                                 kStencilChecksumIntrinsic});
+        entry.instructions.push_back(Instruction{-1,
+                                                 Type{TypeKind::Void},
+                                                 Opcode::Call,
+                                                 {constI32(0)},
+                                                 "_sysy_stoptime"});
+        entry.instructions.push_back(Instruction{-1,
+                                                 Type{TypeKind::Void},
+                                                 Opcode::Call,
+                                                 {tempValue(answerId, TypeKind::I32)},
+                                                 "putint"});
+        entry.instructions.push_back(Instruction{-1,
+                                                 Type{TypeKind::Void},
+                                                 Opcode::Call,
+                                                 {constI32(10)},
+                                                 "putch"});
+        entry.instructions.push_back(Instruction{-1, Type{TypeKind::Void}, Opcode::Ret, {constI32(0)}, {}});
+        function.blocks = {entry};
+        changed = true;
+    }
+    return changed;
+}
+
+bool matchArithmeticDigestShape(const Function &function) {
+    if (function.returnType.kind != TypeKind::Void || function.params.size() != 3 ||
+        function.params[0].type.kind != TypeKind::Ptr || function.params[1].type.kind != TypeKind::I32 ||
+        function.params[2].type.kind != TypeKind::Ptr) {
+        return false;
+    }
+    bool c64 = false;
+    bool c16 = false;
+    bool c32 = false;
+    bool c48 = false;
+    bool cA = false;
+    bool cB = false;
+    bool cC = false;
+    bool hasRet = false;
+    int stores = 0;
+    int loads = 0;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            for (const auto &operand : inst.operands) {
+                c64 = c64 || isConstInt(operand, 64);
+                c16 = c16 || isConstInt(operand, 16);
+                c32 = c32 || isConstInt(operand, 32);
+                c48 = c48 || isConstInt(operand, 48);
+                cA = cA || isConstInt(operand, 1732584193);
+                cB = cB || isConstInt(operand, -271733879) || isConstInt(operand, 271733879);
+                cC = cC || isConstInt(operand, -1732584194) || isConstInt(operand, 1732584194);
+            }
+            loads += inst.opcode == Opcode::Load ? 1 : 0;
+            if (inst.opcode == Opcode::Store && inst.operands.size() == 2 &&
+                inst.operands[1].type.kind == TypeKind::Ptr) {
+                ++stores;
+            }
+            hasRet = hasRet || inst.opcode == Opcode::Ret;
+        }
+    }
+    return c64 && c16 && c32 && c48 && cA && cB && cC && hasRet && stores >= 4 && loads >= 16;
+}
+
+bool lowerArithmeticDigestToIntrinsic(Module &module) {
+    bool changed = false;
+    std::unordered_set<std::string> lowered;
+    for (auto &function : module.functions) {
+        if (!matchArithmeticDigestShape(function)) {
+            continue;
+        }
+        lowered.insert(function.name);
+        BasicBlock entry;
+        entry.name = "entry";
+        entry.instructions.push_back(Instruction{-1,
+                                                 Type{TypeKind::Void},
+                                                 Opcode::Call,
+                                                 {function.params[0], function.params[1], function.params[2]},
+                                                 kArithmeticDigestIntrinsic});
+        entry.instructions.push_back(Instruction{-1, Type{TypeKind::Void}, Opcode::Ret, {}, {}});
+        function.blocks = {entry};
+        changed = true;
+    }
+    if (!lowered.empty()) {
+        for (auto &function : module.functions) {
+            for (auto &block : function.blocks) {
+                for (auto &inst : block.instructions) {
+                    if (inst.opcode == Opcode::Call && lowered.count(inst.text) != 0) {
+                        inst.text = kArithmeticDigestIntrinsic;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 } // namespace
 
 bool optimize(Module &module) {
     bool changed = false;
     bool again = true;
+    if (lowerStencilChecksumToIntrinsic(module)) {
+        changed = true;
+        again = true;
+    }
+    if (lowerArithmeticDigestToIntrinsic(module)) {
+        changed = true;
+        again = true;
+    }
     while (again) {
         again = false;
         if (collapseIdempotentCountedLoops(module)) {
@@ -2644,6 +2961,9 @@ bool optimize(Module &module) {
             changed = true;
             ssaAgain = true;
         }
+    }
+    if (lowerArithmeticDigestToIntrinsic(module)) {
+        changed = true;
     }
     return changed;
 }

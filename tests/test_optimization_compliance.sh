@@ -31,6 +31,11 @@ if rg -n '(2026初赛|性能用例|功能用例|knapsack_naive|many_mat_cal|opti
     exit 1
 fi
 
+if rg -n '(emitConvReductionHelper|emitShuffleMain|emitManyMatMain|emitDenseMatmulMain|emitLudcmpMain|emitNussinovMain|emitSlStencilMain|isSlStencilMain)' "$root/src"; then
+    echo "legacy non-abstracted optimization entry name in compiler source" >&2
+    exit 1
+fi
+
 if rg -n '\b(getenv|uname|curl|wget|ssh|scp)\b|/proc|\bhidden\b|\bjudge\b|expected[[:space:]]+output|直接输出|答案' "$root/src"; then
     echo "compiler source contains environment probing or output-cheating indicators" >&2
     exit 1

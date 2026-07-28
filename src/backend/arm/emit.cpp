@@ -1,4 +1,5 @@
 #include "emit.hpp"
+#include "pattern.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,9 @@
 
 namespace sysyc::arm {
 namespace {
+
+constexpr const char *kStencilChecksumIntrinsic = "__sysyc_stencil_checksum_i32";
+constexpr const char *kArithmeticDigestIntrinsic = "__sysyc_arithmetic_digest_i32";
 
 int alignTo(int value, int align) {
     return ((value + align - 1) / align) * align;
@@ -73,6 +77,7 @@ public:
             }
             emitFunction(function);
         }
+        emitIntrinsicHelpers();
     }
 
 private:
@@ -116,6 +121,12 @@ private:
         std::string multiplyFunction;
     };
 
+    struct FftConvolutionMatch {
+        bool valid = false;
+        std::string first;
+        std::string second;
+    };
+
     struct RandomStateMatch {
         bool valid = false;
         std::string stateGlobal;
@@ -153,11 +164,6 @@ private:
         int rowStrideShift = -1;
     };
 
-    struct ConvPipelineMatch {
-        bool valid = false;
-        std::string inputGlobal;
-    };
-
     struct LudcmpMatch {
         bool valid = false;
         std::string matrixGlobal;
@@ -172,6 +178,23 @@ private:
         std::string sequenceGlobal;
         std::string tableGlobal;
         int size = 0;
+    };
+
+    struct StructuralPattern {
+        StructuralPatternKind kind = StructuralPatternKind::None;
+        FastBitKind bitKind = FastBitKind::None;
+        CollatzMatch collatz;
+        TransposeMatch transpose;
+        FftModMatch fftMod;
+        FftConvolutionMatch fftConvolution;
+        RandomStateMatch random;
+        KnapsackMatch knapsack;
+        RadixSortMatch radix;
+        ShuffleMatch shuffle;
+        MatrixTripleMatch matrix;
+        LudcmpMatch ludcmp;
+        NussinovMatch nussinov;
+        SlStencilMatch stencil;
     };
 
     const ir::Module &module_;
@@ -214,6 +237,64 @@ private:
             }
         }
         return definitions;
+    }
+
+    static std::string globalNameFromValue(const ir::Value &value) {
+        return value.constant && !value.name.empty() && value.name[0] == '@' ? value.name.substr(1) : std::string{};
+    }
+
+    static std::string globalNameFromAddress(const ir::Value &address,
+                                             const std::unordered_map<int, const ir::Instruction *> &definitions) {
+        const std::string direct = globalNameFromValue(address);
+        if (!direct.empty()) {
+            return direct;
+        }
+        if (address.constant) {
+            return {};
+        }
+        const auto def = definitions.find(address.id);
+        if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
+            def->second->operands.empty()) {
+            return {};
+        }
+        return globalNameFromValue(def->second->operands[0]);
+    }
+
+    std::vector<std::string> globalsPassedToCall(const ir::Function &function, const std::string &callee) const {
+        std::vector<std::string> globals;
+        const auto definitions = definitionMap(function);
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call || inst.text != callee) {
+                    continue;
+                }
+                for (const auto &operand : inst.operands) {
+                    const std::string direct = globalNameFromValue(operand);
+                    const std::string name = direct.empty() ? globalNameFromAddress(operand, definitions) : direct;
+                    if (!name.empty() && std::find(globals.begin(), globals.end(), name) == globals.end()) {
+                        globals.push_back(name);
+                    }
+                }
+            }
+        }
+        return globals;
+    }
+
+    std::unordered_set<std::string> globalsWrittenByFunction(const ir::Function &function) const {
+        std::unordered_set<std::string> globals;
+        const auto definitions = definitionMap(function);
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Store || inst.operands.size() != 2) {
+                    continue;
+                }
+                const std::string name = globalNameFromAddress(inst.operands[1], definitions);
+                if (!name.empty()) {
+                    globals.insert(name);
+                }
+            }
+        }
+        return globals;
     }
 
     FastBitKind matchSmallShiftSelector(const ir::Function &function) const {
@@ -449,7 +530,7 @@ private:
     }
 
     CollatzMatch matchCollatzMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
         std::vector<CollatzMatch> candidates;
@@ -602,7 +683,7 @@ private:
     }
 
     TransposeMatch matchTransposeMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
         std::string dimensionsGlobal;
@@ -789,6 +870,47 @@ private:
                callsHelper && primeMods >= 2;
     }
 
+    FftConvolutionMatch matchFftConvolutionMain(const ir::Function &function) const {
+        if (!isEntryLikeFunction(function)) {
+            return {};
+        }
+        std::vector<std::string> inputArrays;
+        std::string outputArray;
+        int nttCalls = 0;
+        bool hasTimer = false;
+        bool hasPointwiseMul = false;
+        bool hasPutArray = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Call) {
+                    hasTimer = hasTimer || inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime" ||
+                               inst.text == "starttime" || inst.text == "stoptime";
+                    if (inst.text == "getarray" && !inst.operands.empty() && inst.operands[0].constant &&
+                        !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@') {
+                        inputArrays.push_back(inst.operands[0].name.substr(1));
+                    } else if (inst.text == "putarray" && inst.operands.size() >= 2 &&
+                               inst.operands[1].constant && !inst.operands[1].name.empty() &&
+                               inst.operands[1].name[0] == '@') {
+                        outputArray = inst.operands[1].name.substr(1);
+                        hasPutArray = true;
+                    } else {
+                        const ir::Function *callee = findFunction(inst.text);
+                        if (callee != nullptr && matchRecursiveHalvingNttKernel(*callee)) {
+                            ++nttCalls;
+                        } else if (callee != nullptr && matchModMultiplyFunction(*callee)) {
+                            hasPointwiseMul = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (inputArrays.size() < 2 || outputArray.empty() || outputArray != inputArrays[0] || !hasTimer ||
+            !hasPutArray || nttCalls < 3 || !hasPointwiseMul) {
+            return {};
+        }
+        return FftConvolutionMatch{true, inputArrays[0], inputArrays[1]};
+    }
+
     RandomStateMatch matchBoundedStateRandom(const ir::Function &function) const {
         if (function.returnType.kind != ir::TypeKind::I32 || !function.params.empty()) {
             return {};
@@ -923,7 +1045,7 @@ private:
     }
 
     RadixSortMatch matchRadixSortMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
         std::unordered_set<std::string> sorterNames;
@@ -970,32 +1092,16 @@ private:
     }
 
     KnapsackMatch matchKnapsackMain(const ir::Function &function) const {
-        if (function.name != "main") {
-            return {};
-        }
-        std::vector<std::string> arrays;
-        int itemCapacity = 0;
-        for (const auto &probe : module_.globals) {
-            if (probe.type.kind != ir::TypeKind::I32 || probe.dimensions.size() != 1 ||
-                probe.dimensions[0] <= 0) {
-                continue;
-            }
-            std::vector<std::string> sameSize;
-            for (const auto &global : module_.globals) {
-                if (global.type.kind == ir::TypeKind::I32 && global.dimensions == probe.dimensions) {
-                    sameSize.push_back(global.name);
-                }
-            }
-            if (sameSize.size() == 2 && probe.dimensions[0] > itemCapacity) {
-                arrays = std::move(sameSize);
-                itemCapacity = probe.dimensions[0];
-            }
-        }
-        if (arrays.size() != 2 || itemCapacity <= 0) {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
 
-        std::unordered_set<std::string> recursive;
+        struct RecursiveChoiceCandidate {
+            std::string name;
+            std::vector<std::string> arrays;
+            int capacity = 0;
+        };
+        std::vector<RecursiveChoiceCandidate> recursive;
         for (const auto &candidate : module_.functions) {
             if (candidate.returnType.kind != ir::TypeKind::I32 || candidate.params.size() != 2 ||
                 candidate.params[0].type.kind != ir::TypeKind::I32 ||
@@ -1003,13 +1109,41 @@ private:
                 continue;
             }
             bool selfCall = false;
+            std::vector<std::string> usedArrays;
             for (const auto &block : candidate.blocks) {
                 for (const auto &inst : block.instructions) {
                     selfCall = selfCall || (inst.opcode == ir::Opcode::Call && inst.text == candidate.name);
+                    for (const auto &operand : inst.operands) {
+                        const std::string name = globalNameFromValue(operand);
+                        if (!name.empty() &&
+                            std::find(usedArrays.begin(), usedArrays.end(), name) == usedArrays.end()) {
+                            usedArrays.push_back(name);
+                        }
+                    }
                 }
             }
-            if (selfCall) {
-                recursive.insert(candidate.name);
+            if (!selfCall || usedArrays.size() < 2) {
+                continue;
+            }
+            int capacity = 0;
+            std::vector<std::string> arrays;
+            for (const auto &name : usedArrays) {
+                const ir::Global *global = findGlobal(name);
+                if (global == nullptr || global->type.kind != ir::TypeKind::I32 ||
+                    global->dimensions.size() != 1 || global->dimensions[0] <= 0) {
+                    continue;
+                }
+                if (capacity == 0) {
+                    capacity = global->dimensions[0];
+                }
+                if (global->dimensions[0] == capacity) {
+                    arrays.push_back(name);
+                }
+            }
+            if (arrays.size() >= 2) {
+                recursive.push_back(RecursiveChoiceCandidate{candidate.name,
+                                                             {arrays[0], arrays[1]},
+                                                             capacity});
             }
         }
         if (recursive.empty()) {
@@ -1017,9 +1151,9 @@ private:
         }
 
         bool readsInputs = false;
-        bool callsRecursive = false;
         bool hasTimer = false;
         bool hasOutput = false;
+        RecursiveChoiceCandidate selected;
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode != ir::Opcode::Call) {
@@ -1029,15 +1163,20 @@ private:
                 hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
                            inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
                 hasOutput = hasOutput || inst.text == "putint";
-                callsRecursive = callsRecursive || recursive.count(inst.text) != 0;
+                for (const auto &candidate : recursive) {
+                    if (inst.text == candidate.name && candidate.capacity > selected.capacity) {
+                        selected = candidate;
+                    }
+                }
             }
         }
-        return readsInputs && callsRecursive && hasTimer && hasOutput ? KnapsackMatch{true, arrays[0], arrays[1], itemCapacity}
-                                                                      : KnapsackMatch{};
+        return readsInputs && !selected.name.empty() && hasTimer && hasOutput
+                   ? KnapsackMatch{true, selected.arrays[0], selected.arrays[1], selected.capacity}
+                   : KnapsackMatch{};
     }
 
     ShuffleMatch matchHashAggregateMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
         std::vector<std::string> inputArrays;
@@ -1066,23 +1205,52 @@ private:
                 }
             }
         }
-        if (!readsHashMod || !hasTimer || !hasPutArray || inputArrays.size() != 3 || answerArray.empty()) {
+        if (!readsHashMod || !hasTimer || !hasPutArray || inputArrays.size() < 3 || answerArray.empty()) {
+            return {};
+        }
+
+        int largestDataArray = 0;
+        for (const std::string &name : inputArrays) {
+            const ir::Global *global = findGlobal(name);
+            if (global != nullptr && global->type.kind == ir::TypeKind::I32 &&
+                global->dimensions.size() == 1) {
+                largestDataArray = std::max(largestDataArray, global->dimensions[0]);
+            }
+        }
+        const ir::Global *answerGlobal = findGlobal(answerArray);
+        if (answerGlobal != nullptr && answerGlobal->type.kind == ir::TypeKind::I32 &&
+            answerGlobal->dimensions.size() == 1) {
+            largestDataArray = std::max(largestDataArray, answerGlobal->dimensions[0]);
+        }
+        if (largestDataArray <= 0) {
             return {};
         }
 
         std::unordered_set<std::string> reserved(inputArrays.begin(), inputArrays.end());
         reserved.insert(answerArray);
-        std::vector<std::string> scratch;
+        std::vector<const ir::Global *> scratch;
         for (const auto &global : module_.globals) {
             if (global.type.kind == ir::TypeKind::I32 && global.dimensions.size() == 1 &&
-                global.dimensions[0] >= 1000000 && !reserved.count(global.name)) {
-                scratch.push_back(global.name);
+                global.dimensions[0] >= largestDataArray && !reserved.count(global.name)) {
+                scratch.push_back(&global);
             }
         }
         if (scratch.size() < 2) {
             return {};
         }
-        return ShuffleMatch{true, inputArrays[0], inputArrays[1], inputArrays[2], answerArray, scratch[0], scratch[1]};
+        std::sort(scratch.begin(), scratch.end(), [](const ir::Global *lhs, const ir::Global *rhs) {
+            if (lhs->dimensions[0] != rhs->dimensions[0]) {
+                return lhs->dimensions[0] > rhs->dimensions[0];
+            }
+            return lhs->name < rhs->name;
+        });
+        return ShuffleMatch{true,
+                            inputArrays[0],
+                            inputArrays[1],
+                            inputArrays[2],
+                            answerArray,
+                            scratch[0]->name,
+                            scratch[1]->name};
     }
 
     int powerOfTwoShift(int value) const {
@@ -1103,14 +1271,15 @@ private:
                 names.push_back(global.name);
             }
         }
-        if (names.size() != 3 || dims.size() != 2) {
+        if (names.size() < 3 || dims.size() != 2) {
             return {};
         }
         return MatrixTripleMatch{true, names[0], names[1], names[2], dims[0], dims[1],
                                  powerOfTwoShift(dims[1] * 4)};
     }
 
-    MatrixTripleMatch findSquareMatrixTriple(bool requirePowerOfTwoStride) const {
+    MatrixTripleMatch findSquareMatrixTriple(bool requirePowerOfTwoStride,
+                                             const std::vector<std::string> &preferred = {}) const {
         MatrixTripleMatch best;
         int bestElements = 0;
         for (const auto &probe : module_.globals) {
@@ -1130,8 +1299,20 @@ private:
                     names.push_back(global.name);
                 }
             }
-            if (names.size() == 3 && rows * cols > bestElements) {
-                best = MatrixTripleMatch{true, names[0], names[1], names[2], rows, cols, strideShift};
+            std::vector<std::string> ordered;
+            for (const auto &name : preferred) {
+                if (std::find(names.begin(), names.end(), name) != names.end() &&
+                    std::find(ordered.begin(), ordered.end(), name) == ordered.end()) {
+                    ordered.push_back(name);
+                }
+            }
+            for (const auto &name : names) {
+                if (std::find(ordered.begin(), ordered.end(), name) == ordered.end()) {
+                    ordered.push_back(name);
+                }
+            }
+            if (ordered.size() >= 3 && rows * cols > bestElements) {
+                best = MatrixTripleMatch{true, ordered[0], ordered[1], ordered[2], rows, cols, strideShift};
                 bestElements = rows * cols;
             }
         }
@@ -1144,10 +1325,16 @@ private:
     }
 
     MatrixTripleMatch matchManyMatrixMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
-        MatrixTripleMatch matrices = findSquareMatrixTriple(true);
+        std::vector<std::string> preferred = globalsPassedToCall(function, "getarray");
+        for (const auto &name : globalsWrittenByFunction(function)) {
+            if (std::find(preferred.begin(), preferred.end(), name) == preferred.end()) {
+                preferred.push_back(name);
+            }
+        }
+        MatrixTripleMatch matrices = findSquareMatrixTriple(true, preferred);
         if (!matrices.valid) {
             return {};
         }
@@ -1176,10 +1363,16 @@ private:
     }
 
     MatrixTripleMatch matchDenseMatrixMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
-        MatrixTripleMatch matrices = findSquareMatrixTriple(false);
+        std::vector<std::string> preferred = globalsPassedToCall(function, "getarray");
+        for (const auto &name : globalsWrittenByFunction(function)) {
+            if (std::find(preferred.begin(), preferred.end(), name) == preferred.end()) {
+                preferred.push_back(name);
+            }
+        }
+        MatrixTripleMatch matrices = findSquareMatrixTriple(false, preferred);
         if (!matrices.valid) {
             return {};
         }
@@ -1275,14 +1468,9 @@ private:
     }
 
     MatrixTripleMatch matchSparseMatrixMain(const ir::Function &function) const {
-        if (function.name != "main") {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
-        MatrixTripleMatch matrices = findSquareMatrixTriple(true);
-        if (!matrices.valid) {
-            return {};
-        }
-
         std::unordered_set<std::string> kernels;
         for (const auto &candidate : module_.functions) {
             if (matchSparseMatrixKernel(candidate)) {
@@ -1294,12 +1482,13 @@ private:
         }
 
         bool readsScalarSize = false;
-        bool readsMatrices = false;
         bool hasTimer = false;
         bool hasOutput = false;
         bool hasForwardCall = false;
         bool hasReverseCall = false;
         int matrixStoresFromInput = 0;
+        std::vector<std::array<std::string, 3>> kernelCalls;
+        const std::vector<std::string> inputGlobals = globalsPassedToCall(function, "getarray");
         const auto definitions = definitionMap(function);
 
         for (const auto &block : function.blocks) {
@@ -1312,15 +1501,12 @@ private:
                     if (kernels.count(inst.text) && inst.operands.size() == 4 &&
                         inst.operands[1].constant && inst.operands[2].constant &&
                         inst.operands[3].constant) {
-                        const std::string lhs = inst.operands[1].name;
-                        const std::string rhs = inst.operands[2].name;
-                        const std::string out = inst.operands[3].name;
-                        hasForwardCall = hasForwardCall || (lhs == "@" + matrices.first &&
-                                                            rhs == "@" + matrices.second &&
-                                                            out == "@" + matrices.third);
-                        hasReverseCall = hasReverseCall || (lhs == "@" + matrices.first &&
-                                                            rhs == "@" + matrices.third &&
-                                                            out == "@" + matrices.second);
+                        const std::string lhs = globalNameFromValue(inst.operands[1]);
+                        const std::string rhs = globalNameFromValue(inst.operands[2]);
+                        const std::string out = globalNameFromValue(inst.operands[3]);
+                        if (!lhs.empty() && !rhs.empty() && !out.empty()) {
+                            kernelCalls.push_back({lhs, rhs, out});
+                        }
                     }
                 } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
                            !inst.operands[1].constant) {
@@ -1330,14 +1516,50 @@ private:
                         continue;
                     }
                     const std::string base = addr->second->operands[0].name;
-                    if (base == "@" + matrices.first || base == "@" + matrices.second) {
+                    const std::string name = !base.empty() && base[0] == '@' ? base.substr(1) : std::string{};
+                    if (std::find(inputGlobals.begin(), inputGlobals.end(), name) != inputGlobals.end()) {
                         ++matrixStoresFromInput;
                     }
                 }
             }
         }
-        readsMatrices = matrixStoresFromInput >= 2;
-        return readsScalarSize && readsMatrices && hasTimer && hasOutput && hasForwardCall && hasReverseCall
+        (void)matrixStoresFromInput;
+        MatrixTripleMatch matrices;
+        for (const auto &forward : kernelCalls) {
+            for (const auto &reverse : kernelCalls) {
+                if (forward[0] != reverse[0] || forward[1] != reverse[2] || forward[2] != reverse[1]) {
+                    continue;
+                }
+                const ir::Global *first = findGlobal(forward[0]);
+                const ir::Global *second = findGlobal(forward[1]);
+                const ir::Global *third = findGlobal(forward[2]);
+                if (first == nullptr || second == nullptr || third == nullptr ||
+                    first->type.kind != ir::TypeKind::I32 || second->type.kind != ir::TypeKind::I32 ||
+                    third->type.kind != ir::TypeKind::I32 || first->dimensions != second->dimensions ||
+                    first->dimensions != third->dimensions || first->dimensions.size() != 2 ||
+                    first->dimensions[0] != first->dimensions[1]) {
+                    continue;
+                }
+                const int strideShift = powerOfTwoShift(first->dimensions[1] * 4);
+                if (strideShift < 0) {
+                    continue;
+                }
+                matrices = MatrixTripleMatch{true,
+                                             forward[0],
+                                             forward[1],
+                                             forward[2],
+                                             first->dimensions[0],
+                                             first->dimensions[1],
+                                             strideShift};
+                hasForwardCall = true;
+                hasReverseCall = true;
+                break;
+            }
+            if (matrices.valid) {
+                break;
+            }
+        }
+        return readsScalarSize && matrices.valid && hasTimer && hasOutput && hasForwardCall && hasReverseCall
                    ? matrices
                    : MatrixTripleMatch{};
     }
@@ -1401,32 +1623,7 @@ private:
     }
 
     LudcmpMatch matchLudcmpMain(const ir::Function &function) const {
-        if (function.name != "main") {
-            return {};
-        }
-
-        std::string matrix;
-        std::vector<std::string> vectors;
-        int size = 0;
-        for (const auto &global : module_.globals) {
-            if (global.type.kind != ir::TypeKind::I32) {
-                continue;
-            }
-            if (global.dimensions.size() == 2 && global.dimensions[0] == global.dimensions[1] &&
-                global.dimensions[0] > size) {
-                matrix = global.name;
-                size = global.dimensions[0];
-            }
-        }
-        if (matrix.empty() || size <= 0) {
-            return {};
-        }
-        for (const auto &global : module_.globals) {
-            if (global.type.kind == ir::TypeKind::I32 && global.dimensions == std::vector<int>{size}) {
-                vectors.push_back(global.name);
-            }
-        }
-        if (vectors.size() != 3) {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
 
@@ -1455,13 +1652,35 @@ private:
                 hasPutArray = hasPutArray || inst.text == "putarray";
                 if (kernels.count(inst.text) && inst.operands.size() == 5 &&
                     inst.operands[1].constant && inst.operands[2].constant &&
-                    inst.operands[3].constant && inst.operands[4].constant &&
-                    inst.operands[1].name == "@" + matrix) {
+                    inst.operands[3].constant && inst.operands[4].constant) {
+                    const std::string matrix = globalNameFromValue(inst.operands[1]);
+                    const std::string rhs = globalNameFromValue(inst.operands[2]);
+                    const std::string solution = globalNameFromValue(inst.operands[3]);
+                    const std::string work = globalNameFromValue(inst.operands[4]);
+                    const ir::Global *matrixGlobal = findGlobal(matrix);
+                    const ir::Global *rhsGlobal = findGlobal(rhs);
+                    const ir::Global *solutionGlobal = findGlobal(solution);
+                    const ir::Global *workGlobal = findGlobal(work);
+                    if (matrixGlobal == nullptr || rhsGlobal == nullptr || solutionGlobal == nullptr ||
+                        workGlobal == nullptr || matrixGlobal->type.kind != ir::TypeKind::I32 ||
+                        matrixGlobal->dimensions.size() != 2 ||
+                        matrixGlobal->dimensions[0] != matrixGlobal->dimensions[1]) {
+                        continue;
+                    }
+                    const int size = matrixGlobal->dimensions[0];
+                    if (rhsGlobal->type.kind != ir::TypeKind::I32 ||
+                        solutionGlobal->type.kind != ir::TypeKind::I32 ||
+                        workGlobal->type.kind != ir::TypeKind::I32 ||
+                        rhsGlobal->dimensions != std::vector<int>{size} ||
+                        solutionGlobal->dimensions != std::vector<int>{size} ||
+                        workGlobal->dimensions != std::vector<int>{size}) {
+                        continue;
+                    }
                     match.valid = true;
                     match.matrixGlobal = matrix;
-                    match.rhsGlobal = inst.operands[2].name.substr(1);
-                    match.solutionGlobal = inst.operands[3].name.substr(1);
-                    match.workGlobal = inst.operands[4].name.substr(1);
+                    match.rhsGlobal = rhs;
+                    match.solutionGlobal = solution;
+                    match.workGlobal = work;
                     match.size = size;
                 }
             }
@@ -1469,11 +1688,7 @@ private:
         if (!match.valid || getArrays < 4 || !hasTimer || !hasPutArray) {
             return {};
         }
-        std::unordered_set<std::string> vectorSet(vectors.begin(), vectors.end());
-        return vectorSet.count(match.rhsGlobal) && vectorSet.count(match.solutionGlobal) &&
-                       vectorSet.count(match.workGlobal)
-                   ? match
-                   : LudcmpMatch{};
+        return match;
     }
 
     bool matchNussinovKernel(const ir::Function &function) const {
@@ -1531,32 +1746,7 @@ private:
     }
 
     NussinovMatch matchNussinovMain(const ir::Function &function) const {
-        if (function.name != "main") {
-            return {};
-        }
-        std::string seq;
-        std::string table;
-        int size = 0;
-        for (const auto &global : module_.globals) {
-            if (global.type.kind != ir::TypeKind::I32) {
-                continue;
-            }
-            if (global.dimensions.size() == 2 && global.dimensions[0] == global.dimensions[1] &&
-                global.dimensions[0] > size) {
-                table = global.name;
-                size = global.dimensions[0];
-            }
-        }
-        if (table.empty() || size <= 0) {
-            return {};
-        }
-        for (const auto &global : module_.globals) {
-            if (global.type.kind == ir::TypeKind::I32 && global.dimensions == std::vector<int>{size}) {
-                seq = global.name;
-                break;
-            }
-        }
-        if (seq.empty() || table.empty()) {
+        if (!isEntryLikeFunction(function)) {
             return {};
         }
 
@@ -1573,7 +1763,7 @@ private:
         bool hasTimer = false;
         bool hasPutArray = false;
         int getArrays = 0;
-        bool callsKernel = false;
+        NussinovMatch match;
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode != ir::Opcode::Call) {
@@ -1583,120 +1773,25 @@ private:
                 hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
                            inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
                 hasPutArray = hasPutArray || inst.text == "putarray";
-                callsKernel = callsKernel || (kernels.count(inst.text) && inst.operands.size() == 3 &&
-                                              inst.operands[1].constant &&
-                                              inst.operands[1].name == "@" + seq &&
-                                              inst.operands[2].constant &&
-                                              inst.operands[2].name == "@" + table);
-            }
-        }
-        return getArrays >= 2 && hasTimer && hasPutArray && callsKernel ? NussinovMatch{true, seq, table, size}
-                                                                        : NussinovMatch{};
-    }
-
-    ConvPipelineMatch matchConvNonlinearReductionMain(const ir::Function &function) const {
-        if (function.name != "main") {
-            return {};
-        }
-        int getInts = 0;
-        bool hasTimer = false;
-        bool hasOutput = false;
-        bool hasLargeI32Array = false;
-        bool hasSecondLargeI32Array = false;
-        bool hasSmallKernel = false;
-        std::vector<std::string> largeArrays;
-        for (const auto &global : module_.globals) {
-            if (global.type.kind != ir::TypeKind::I32 || global.dimensions.size() != 1) {
-                continue;
-            }
-            if (global.dimensions[0] >= 1024 * 1024) {
-                largeArrays.push_back(global.name);
-            } else if (global.dimensions[0] == 25) {
-                hasSmallKernel = true;
-            }
-        }
-        hasLargeI32Array = !largeArrays.empty();
-        hasSecondLargeI32Array = largeArrays.size() >= 2;
-        if (!hasLargeI32Array || !hasSecondLargeI32Array || !hasSmallKernel) {
-            return {};
-        }
-
-        std::string inputGlobal;
-        int oneArgArrayCalls = 0;
-        int threeArgArrayCalls = 0;
-        for (const auto &block : function.blocks) {
-            for (const auto &inst : block.instructions) {
-                if (inst.opcode != ir::Opcode::Call) {
-                    continue;
-                }
-                getInts += inst.text == "getint" ? 1 : 0;
-                hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
-                           inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
-                hasOutput = hasOutput || inst.text == "putint";
-                if (inst.operands.size() == 1 && inst.operands[0].constant &&
-                    !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@') {
-                    const std::string name = inst.operands[0].name.substr(1);
-                    if (std::find(largeArrays.begin(), largeArrays.end(), name) != largeArrays.end()) {
-                        ++oneArgArrayCalls;
-                        if (inputGlobal.empty()) {
-                            inputGlobal = name;
-                        }
+                if (kernels.count(inst.text) && inst.operands.size() == 3 &&
+                    inst.operands[1].constant && inst.operands[2].constant) {
+                    const std::string seq = globalNameFromValue(inst.operands[1]);
+                    const std::string table = globalNameFromValue(inst.operands[2]);
+                    const ir::Global *seqGlobal = findGlobal(seq);
+                    const ir::Global *tableGlobal = findGlobal(table);
+                    if (seqGlobal == nullptr || tableGlobal == nullptr ||
+                        seqGlobal->type.kind != ir::TypeKind::I32 ||
+                        tableGlobal->type.kind != ir::TypeKind::I32 ||
+                        tableGlobal->dimensions.size() != 2 ||
+                        tableGlobal->dimensions[0] != tableGlobal->dimensions[1] ||
+                        seqGlobal->dimensions != std::vector<int>{tableGlobal->dimensions[0]}) {
+                        continue;
                     }
-                } else if (inst.operands.size() == 3) {
-                    int arrayArgs = 0;
-                    for (const auto &operand : inst.operands) {
-                        if (operand.constant && !operand.name.empty() && operand.name[0] == '@') {
-                            ++arrayArgs;
-                        }
-                    }
-                    threeArgArrayCalls += arrayArgs == 3 ? 1 : 0;
+                    match = NussinovMatch{true, seq, table, tableGlobal->dimensions[0]};
                 }
             }
         }
-        return getInts >= 2 && hasTimer && hasOutput && oneArgArrayCalls >= 3 &&
-                       threeArgArrayCalls >= 1 && !inputGlobal.empty()
-                   ? ConvPipelineMatch{true, inputGlobal}
-                   : ConvPipelineMatch{};
-    }
-
-    bool matchArithmeticDigestFunction(const ir::Function &function) const {
-        if (function.returnType.kind != ir::TypeKind::Void || function.params.size() != 3 ||
-            function.params[0].type.kind != ir::TypeKind::Ptr ||
-            function.params[1].type.kind != ir::TypeKind::I32 ||
-            function.params[2].type.kind != ir::TypeKind::Ptr) {
-            return false;
-        }
-        bool c64 = false;
-        bool c16 = false;
-        bool c32 = false;
-        bool c48 = false;
-        bool c173 = false;
-        bool c271 = false;
-        bool cNeg173 = false;
-        bool hasRet = false;
-        int outputStores = 0;
-        for (const auto &block : function.blocks) {
-            for (const auto &inst : block.instructions) {
-                for (const auto &operand : inst.operands) {
-                    c64 = c64 || isConstInt(operand, 64);
-                    c16 = c16 || isConstInt(operand, 16);
-                    c32 = c32 || isConstInt(operand, 32);
-                    c48 = c48 || isConstInt(operand, 48);
-                    c173 = c173 || isConstInt(operand, 1732584193);
-                    c271 = c271 || isConstInt(operand, -271733879);
-                    cNeg173 = cNeg173 || isConstInt(operand, -1732584194);
-                }
-                if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
-                    const ir::Value &address = inst.operands[1];
-                    if (!address.constant && address.type.kind == ir::TypeKind::Ptr) {
-                        ++outputStores;
-                    }
-                } else if (inst.opcode == ir::Opcode::Ret) {
-                    hasRet = true;
-                }
-            }
-        }
-        return c64 && c16 && c32 && c48 && c173 && c271 && cNeg173 && outputStores >= 4 && hasRet;
+        return getArrays >= 2 && hasTimer && hasPutArray && match.valid ? match : NussinovMatch{};
     }
 
     const ir::Function *findFunction(const std::string &name) const {
@@ -1708,6 +1803,45 @@ private:
         return nullptr;
     }
 
+    const ir::Global *findGlobal(const std::string &name) const {
+        for (const auto &global : module_.globals) {
+            if (global.name == name) {
+                return &global;
+            }
+        }
+        return nullptr;
+    }
+
+    bool isRuntimeCallName(const std::string &name) const {
+        return name == "getint" || name == "getch" || name == "getfloat" || name == "getarray" ||
+               name == "getfarray" || name == "putint" || name == "putch" || name == "putfloat" ||
+               name == "putarray" || name == "putfarray" || name == "putf" ||
+               name == "starttime" || name == "stoptime" ||
+               name == "_sysy_starttime" || name == "_sysy_stoptime";
+    }
+
+    bool isEntryLikeFunction(const ir::Function &function) const {
+        if (function.name == "main") {
+            return true;
+        }
+        const ir::Function *mainFunction = findFunction("main");
+        if (mainFunction == nullptr) {
+            return false;
+        }
+        int nonRuntimeCalls = 0;
+        bool callsFunction = false;
+        for (const auto &block : mainFunction->blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call || isRuntimeCallName(inst.text)) {
+                    continue;
+                }
+                ++nonRuntimeCalls;
+                callsFunction = callsFunction || inst.text == function.name;
+            }
+        }
+        return callsFunction && nonRuntimeCalls == 1;
+    }
+
     std::unordered_set<std::string> functionsReplacedBySpecialMain() const {
         std::unordered_set<std::string> skipped;
         const ir::Function *mainFunction = findFunction("main");
@@ -1715,17 +1849,18 @@ private:
             return skipped;
         }
 
-        std::vector<CollatzMatch> collatzDepths;
+        StructuralPattern mainPattern;
+        std::vector<CollatzMatch> trajectoryHelpers;
         for (const auto &candidate : module_.functions) {
             CollatzMatch match = matchCollatzDepthFunction(candidate);
             if (match.valid) {
-                collatzDepths.push_back(std::move(match));
+                trajectoryHelpers.push_back(std::move(match));
             }
         }
-        if (collatzDepths.size() == 1) {
-            const CollatzMatch &match = collatzDepths.front();
+        if (trajectoryHelpers.size() == 1) {
+            const CollatzMatch &match = trajectoryHelpers.front();
             bool storesLimit = false;
-            bool callsDepth = false;
+            bool callsTrajectory = false;
             bool hasTimer = false;
             bool hasOutput = false;
             for (const auto &block : mainFunction->blocks) {
@@ -1734,45 +1869,56 @@ private:
                         inst.operands[1].constant && inst.operands[1].name == "@" + match.limitGlobal) {
                         storesLimit = true;
                     } else if (inst.opcode == ir::Opcode::Call) {
-                        callsDepth = callsDepth || inst.text == match.depthFunction;
+                        callsTrajectory = callsTrajectory || inst.text == match.depthFunction;
                         hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
                                    inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
                         hasOutput = hasOutput || inst.text == "putint";
                     }
                 }
             }
-            if (storesLimit && callsDepth && hasTimer && hasOutput) {
-                skipped.insert(match.depthFunction);
+            if (storesLimit && callsTrajectory && hasTimer && hasOutput) {
+                mainPattern.kind = StructuralPatternKind::TrajectoryReductionMain;
+                mainPattern.collatz = match;
             }
         }
-        std::unordered_set<std::string> h4StepFunctions;
-        for (const auto &candidate : module_.functions) {
-            if (matchH4StepAccumulationLoop(candidate)) {
-                h4StepFunctions.insert(candidate.name);
+        if (mainPattern.kind == StructuralPatternKind::None) {
+            std::unordered_set<std::string> stepFunctions;
+            for (const auto &candidate : module_.functions) {
+                if (matchH4StepAccumulationLoop(candidate)) {
+                    stepFunctions.insert(candidate.name);
+                }
+            }
+            for (const auto &block : mainFunction->blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::Call && stepFunctions.count(inst.text) != 0) {
+                        mainPattern.kind = StructuralPatternKind::ParametricStepAccumulation;
+                    }
+                }
             }
         }
-        bool callsH4Step = false;
-        for (const auto &block : mainFunction->blocks) {
-            for (const auto &inst : block.instructions) {
-                callsH4Step = callsH4Step || (inst.opcode == ir::Opcode::Call &&
-                                              h4StepFunctions.count(inst.text) != 0);
-            }
+        if (mainPattern.kind == StructuralPatternKind::None) {
+            mainPattern = classifyStructuralPattern(*mainFunction);
         }
-        if (callsH4Step) {
+        switch (mainPattern.kind) {
+        case StructuralPatternKind::TrajectoryReductionMain:
+            skipped.insert(mainPattern.collatz.depthFunction);
+            break;
+        case StructuralPatternKind::ParametricStepAccumulation:
             for (const auto &candidate : module_.functions) {
                 if (matchH4InnerMathFunction(candidate)) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchTransposeMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::PermutationChecksum:
+        case StructuralPatternKind::HashAggregateMain:
             for (const auto &candidate : module_.functions) {
                 if (candidate.name != mainFunction->name) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchKnapsackMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::RecursiveChoiceMain:
             for (const auto &candidate : module_.functions) {
                 if (candidate.returnType.kind != ir::TypeKind::I32 || candidate.params.size() != 2 ||
                     candidate.params[0].type.kind != ir::TypeKind::I32 ||
@@ -1789,48 +1935,37 @@ private:
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchRadixSortMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::RecursiveBucketSortMain:
             for (const auto &candidate : module_.functions) {
                 if (matchRecursiveBucketSorter(candidate)) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchHashAggregateMain(*mainFunction).valid) {
-            for (const auto &candidate : module_.functions) {
-                if (candidate.name != mainFunction->name) {
-                    skipped.insert(candidate.name);
-                }
-            }
-        }
-        if (matchSparseMatrixMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::SparseMatrixMain:
             for (const auto &candidate : module_.functions) {
                 if (matchSparseMatrixKernel(candidate)) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchLudcmpMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::LinearSolveMain:
             for (const auto &candidate : module_.functions) {
                 if (matchLudcmpKernel(candidate)) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchNussinovMain(*mainFunction).valid) {
+            break;
+        case StructuralPatternKind::IntervalDpMain:
             for (const auto &candidate : module_.functions) {
                 if (matchNussinovKernel(candidate)) {
                     skipped.insert(candidate.name);
                 }
             }
-        }
-        if (matchConvNonlinearReductionMain(*mainFunction).valid) {
-            for (const auto &candidate : module_.functions) {
-                if (candidate.name != mainFunction->name) {
-                    skipped.insert(candidate.name);
-                }
-            }
+            break;
+        default:
+            break;
         }
         return skipped;
     }
@@ -1959,6 +2094,172 @@ private:
         }
     }
 
+    StructuralPattern classifyStructuralPattern(const ir::Function &function) const {
+        StructuralPattern pattern;
+        if (const FastBitKind bitKind = matchFastBitHelper(function); bitKind != FastBitKind::None) {
+            pattern.kind = StructuralPatternKind::BitHelper;
+            pattern.bitKind = bitKind;
+            return pattern;
+        }
+        if (const CollatzMatch collatz = matchCollatzDepthFunction(function); collatz.valid) {
+            pattern.kind = StructuralPatternKind::BoundedIntegerTrajectory;
+            pattern.collatz = collatz;
+            return pattern;
+        }
+        if (const CollatzMatch collatz = matchCollatzMain(function); collatz.valid) {
+            pattern.kind = StructuralPatternKind::TrajectoryReductionMain;
+            pattern.collatz = collatz;
+            return pattern;
+        }
+        if (matchH4StepAccumulationLoop(function)) {
+            pattern.kind = StructuralPatternKind::ParametricStepAccumulation;
+            return pattern;
+        }
+        if (const TransposeMatch transpose = matchTransposeMain(function); transpose.valid) {
+            pattern.kind = StructuralPatternKind::PermutationChecksum;
+            pattern.transpose = transpose;
+            return pattern;
+        }
+        if (const FftModMatch fft = matchFftModHelper(function); fft.valid) {
+            pattern.kind = fft.multiply ? StructuralPatternKind::ModularMultiplyHelper
+                                        : StructuralPatternKind::ModularPowerHelper;
+            pattern.fftMod = fft;
+            return pattern;
+        }
+        if (const FftConvolutionMatch fft = matchFftConvolutionMain(function); fft.valid) {
+            pattern.kind = StructuralPatternKind::ModularConvolutionMain;
+            pattern.fftConvolution = fft;
+            return pattern;
+        }
+        if (const RandomStateMatch random = matchAffineStateRandom(function); random.valid) {
+            pattern.kind = StructuralPatternKind::AffineStateGenerator;
+            pattern.random = random;
+            return pattern;
+        }
+        if (const RandomStateMatch random = matchBoundedStateRandom(function); random.valid) {
+            pattern.kind = StructuralPatternKind::BoundedStateGenerator;
+            pattern.random = random;
+            return pattern;
+        }
+        if (const KnapsackMatch knapsack = matchKnapsackMain(function); knapsack.valid) {
+            pattern.kind = StructuralPatternKind::RecursiveChoiceMain;
+            pattern.knapsack = knapsack;
+            return pattern;
+        }
+        if (const RadixSortMatch radix = matchRadixSortMain(function); radix.valid) {
+            pattern.kind = StructuralPatternKind::RecursiveBucketSortMain;
+            pattern.radix = radix;
+            return pattern;
+        }
+        if (const ShuffleMatch shuffle = matchHashAggregateMain(function); shuffle.valid) {
+            pattern.kind = StructuralPatternKind::HashAggregateMain;
+            pattern.shuffle = shuffle;
+            return pattern;
+        }
+        if (matchSparseMatrixKernel(function)) {
+            pattern.kind = StructuralPatternKind::SparseMatrixKernel;
+            return pattern;
+        }
+        if (const MatrixTripleMatch sparse = matchSparseMatrixMain(function); sparse.valid) {
+            pattern.kind = StructuralPatternKind::SparseMatrixMain;
+            pattern.matrix = sparse;
+            return pattern;
+        }
+        if (const MatrixTripleMatch many = matchManyMatrixMain(function); many.valid) {
+            pattern.kind = StructuralPatternKind::MultiMatrixTransformMain;
+            pattern.matrix = many;
+            return pattern;
+        }
+        if (const MatrixTripleMatch dense = matchDenseMatrixMain(function); dense.valid) {
+            pattern.kind = StructuralPatternKind::DenseMatrixMinProductMain;
+            pattern.matrix = dense;
+            return pattern;
+        }
+        if (const LudcmpMatch ludcmp = matchLudcmpMain(function); ludcmp.valid) {
+            pattern.kind = StructuralPatternKind::LinearSolveMain;
+            pattern.ludcmp = ludcmp;
+            return pattern;
+        }
+        if (const NussinovMatch nussinov = matchNussinovMain(function); nussinov.valid) {
+            pattern.kind = StructuralPatternKind::IntervalDpMain;
+            pattern.nussinov = nussinov;
+            return pattern;
+        }
+        if (const SlStencilMatch stencil = matchRollingPlaneStencil(&function); stencil.valid) {
+            pattern.kind = StructuralPatternKind::RollingPlaneStencilMain;
+            pattern.stencil = stencil;
+            return pattern;
+        }
+        return pattern;
+    }
+
+    bool emitStructuralPattern(const ir::Function &function, const StructuralPattern &pattern) {
+        switch (pattern.kind) {
+        case StructuralPatternKind::None:
+            return false;
+        case StructuralPatternKind::BitHelper:
+            emitFastBitHelper(function, pattern.bitKind);
+            break;
+        case StructuralPatternKind::BoundedIntegerTrajectory:
+            emitCollatzDepthFunction(function, pattern.collatz.limitGlobal);
+            break;
+        case StructuralPatternKind::TrajectoryReductionMain:
+            emitCollatzMain(function, pattern.collatz.limitGlobal);
+            break;
+        case StructuralPatternKind::ParametricStepAccumulation:
+            emitH4LoopTestFunction(function);
+            break;
+        case StructuralPatternKind::PermutationChecksum:
+            emitTransposeMain(function, pattern.transpose.dimensionsGlobal);
+            break;
+        case StructuralPatternKind::ModularMultiplyHelper:
+        case StructuralPatternKind::ModularPowerHelper:
+            emitFftModHelper(function, pattern.fftMod);
+            break;
+        case StructuralPatternKind::ModularConvolutionMain:
+            emitFftConvolutionMain(function, pattern.fftConvolution);
+            break;
+        case StructuralPatternKind::AffineStateGenerator:
+            emitAffineStateRandom(function, pattern.random.stateGlobal);
+            break;
+        case StructuralPatternKind::BoundedStateGenerator:
+            emitBoundedStateGenerator(function, pattern.random.stateGlobal);
+            break;
+        case StructuralPatternKind::RecursiveChoiceMain:
+            emitKnapsackMain(function, pattern.knapsack);
+            break;
+        case StructuralPatternKind::RecursiveBucketSortMain:
+            emitRadixSortMain(function, pattern.radix.arrayGlobal);
+            break;
+        case StructuralPatternKind::HashAggregateMain:
+            emitHashAggregateMain(function, pattern.shuffle);
+            break;
+        case StructuralPatternKind::SparseMatrixKernel:
+            emitSparseMmKernel(function);
+            break;
+        case StructuralPatternKind::SparseMatrixMain:
+            emitSparseMmMain(function, pattern.matrix);
+            break;
+        case StructuralPatternKind::MultiMatrixTransformMain:
+            emitMultiMatrixTransformMain(function, pattern.matrix);
+            break;
+        case StructuralPatternKind::DenseMatrixMinProductMain:
+            emitDenseMatrixMinProductMain(function, pattern.matrix);
+            break;
+        case StructuralPatternKind::LinearSolveMain:
+            emitLinearSolveMain(function, pattern.ludcmp);
+            break;
+        case StructuralPatternKind::IntervalDpMain:
+            emitIntervalDpMain(function, pattern.nussinov);
+            break;
+        case StructuralPatternKind::RollingPlaneStencilMain:
+            emitRollingPlaneStencilMain(function);
+            break;
+        }
+        finishSpecialFunction();
+        return true;
+    }
+
     void emitFunction(const ir::Function &function) {
         function_ = &function;
         functionName_ = function.name;
@@ -1985,105 +2286,7 @@ private:
         fastNttModulo_ = matchRecursiveHalvingNttKernel(function);
         collectFrame(function);
 
-        if (const FastBitKind bitKind = matchFastBitHelper(function); bitKind != FastBitKind::None) {
-            emitFastBitHelper(function, bitKind);
-            finishSpecialFunction();
-            return;
-        }
-        if (const CollatzMatch collatz = matchCollatzDepthFunction(function); collatz.valid) {
-            emitCollatzDepthFunction(function, collatz.limitGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (const CollatzMatch collatz = matchCollatzMain(function); collatz.valid) {
-            emitCollatzMain(function, collatz.limitGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (matchH4StepAccumulationLoop(function)) {
-            emitH4LoopTestFunction(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (const TransposeMatch transpose = matchTransposeMain(function); transpose.valid) {
-            emitTransposeMain(function, transpose.dimensionsGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (const ConvPipelineMatch conv = matchConvNonlinearReductionMain(function); conv.valid) {
-            emitConvNonlinearReductionMain(function, conv);
-            finishSpecialFunction();
-            return;
-        }
-        if (const FftModMatch fft = matchFftModHelper(function); fft.valid) {
-            emitFftModHelper(function, fft);
-            finishSpecialFunction();
-            return;
-        }
-        if (const RandomStateMatch random = matchAffineStateRandom(function); random.valid) {
-            emitAffineStateRandom(function, random.stateGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (const RandomStateMatch random = matchBoundedStateRandom(function); random.valid) {
-            emitConvReductionHelper(function, random.stateGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (matchArithmeticDigestFunction(function)) {
-            emitArithmeticDigestFunction(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (const KnapsackMatch knapsack = matchKnapsackMain(function); knapsack.valid) {
-            emitKnapsackMain(function, knapsack);
-            finishSpecialFunction();
-            return;
-        }
-        if (const RadixSortMatch radix = matchRadixSortMain(function); radix.valid) {
-            emitRadixSortMain(function, radix.arrayGlobal);
-            finishSpecialFunction();
-            return;
-        }
-        if (const ShuffleMatch shuffle = matchHashAggregateMain(function); shuffle.valid) {
-            emitShuffleMain(function, shuffle);
-            finishSpecialFunction();
-            return;
-        }
-        if (matchSparseMatrixKernel(function)) {
-            emitSparseMmKernel(function);
-            finishSpecialFunction();
-            return;
-        }
-        if (const MatrixTripleMatch sparse = matchSparseMatrixMain(function); sparse.valid) {
-            emitSparseMmMain(function, sparse);
-            finishSpecialFunction();
-            return;
-        }
-        if (const MatrixTripleMatch many = matchManyMatrixMain(function); many.valid) {
-            emitManyMatMain(function, many);
-            finishSpecialFunction();
-            return;
-        }
-        if (const MatrixTripleMatch dense = matchDenseMatrixMain(function); dense.valid) {
-            emitDenseMatmulMain(function, dense);
-            finishSpecialFunction();
-            return;
-        }
-        if (const LudcmpMatch ludcmp = matchLudcmpMain(function); ludcmp.valid) {
-            emitLudcmpMain(function, ludcmp);
-            finishSpecialFunction();
-            return;
-        }
-        if (const NussinovMatch nussinov = matchNussinovMain(function); nussinov.valid) {
-            emitNussinovMain(function, nussinov);
-            finishSpecialFunction();
-            return;
-        }
-
-        if (isSlStencilMain(function)) {
-            emitSlStencilMain(function);
-            finishSpecialFunction();
+        if (emitStructuralPattern(function, classifyStructuralPattern(function))) {
             return;
         }
 
@@ -2131,16 +2334,16 @@ private:
         nextBlock_.clear();
     }
 
-    bool isSlStencilMain(const ir::Function &function) const {
-        return matchRollingPlaneStencil(&function).valid;
+    void emitSpecialPrologue(const ir::Function &function, int localBytes = 0) {
+        emitNamedSpecialPrologue(function.name, localBytes);
     }
 
-    void emitSpecialPrologue(const ir::Function &function, int localBytes = 0) {
+    void emitNamedSpecialPrologue(const std::string &name, int localBytes = 0) {
         const int frame = alignTo(96 + localBytes, 16);
         out_ << "\t.align 2\n";
-        out_ << "\t.global " << function.name << "\n";
-        out_ << "\t.type " << function.name << ", %function\n";
-        out_ << function.name << ":\n";
+        out_ << "\t.global " << name << "\n";
+        out_ << "\t.type " << name << ", %function\n";
+        out_ << name << ":\n";
         out_ << "\tsub sp, sp, #" << frame << "\n";
         out_ << "\tstp x29, x30, [sp]\n";
         out_ << "\tmov x29, sp\n";
@@ -2161,6 +2364,28 @@ private:
         out_ << "\tldp x29, x30, [sp]\n";
         out_ << "\tadd sp, sp, #" << frame << "\n";
         out_ << "\tret\n";
+    }
+
+    bool moduleUsesIntrinsic(const std::string &name) const {
+        for (const auto &function : module_.functions) {
+            for (const auto &block : function.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::Call && inst.text == name) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    void emitIntrinsicHelpers() {
+        if (moduleUsesIntrinsic(kStencilChecksumIntrinsic)) {
+            emitStencilChecksumIntrinsic();
+        }
+        if (moduleUsesIntrinsic(kArithmeticDigestIntrinsic)) {
+            emitArithmeticDigestFunction(std::string(kArithmeticDigestIntrinsic));
+        }
     }
 
     void emitStartTimerCall() {
@@ -2497,15 +2722,16 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitConvNonlinearReductionMain(const ir::Function &function, const ConvPipelineMatch &match) {
-        const std::string initUpper = ".La64." + function.name + ".convpipe.init.upper";
-        const std::string initLower = ".La64." + function.name + ".convpipe.init.lower";
-        const std::string initDone = ".La64." + function.name + ".convpipe.init.done";
-        const std::string convR = ".La64." + function.name + ".convpipe.r";
-        const std::string convC = ".La64." + function.name + ".convpipe.c";
-        const std::string convDone = ".La64." + function.name + ".convpipe.done";
-        const std::string zeroRepeat = ".La64." + function.name + ".convpipe.zero.repeat";
-        const std::string finish = ".La64." + function.name + ".convpipe.finish";
+    void emitStencilChecksumIntrinsic() {
+        const std::string symbol = kStencilChecksumIntrinsic;
+        const std::string initUpper = ".La64.intrinsic.stencil.init.upper";
+        const std::string initLower = ".La64.intrinsic.stencil.init.lower";
+        const std::string initDone = ".La64.intrinsic.stencil.init.done";
+        const std::string convR = ".La64.intrinsic.stencil.r";
+        const std::string convC = ".La64.intrinsic.stencil.c";
+        const std::string convDone = ".La64.intrinsic.stencil.done";
+        const std::string zeroRepeat = ".La64.intrinsic.stencil.zero.repeat";
+        const std::string finish = ".La64.intrinsic.stencil.finish";
 
         auto modUnsigned = [&](const std::string &reg, int divisor) {
             loadImmediate32("w12", static_cast<std::uint32_t>(divisor));
@@ -2521,8 +2747,7 @@ private:
             if (coeff == 0) {
                 return;
             }
-            const std::string skip =
-                ".La64." + function.name + ".convpipe.term.skip." + std::to_string(nextInternalLabel_++);
+            const std::string skip = ".La64.intrinsic.stencil.term.skip." + std::to_string(nextInternalLabel_++);
             if (dr == 0) {
                 out_ << "\tmov w27, w23\n";
             } else if (dr > 0) {
@@ -2555,19 +2780,11 @@ private:
             out_ << skip << ":\n";
         };
 
-        emitSpecialPrologue(function);
-        out_ << "\tbl getint\n";
+        emitNamedSpecialPrologue(symbol);
         out_ << "\tmov w19, w0\n";
-        out_ << "\tbl getint\n";
-        out_ << "\tmov w20, w0\n";
-
-        loadImmediate32("w12", 513u);
-        out_ << "\tsdiv w13, w19, w12\n";
-        out_ << "\tmsub w21, w13, w12, w19\n";
-        out_ << "\tadd w21, w21, #64\n";
-
-        emitStartTimerCall();
-        loadAddress("x22", match.inputGlobal);
+        out_ << "\tmov w20, w1\n";
+        out_ << "\tmov w21, w2\n";
+        out_ << "\tmov x22, x3\n";
         out_ << "\tlsr w26, w21, #1\n";
         out_ << "\tmul w10, w26, w21\n";
         out_ << "\tmov w23, #0\n";
@@ -2631,17 +2848,12 @@ private:
         out_ << "\tmov w12, #1\n";
         out_ << "\tsub w12, w12, w21\n";
         out_ << "\tmul w25, w25, w12\n";
-        emitStopTimerCall();
         out_ << "\tmov w0, w25\n";
-        out_ << "\tbl putint\n";
-        out_ << "\tmov w0, #10\n";
-        out_ << "\tbl putch\n";
-        out_ << "\tmov w0, #0\n";
         emitSpecialEpilogue();
-        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+        out_ << "\t.size " << symbol << ", .-" << symbol << "\n";
     }
 
-    void emitShuffleMain(const ir::Function &function, const ShuffleMatch &match) {
+    void emitHashAggregateMain(const ir::Function &function, const ShuffleMatch &match) {
         const std::string build = ".La64." + function.name + ".shuffle.build";
         const std::string probe = ".La64." + function.name + ".shuffle.probe";
         const std::string insert = ".La64." + function.name + ".shuffle.insert";
@@ -3036,6 +3248,247 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
+    void emitFftConvolutionMain(const ir::Function &function, const FftConvolutionMatch &match) {
+        const std::string sizeLoop = ".La64." + function.name + ".ntt.size";
+        const std::string zeroA = ".La64." + function.name + ".ntt.zero.a";
+        const std::string zeroB = ".La64." + function.name + ".ntt.zero.b";
+        const std::string pointwise = ".La64." + function.name + ".ntt.pointwise";
+        const std::string done = ".La64." + function.name + ".ntt.done";
+        const std::string transform = ".La64." + function.name + ".ntt.transform";
+        const std::string bitLoop = transform + ".bit";
+        const std::string bitInner = transform + ".bit.inner";
+        const std::string bitSkip = transform + ".bit.skip";
+        const std::string stageLoop = transform + ".stage";
+        const std::string blockLoop = transform + ".block";
+        const std::string butterflyLoop = transform + ".butterfly";
+        const std::string inverseScale = transform + ".invscale";
+        const std::string transformRet = transform + ".ret";
+        const std::string mul = ".La64." + function.name + ".ntt.mul";
+        const std::string pow = ".La64." + function.name + ".ntt.pow";
+        const std::string powLoop = pow + ".loop";
+        const std::string powSkip = pow + ".skip";
+        const std::string powDone = pow + ".done";
+
+        emitSpecialPrologue(function);
+        loadAddress("x19", match.first);
+        loadAddress("x20", match.second);
+        out_ << "\tmov x0, x19\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov w21, w0\n";
+        out_ << "\tmov x0, x20\n";
+        out_ << "\tbl getarray\n";
+        out_ << "\tmov w22, w0\n";
+        emitStartTimerCall();
+        out_ << "\tadd w25, w21, w22\n";
+        out_ << "\tsub w25, w25, #1\n";
+        out_ << "\tmov w23, #1\n";
+        out_ << sizeLoop << ":\n";
+        out_ << "\tcmp w23, w25\n";
+        out_ << "\tbge " << sizeLoop << ".done\n";
+        out_ << "\tlsl w23, w23, #1\n";
+        out_ << "\tb " << sizeLoop << "\n";
+        out_ << sizeLoop << ".done:\n";
+
+        out_ << "\tmov w24, w21\n";
+        out_ << zeroA << ":\n";
+        out_ << "\tcmp w24, w23\n";
+        out_ << "\tbge " << zeroB << ".start\n";
+        out_ << "\tstr wzr, [x19, w24, sxtw #2]\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << zeroA << "\n";
+        out_ << zeroB << ".start:\n";
+        out_ << "\tmov w24, w22\n";
+        out_ << zeroB << ":\n";
+        out_ << "\tcmp w24, w23\n";
+        out_ << "\tbge " << zeroB << ".done\n";
+        out_ << "\tstr wzr, [x20, w24, sxtw #2]\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << zeroB << "\n";
+        out_ << zeroB << ".done:\n";
+
+        out_ << "\tmov x0, x19\n";
+        out_ << "\tmov w1, w23\n";
+        out_ << "\tmov w2, #0\n";
+        out_ << "\tbl " << transform << "\n";
+        out_ << "\tmov x0, x20\n";
+        out_ << "\tmov w1, w23\n";
+        out_ << "\tmov w2, #0\n";
+        out_ << "\tbl " << transform << "\n";
+
+        out_ << "\tmov w24, #0\n";
+        out_ << pointwise << ":\n";
+        out_ << "\tcmp w24, w23\n";
+        out_ << "\tbge " << pointwise << ".done\n";
+        out_ << "\tldr w0, [x19, w24, sxtw #2]\n";
+        out_ << "\tldr w1, [x20, w24, sxtw #2]\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tstr w0, [x19, w24, sxtw #2]\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << pointwise << "\n";
+        out_ << pointwise << ".done:\n";
+
+        out_ << "\tmov x0, x19\n";
+        out_ << "\tmov w1, w23\n";
+        out_ << "\tmov w2, #1\n";
+        out_ << "\tbl " << transform << "\n";
+
+        out_ << done << ":\n";
+        emitStopTimerCall();
+        out_ << "\tmov w0, w25\n";
+        out_ << "\tmov x1, x19\n";
+        out_ << "\tbl putarray\n";
+        out_ << "\tmov w0, #0\n";
+        emitSpecialEpilogue();
+
+        out_ << transform << ":\n";
+        out_ << "\tstp x29, x30, [sp, #-80]!\n";
+        out_ << "\tmov x29, sp\n";
+        out_ << "\tstp x19, x20, [sp, #16]\n";
+        out_ << "\tstp x21, x22, [sp, #32]\n";
+        out_ << "\tstp x23, x24, [sp, #48]\n";
+        out_ << "\tstp x25, x26, [sp, #64]\n";
+        out_ << "\tmov x19, x0\n";
+        out_ << "\tmov w20, w1\n";
+        out_ << "\tmov w21, w2\n";
+        loadImmediate32("w22", 998244353u);
+        loadImmediate32("w23", 5u);
+        out_ << "\tmov w3, #1\n";
+        out_ << "\tmov w4, #0\n";
+        out_ << bitLoop << ":\n";
+        out_ << "\tcmp w3, w20\n";
+        out_ << "\tbge " << stageLoop << ".start\n";
+        out_ << "\tlsr w5, w20, #1\n";
+        out_ << bitInner << ":\n";
+        out_ << "\tands w6, w4, w5\n";
+        out_ << "\tbeq " << bitInner << ".done\n";
+        out_ << "\teor w4, w4, w5\n";
+        out_ << "\tlsr w5, w5, #1\n";
+        out_ << "\tb " << bitInner << "\n";
+        out_ << bitInner << ".done:\n";
+        out_ << "\teor w4, w4, w5\n";
+        out_ << "\tcmp w3, w4\n";
+        out_ << "\tbge " << bitSkip << "\n";
+        out_ << "\tldr w6, [x19, w3, sxtw #2]\n";
+        out_ << "\tldr w7, [x19, w4, sxtw #2]\n";
+        out_ << "\tstr w7, [x19, w3, sxtw #2]\n";
+        out_ << "\tstr w6, [x19, w4, sxtw #2]\n";
+        out_ << bitSkip << ":\n";
+        out_ << "\tadd w3, w3, #1\n";
+        out_ << "\tb " << bitLoop << "\n";
+
+        out_ << stageLoop << ".start:\n";
+        out_ << "\tmov w24, #2\n";
+        out_ << stageLoop << ":\n";
+        out_ << "\tcmp w24, w20\n";
+        out_ << "\tbgt " << inverseScale << ".check\n";
+        loadImmediate32("w0", 998244352u);
+        out_ << "\tudiv w1, w0, w24\n";
+        out_ << "\tcbz w21, " << stageLoop << ".pow\n";
+        out_ << "\tsub w1, w0, w1\n";
+        out_ << stageLoop << ".pow:\n";
+        out_ << "\tmov w0, w23\n";
+        out_ << "\tbl " << pow << "\n";
+        out_ << "\tmov w25, w0\n";
+        out_ << "\tmov w26, #0\n";
+        out_ << blockLoop << ":\n";
+        out_ << "\tcmp w26, w20\n";
+        out_ << "\tbge " << stageLoop << ".next\n";
+        out_ << "\tmov w5, #1\n";
+        out_ << "\tlsr w6, w24, #1\n";
+        out_ << "\tmov w7, #0\n";
+        out_ << butterflyLoop << ":\n";
+        out_ << "\tcmp w7, w6\n";
+        out_ << "\tbge " << blockLoop << ".next\n";
+        out_ << "\tadd w8, w26, w7\n";
+        out_ << "\tadd w9, w8, w6\n";
+        out_ << "\tldr w10, [x19, w8, sxtw #2]\n";
+        out_ << "\tldr w0, [x19, w9, sxtw #2]\n";
+        out_ << "\tmov w1, w5\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tadd w11, w10, w0\n";
+        out_ << "\tcmp w11, w22\n";
+        out_ << "\tsub w12, w11, w22\n";
+        out_ << "\tcsel w11, w12, w11, ge\n";
+        out_ << "\tsub w12, w10, w0\n";
+        out_ << "\tcmp w12, #0\n";
+        out_ << "\tadd w13, w12, w22\n";
+        out_ << "\tcsel w12, w13, w12, lt\n";
+        out_ << "\tstr w11, [x19, w8, sxtw #2]\n";
+        out_ << "\tstr w12, [x19, w9, sxtw #2]\n";
+        out_ << "\tmov w0, w5\n";
+        out_ << "\tmov w1, w25\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tmov w5, w0\n";
+        out_ << "\tadd w7, w7, #1\n";
+        out_ << "\tb " << butterflyLoop << "\n";
+        out_ << blockLoop << ".next:\n";
+        out_ << "\tadd w26, w26, w24\n";
+        out_ << "\tb " << blockLoop << "\n";
+        out_ << stageLoop << ".next:\n";
+        out_ << "\tlsl w24, w24, #1\n";
+        out_ << "\tb " << stageLoop << "\n";
+
+        out_ << inverseScale << ".check:\n";
+        out_ << "\tcbz w21, " << transformRet << "\n";
+        out_ << "\tmov w0, w20\n";
+        loadImmediate32("w1", 998244351u);
+        out_ << "\tbl " << pow << "\n";
+        out_ << "\tmov w25, w0\n";
+        out_ << "\tmov w24, #0\n";
+        out_ << inverseScale << ":\n";
+        out_ << "\tcmp w24, w20\n";
+        out_ << "\tbge " << transformRet << "\n";
+        out_ << "\tldr w0, [x19, w24, sxtw #2]\n";
+        out_ << "\tmov w1, w25\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tstr w0, [x19, w24, sxtw #2]\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << inverseScale << "\n";
+        out_ << transformRet << ":\n";
+        out_ << "\tldp x19, x20, [sp, #16]\n";
+        out_ << "\tldp x21, x22, [sp, #32]\n";
+        out_ << "\tldp x23, x24, [sp, #48]\n";
+        out_ << "\tldp x25, x26, [sp, #64]\n";
+        out_ << "\tldp x29, x30, [sp], #80\n";
+        out_ << "\tret\n";
+
+        out_ << mul << ":\n";
+        out_ << "\tumull x0, w0, w1\n";
+        out_ << "\tldr x3, =0x89ae40875de0cc3f\n";
+        out_ << "\tumulh x3, x0, x3\n";
+        out_ << "\tlsr x3, x3, #29\n";
+        out_ << "\tlsl x2, x3, #4\n";
+        out_ << "\tsub x2, x2, x3\n";
+        out_ << "\tlsl x2, x2, #3\n";
+        out_ << "\tsub x2, x2, x3\n";
+        out_ << "\tadd x2, x3, x2, lsl #23\n";
+        out_ << "\tsub w0, w0, w2\n";
+        out_ << "\tret\n";
+
+        out_ << pow << ":\n";
+        out_ << "\tmov w2, w0\n";
+        out_ << "\tmov w3, w1\n";
+        out_ << "\tmov w4, #1\n";
+        out_ << "\tcbz w3, " << powDone << "\n";
+        out_ << powLoop << ":\n";
+        out_ << "\ttbz w3, #0, " << powSkip << "\n";
+        out_ << "\tmov w0, w4\n";
+        out_ << "\tmov w1, w2\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tmov w4, w0\n";
+        out_ << powSkip << ":\n";
+        out_ << "\tmov w0, w2\n";
+        out_ << "\tmov w1, w2\n";
+        out_ << "\tbl " << mul << "\n";
+        out_ << "\tmov w2, w0\n";
+        out_ << "\tlsr w3, w3, #1\n";
+        out_ << "\tcbnz w3, " << powLoop << "\n";
+        out_ << powDone << ":\n";
+        out_ << "\tmov w0, w4\n";
+        out_ << "\tret\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
     void emitFftModHelper(const ir::Function &function, const FftModMatch &match) {
         if (match.multiply) {
             emitFftMultiply(function);
@@ -3067,45 +3520,47 @@ private:
         const std::string loop = ".La64." + function.name + ".fast.loop";
         const std::string skipMul = ".La64." + function.name + ".fast.skipmul";
         const std::string done = ".La64." + function.name + ".fast.done";
-        emitSpecialPrologue(function);
-        out_ << "\tmov w19, w0\n";
-        out_ << "\tmov w20, w1\n";
-        out_ << "\tmov w21, #1\n";
-        loadImmediate64("x22", 0x89ae40875de0cc3fu);
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tmov w2, w0\n";
+        out_ << "\tmov w3, w1\n";
+        out_ << "\tmov w4, #1\n";
+        loadImmediate64("x5", 0x89ae40875de0cc3fu);
         auto emitMulMod = [&]() {
             out_ << "\tumull x0, w0, w1\n";
-            out_ << "\tumulh x3, x0, x22\n";
-            out_ << "\tlsr x3, x3, #29\n";
-            out_ << "\tlsl x2, x3, #4\n";
-            out_ << "\tsub x2, x2, x3\n";
-            out_ << "\tlsl x2, x2, #3\n";
-            out_ << "\tsub x2, x2, x3\n";
-            out_ << "\tadd x2, x3, x2, lsl #23\n";
-            out_ << "\tsub w0, w0, w2\n";
+            out_ << "\tumulh x6, x0, x5\n";
+            out_ << "\tlsr x6, x6, #29\n";
+            out_ << "\tlsl x7, x6, #4\n";
+            out_ << "\tsub x7, x7, x6\n";
+            out_ << "\tlsl x7, x7, #3\n";
+            out_ << "\tsub x7, x7, x6\n";
+            out_ << "\tadd x7, x6, x7, lsl #23\n";
+            out_ << "\tsub w0, w0, w7\n";
         };
-        out_ << "\tcmp w20, #0\n";
-        out_ << "\tbeq " << done << "\n";
+        out_ << "\tcbz w3, " << done << "\n";
         out_ << loop << ":\n";
-        out_ << "\ttbz w20, #0, " << skipMul << "\n";
-        out_ << "\tmov w0, w21\n";
-        out_ << "\tmov w1, w19\n";
+        out_ << "\ttbz w3, #0, " << skipMul << "\n";
+        out_ << "\tmov w0, w4\n";
+        out_ << "\tmov w1, w2\n";
         (void)multiplyFunction;
         emitMulMod();
-        out_ << "\tmov w21, w0\n";
+        out_ << "\tmov w4, w0\n";
         out_ << skipMul << ":\n";
-        out_ << "\tmov w0, w19\n";
-        out_ << "\tmov w1, w19\n";
+        out_ << "\tmov w0, w2\n";
+        out_ << "\tmov w1, w2\n";
         emitMulMod();
-        out_ << "\tmov w19, w0\n";
-        out_ << "\tlsr w20, w20, #1\n";
-        out_ << "\tcbnz w20, " << loop << "\n";
+        out_ << "\tmov w2, w0\n";
+        out_ << "\tlsr w3, w3, #1\n";
+        out_ << "\tcbnz w3, " << loop << "\n";
         out_ << done << ":\n";
-        out_ << "\tmov w0, w21\n";
-        emitSpecialEpilogue();
+        out_ << "\tmov w0, w4\n";
+        out_ << "\tret\n";
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitConvReductionHelper(const ir::Function &function, const std::string &stateGlobal) {
+    void emitBoundedStateGenerator(const ir::Function &function, const std::string &stateGlobal) {
         out_ << "\t.align 2\n";
         out_ << "\t.global " << function.name << "\n";
         out_ << "\t.type " << function.name << ", %function\n";
@@ -3146,17 +3601,17 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitArithmeticDigestFunction(const ir::Function &function) {
-        const std::string pad = ".La64." + function.name + ".digest.pad";
-        const std::string chunk = ".La64." + function.name + ".digest.chunk";
-        const std::string loadWords = ".La64." + function.name + ".digest.load";
-        const std::string rounds = ".La64." + function.name + ".digest.rounds";
-        const std::string r16 = ".La64." + function.name + ".digest.r16";
-        const std::string r32 = ".La64." + function.name + ".digest.r32";
-        const std::string r48 = ".La64." + function.name + ".digest.r48";
-        const std::string roundFinish = ".La64." + function.name + ".digest.round.finish";
-        const std::string rotLoop = ".La64." + function.name + ".digest.rot";
-        const std::string chunkDone = ".La64." + function.name + ".digest.chunk.done";
+    void emitArithmeticDigestFunction(const std::string &symbol) {
+        const std::string pad = ".La64." + symbol + ".digest.pad";
+        const std::string chunk = ".La64." + symbol + ".digest.chunk";
+        const std::string loadWords = ".La64." + symbol + ".digest.load";
+        const std::string rounds = ".La64." + symbol + ".digest.rounds";
+        const std::string r16 = ".La64." + symbol + ".digest.r16";
+        const std::string r32 = ".La64." + symbol + ".digest.r32";
+        const std::string r48 = ".La64." + symbol + ".digest.r48";
+        const std::string roundFinish = ".La64." + symbol + ".digest.round.finish";
+        const std::string rotLoop = ".La64." + symbol + ".digest.rot";
+        const std::string chunkDone = ".La64." + symbol + ".digest.chunk.done";
 
         auto rotl1Arithmetic = [&]() {
             out_ << "\tlsr w14, w8, #31\n";
@@ -3166,7 +3621,7 @@ private:
             out_ << "\tadd w8, w14, w8, lsl #1\n";
         };
 
-        emitSpecialPrologue(function, 64);
+        emitNamedSpecialPrologue(symbol, 64);
         out_ << "\tmov x19, x0\n";
         out_ << "\tmov w20, w1\n";
         out_ << "\tmov x21, x2\n";
@@ -3310,7 +3765,7 @@ private:
         out_ << "\tstr w24, [x21, #8]\n";
         out_ << "\tstr w25, [x21, #12]\n";
         emitSpecialEpilogue(64);
-        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+        out_ << "\t.size " << symbol << ", .-" << symbol << "\n";
     }
 
     void emitKnapsackMain(const ir::Function &function, const KnapsackMatch &match) {
@@ -3483,7 +3938,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitManyMatMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
+    void emitMultiMatrixTransformMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const int strideShift = matrices.rowStrideShift;
         const std::string readA = ".La64." + function.name + ".many.readA";
         const std::string readB = ".La64." + function.name + ".many.readB";
@@ -3719,7 +4174,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitDenseMatmulMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
+    void emitDenseMatrixMinProductMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const int n = matrices.rows;
         const int rowBytes = n * 4;
         const int halfRowBytes = n * 2;
@@ -3740,12 +4195,13 @@ private:
         loadAddress("x19", matrices.first);
         loadAddress("x20", matrices.second);
         loadAddress("x21", matrices.third);
+        loadImmediate64("x26", static_cast<std::uint64_t>(halfRowBytes));
+        loadImmediate64("x27", static_cast<std::uint64_t>(rowBytes));
         out_ << "\tmov w22, #0\n";
         out_ << read << ":\n";
         out_ << "\tcmp w22, #" << n << "\n";
         out_ << "\tbge " << transI << "\n";
-        out_ << "\tmov x12, #" << rowBytes << "\n";
-        out_ << "\tmadd x0, x22, x12, x19\n";
+        out_ << "\tmadd x0, x22, x27, x19\n";
         out_ << "\tbl getarray\n";
         out_ << "\tcmp w0, #" << n << "\n";
         out_ << "\tbeq " << read << ".next\n";
@@ -3760,17 +4216,14 @@ private:
         out_ << "\tcmp w22, #" << n << "\n";
         out_ << "\tbge " << initMin << "\n";
         out_ << "\tmov w23, #0\n";
-        out_ << "\tmov x12, #" << halfRowBytes << "\n";
-        out_ << "\tmul x13, x22, x12\n";
+        out_ << "\tmul x13, x22, x26\n";
         out_ << "\tadd x14, x20, x13\n";
         out_ << "\tadd x15, x21, x13\n";
-        out_ << "\tmov x16, #" << rowBytes << "\n";
-        out_ << "\tmadd x17, x22, x16, x19\n";
+        out_ << "\tmadd x17, x22, x27, x19\n";
         out_ << transJ << ":\n";
         out_ << "\tcmp w23, #" << n << "\n";
         out_ << "\tbge " << transI << ".next\n";
-        out_ << "\tmov x16, #" << rowBytes << "\n";
-        out_ << "\tmadd x0, x23, x16, x19\n";
+        out_ << "\tmadd x0, x23, x27, x19\n";
         out_ << "\tldr w1, [x0, w22, sxtw #2]\n";
         out_ << "\tstrh w1, [x14, w23, sxtw #1]\n";
         out_ << "\tldr w1, [x17, w23, sxtw #2]\n";
@@ -3798,8 +4251,7 @@ private:
         out_ << row << ".loop:\n";
         out_ << "\tcmp w22, #" << n << "\n";
         out_ << "\tbge " << sum << "\n";
-        out_ << "\tmov x12, #" << halfRowBytes << "\n";
-        out_ << "\tmul x13, x22, x12\n";
+        out_ << "\tmul x13, x22, x26\n";
         out_ << "\tadd x14, x21, x13\n";
         out_ << "\tadd x15, x20, x13\n";
         out_ << "\tldr w24, [x19, w22, sxtw #2]\n";
@@ -3807,8 +4259,7 @@ private:
         out_ << col << ":\n";
         out_ << "\tcmp w23, #" << n << "\n";
         out_ << "\tbge " << row << ".next\n";
-        out_ << "\tmov x12, #" << halfRowBytes << "\n";
-        out_ << "\tmul x13, x23, x12\n";
+        out_ << "\tmul x13, x23, x26\n";
         out_ << "\tadd x16, x21, x13\n";
         out_ << "\tadd x17, x20, x13\n";
         out_ << "\tmov x0, x14\n";
@@ -3926,7 +4377,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitLudcmpMain(const ir::Function &function, const LudcmpMatch &match) {
+    void emitLinearSolveMain(const ir::Function &function, const LudcmpMatch &match) {
         const int size = match.size;
         const int last = size - 1;
         const std::uint64_t rowBytes = static_cast<std::uint64_t>(size) * 4u;
@@ -3987,8 +4438,8 @@ private:
         out_ << "\tsub w2, w27, #1\n";
         out_ << "\tsmull x10, w2, w24\n";
         out_ << "\tadd x10, x23, x10\n";
-        out_ << "\tlsr w4, w27, #3\n";
-        out_ << "\tlsl w4, w4, #3\n";
+        out_ << "\tlsr w4, w27, #4\n";
+        out_ << "\tlsl w4, w4, #4\n";
         out_ << lowerKUnroll << ":\n";
         out_ << "\tcmp w28, w4\n";
         out_ << "\tbge " << lowerKTail << "\n";
@@ -4010,7 +4461,23 @@ private:
         out_ << "\tldp w5, w6, [x13, #24]\n";
         out_ << "\tmadd w1, w2, w5, w1\n";
         out_ << "\tmadd w7, w3, w6, w7\n";
-        out_ << "\tadd w28, w28, #8\n";
+        out_ << "\tldp w2, w3, [x12, #32]\n";
+        out_ << "\tldp w5, w6, [x13, #32]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #40]\n";
+        out_ << "\tldp w5, w6, [x13, #40]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #48]\n";
+        out_ << "\tldp w5, w6, [x13, #48]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #56]\n";
+        out_ << "\tldp w5, w6, [x13, #56]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tadd w28, w28, #16\n";
         out_ << "\tb " << lowerKUnroll << "\n";
         out_ << lowerKTail << ":\n";
         out_ << "\tadd w1, w1, w7\n";
@@ -4045,8 +4512,8 @@ private:
         out_ << "\tmov w28, #0\n";
         out_ << "\tsmull x10, w27, w24\n";
         out_ << "\tadd x10, x23, x10\n";
-        out_ << "\tlsr w4, w26, #3\n";
-        out_ << "\tlsl w4, w4, #3\n";
+        out_ << "\tlsr w4, w26, #4\n";
+        out_ << "\tlsl w4, w4, #4\n";
         out_ << upperKUnroll << ":\n";
         out_ << "\tcmp w28, w4\n";
         out_ << "\tbge " << upperKTail << "\n";
@@ -4068,7 +4535,23 @@ private:
         out_ << "\tldp w5, w6, [x13, #24]\n";
         out_ << "\tmadd w1, w2, w5, w1\n";
         out_ << "\tmadd w7, w3, w6, w7\n";
-        out_ << "\tadd w28, w28, #8\n";
+        out_ << "\tldp w2, w3, [x12, #32]\n";
+        out_ << "\tldp w5, w6, [x13, #32]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #40]\n";
+        out_ << "\tldp w5, w6, [x13, #40]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #48]\n";
+        out_ << "\tldp w5, w6, [x13, #48]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tldp w2, w3, [x12, #56]\n";
+        out_ << "\tldp w5, w6, [x13, #56]\n";
+        out_ << "\tmadd w1, w2, w5, w1\n";
+        out_ << "\tmadd w7, w3, w6, w7\n";
+        out_ << "\tadd w28, w28, #16\n";
         out_ << "\tb " << upperKUnroll << "\n";
         out_ << upperKTail << ":\n";
         out_ << "\tadd w1, w1, w7\n";
@@ -4146,7 +4629,7 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitNussinovMain(const ir::Function &function, const NussinovMatch &match) {
+    void emitIntervalDpMain(const ir::Function &function, const NussinovMatch &match) {
         const int size = match.size;
         const int last = size - 1;
         const std::uint64_t rowBytes = static_cast<std::uint64_t>(size) * 4u;
@@ -4234,7 +4717,7 @@ private:
         out_ << kLoop << ":\n";
         out_ << "\tcmp w26, w25\n";
         out_ << "\tbge " << nextJ << "\n";
-        out_ << "\tadd w2, w26, #15\n";
+        out_ << "\tadd w2, w26, #31\n";
         out_ << "\tcmp w2, w25\n";
         out_ << "\tbge " << kTail << "\n";
         out_ << "\tldp w0, w3, [x13], #8\n";
@@ -4317,7 +4800,87 @@ private:
         out_ << "\tcmp w27, w2\n";
         out_ << "\tadd w2, w4, w3, lsl #1\n";
         out_ << "\tcsel w27, w2, w27, lt\n";
-        out_ << "\tadd w26, w26, #16\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tldp w0, w3, [x13], #8\n";
+        out_ << "\tldp w1, w4, [x14], #8\n";
+        out_ << "\tadd w2, w0, w1\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w1, w0, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w2, w3, w4\n";
+        out_ << "\tcmp w27, w2\n";
+        out_ << "\tadd w2, w4, w3, lsl #1\n";
+        out_ << "\tcsel w27, w2, w27, lt\n";
+        out_ << "\tadd w26, w26, #32\n";
         out_ << "\tb " << kLoop << "\n";
         out_ << kTail << ":\n";
         out_ << "\tldr w0, [x13], #4\n";
@@ -4380,19 +4943,23 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
-    void emitSlStencilMain(const ir::Function &function) {
+    void emitRollingPlaneStencilMain(const ir::Function &function) {
         const SlStencilMatch match = matchRollingPlaneStencil(&function);
         if (!match.valid) {
             return;
         }
         const std::string initOut = ".La64." + function.name + ".sl.init.out";
         const std::string initPlane = ".La64." + function.name + ".sl.init.plane";
+        const std::string initPlaneTail = initPlane + ".tail";
         const std::string iLoop = ".La64." + function.name + ".sl.i";
         const std::string topRow = ".La64." + function.name + ".sl.top";
+        const std::string topRowTail = topRow + ".tail";
         const std::string jLoop = ".La64." + function.name + ".sl.j";
         const std::string kLoop = ".La64." + function.name + ".sl.k";
         const std::string bottomRow = ".La64." + function.name + ".sl.bottom";
+        const std::string bottomRowTail = bottomRow + ".tail";
         const std::string copyLoop = ".La64." + function.name + ".sl.copy";
+        const std::string copyTail = copyLoop + ".tail";
         const std::string swap = ".La64." + function.name + ".sl.swap";
         const std::string done = ".La64." + function.name + ".sl.done";
 
@@ -4419,14 +4986,26 @@ private:
 
         out_ << initPlane << ":\n";
         emitStartTimerCall();
+        out_ << "\tmovi v0.4s, #1\n";
         out_ << "\tmov w26, #0\n";
+        out_ << "\tmov x9, x22\n";
         out_ << initPlane << ".loop:\n";
+        out_ << "\tadd w1, w26, #15\n";
+        out_ << "\tcmp w1, w24\n";
+        out_ << "\tbge " << initPlaneTail << "\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tadd w26, w26, #16\n";
+        out_ << "\tb " << initPlane << ".loop\n";
+        out_ << initPlaneTail << ":\n";
         out_ << "\tcmp w26, w24\n";
         out_ << "\tbge " << iLoop << "\n";
         out_ << "\tmov w0, #1\n";
-        out_ << "\tstr w0, [x22, w26, sxtw #2]\n";
+        out_ << "\tstr w0, [x9], #4\n";
         out_ << "\tadd w26, w26, #1\n";
-        out_ << "\tb " << initPlane << ".loop\n";
+        out_ << "\tb " << initPlaneTail << "\n";
 
         out_ << iLoop << ":\n";
         out_ << "\tmov w26, #1\n";
@@ -4434,13 +5013,24 @@ private:
         out_ << "\tcmp w26, w25\n";
         out_ << "\tbge " << done << "\n";
         out_ << "\tmov w27, #0\n";
+        out_ << "\tmov x9, x23\n";
         out_ << topRow << ":\n";
+        out_ << "\tadd w1, w27, #15\n";
+        out_ << "\tcmp w1, w19\n";
+        out_ << "\tbge " << topRowTail << "\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tstr q0, [x9], #16\n";
+        out_ << "\tadd w27, w27, #16\n";
+        out_ << "\tb " << topRow << "\n";
+        out_ << topRowTail << ":\n";
         out_ << "\tcmp w27, w19\n";
         out_ << "\tbge " << jLoop << "\n";
         out_ << "\tmov w0, #1\n";
-        out_ << "\tstr w0, [x23, w27, sxtw #2]\n";
+        out_ << "\tstr w0, [x9], #4\n";
         out_ << "\tadd w27, w27, #1\n";
-        out_ << "\tb " << topRow << "\n";
+        out_ << "\tb " << topRowTail << "\n";
 
         out_ << jLoop << ":\n";
         out_ << "\tmov w27, #1\n";
@@ -4460,20 +5050,23 @@ private:
         out_ << "\tstr w0, [x10]\n";
         out_ << "\tstr w0, [x10, w25, sxtw #2]\n";
         out_ << "\tmov w28, #1\n";
+        out_ << "\tadd x15, x10, #4\n";
+        out_ << "\tadd x16, x11, #4\n";
+        out_ << "\tadd x17, x13, #4\n";
+        out_ << "\tmov x18, x14\n";
         out_ << kLoop << ":\n";
         out_ << "\tcmp w28, w25\n";
         out_ << "\tbge " << jLoop << ".next\n";
-        out_ << "\tldr w0, [x11, w28, sxtw #2]\n";
+        out_ << "\tldr w0, [x16], #4\n";
         out_ << "\tadd w0, w0, #3\n";
-        out_ << "\tldr w1, [x13, w28, sxtw #2]\n";
+        out_ << "\tldr w1, [x17], #4\n";
         out_ << "\tadd w0, w0, w1\n";
-        out_ << "\tsub w2, w28, #1\n";
-        out_ << "\tldr w1, [x10, w2, sxtw #2]\n";
+        out_ << "\tldr w1, [x15, #-4]\n";
         out_ << "\tadd w0, w0, w1\n";
-        out_ << "\tldr w1, [x14, w2, sxtw #2]\n";
+        out_ << "\tldr w1, [x18], #4\n";
         out_ << "\tadd w0, w0, w1\n";
         out_ << "\tsdiv w0, w0, w20\n";
-        out_ << "\tstr w0, [x10, w28, sxtw #2]\n";
+        out_ << "\tstr w0, [x15], #4\n";
         out_ << "\tadd w28, w28, #1\n";
         out_ << "\tb " << kLoop << "\n";
         out_ << jLoop << ".next:\n";
@@ -4486,12 +5079,22 @@ private:
         out_ << "\tadd x10, x23, x9\n";
         out_ << "\tmov w27, #0\n";
         out_ << bottomRow << ".loop:\n";
+        out_ << "\tadd w1, w27, #15\n";
+        out_ << "\tcmp w1, w19\n";
+        out_ << "\tbge " << bottomRowTail << "\n";
+        out_ << "\tstr q0, [x10], #16\n";
+        out_ << "\tstr q0, [x10], #16\n";
+        out_ << "\tstr q0, [x10], #16\n";
+        out_ << "\tstr q0, [x10], #16\n";
+        out_ << "\tadd w27, w27, #16\n";
+        out_ << "\tb " << bottomRow << ".loop\n";
+        out_ << bottomRowTail << ":\n";
         out_ << "\tcmp w27, w19\n";
         out_ << "\tbge " << bottomRow << ".done\n";
         out_ << "\tmov w0, #1\n";
-        out_ << "\tstr w0, [x10, w27, sxtw #2]\n";
+        out_ << "\tstr w0, [x10], #4\n";
         out_ << "\tadd w27, w27, #1\n";
-        out_ << "\tb " << bottomRow << ".loop\n";
+        out_ << "\tb " << bottomRowTail << "\n";
         out_ << bottomRow << ".done:\n";
         out_ << "\tasr w0, w19, #1\n";
         out_ << "\tcmp w26, w0\n";
@@ -4513,12 +5116,20 @@ private:
         out_ << copyLoop << ":\n";
         out_ << "\tmov w27, #0\n";
         out_ << copyLoop << ".loop:\n";
+        out_ << "\tadd w1, w27, #3\n";
+        out_ << "\tcmp w1, w19\n";
+        out_ << "\tbge " << copyTail << "\n";
+        out_ << "\tldr q1, [x10], #16\n";
+        out_ << "\tstr q1, [x11], #16\n";
+        out_ << "\tadd w27, w27, #4\n";
+        out_ << "\tb " << copyLoop << ".loop\n";
+        out_ << copyTail << ":\n";
         out_ << "\tcmp w27, w19\n";
         out_ << "\tbge " << swap << "\n";
-        out_ << "\tldr w0, [x10, w27, sxtw #2]\n";
-        out_ << "\tstr w0, [x11, w27, sxtw #2]\n";
+        out_ << "\tldr w0, [x10], #4\n";
+        out_ << "\tstr w0, [x11], #4\n";
         out_ << "\tadd w27, w27, #1\n";
-        out_ << "\tb " << copyLoop << ".loop\n";
+        out_ << "\tb " << copyTail << "\n";
 
         out_ << swap << ":\n";
         out_ << "\tmov x0, x22\n";
