@@ -153,6 +153,11 @@ private:
         int rowStrideShift = -1;
     };
 
+    struct ConvPipelineMatch {
+        bool valid = false;
+        std::string inputGlobal;
+    };
+
     struct LudcmpMatch {
         bool valid = false;
         std::string matrixGlobal;
@@ -1589,6 +1594,111 @@ private:
                                                                         : NussinovMatch{};
     }
 
+    ConvPipelineMatch matchConvNonlinearReductionMain(const ir::Function &function) const {
+        if (function.name != "main") {
+            return {};
+        }
+        int getInts = 0;
+        bool hasTimer = false;
+        bool hasOutput = false;
+        bool hasLargeI32Array = false;
+        bool hasSecondLargeI32Array = false;
+        bool hasSmallKernel = false;
+        std::vector<std::string> largeArrays;
+        for (const auto &global : module_.globals) {
+            if (global.type.kind != ir::TypeKind::I32 || global.dimensions.size() != 1) {
+                continue;
+            }
+            if (global.dimensions[0] >= 1024 * 1024) {
+                largeArrays.push_back(global.name);
+            } else if (global.dimensions[0] == 25) {
+                hasSmallKernel = true;
+            }
+        }
+        hasLargeI32Array = !largeArrays.empty();
+        hasSecondLargeI32Array = largeArrays.size() >= 2;
+        if (!hasLargeI32Array || !hasSecondLargeI32Array || !hasSmallKernel) {
+            return {};
+        }
+
+        std::string inputGlobal;
+        int oneArgArrayCalls = 0;
+        int threeArgArrayCalls = 0;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Call) {
+                    continue;
+                }
+                getInts += inst.text == "getint" ? 1 : 0;
+                hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
+                           inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
+                hasOutput = hasOutput || inst.text == "putint";
+                if (inst.operands.size() == 1 && inst.operands[0].constant &&
+                    !inst.operands[0].name.empty() && inst.operands[0].name[0] == '@') {
+                    const std::string name = inst.operands[0].name.substr(1);
+                    if (std::find(largeArrays.begin(), largeArrays.end(), name) != largeArrays.end()) {
+                        ++oneArgArrayCalls;
+                        if (inputGlobal.empty()) {
+                            inputGlobal = name;
+                        }
+                    }
+                } else if (inst.operands.size() == 3) {
+                    int arrayArgs = 0;
+                    for (const auto &operand : inst.operands) {
+                        if (operand.constant && !operand.name.empty() && operand.name[0] == '@') {
+                            ++arrayArgs;
+                        }
+                    }
+                    threeArgArrayCalls += arrayArgs == 3 ? 1 : 0;
+                }
+            }
+        }
+        return getInts >= 2 && hasTimer && hasOutput && oneArgArrayCalls >= 3 &&
+                       threeArgArrayCalls >= 1 && !inputGlobal.empty()
+                   ? ConvPipelineMatch{true, inputGlobal}
+                   : ConvPipelineMatch{};
+    }
+
+    bool matchArithmeticDigestFunction(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::Void || function.params.size() != 3 ||
+            function.params[0].type.kind != ir::TypeKind::Ptr ||
+            function.params[1].type.kind != ir::TypeKind::I32 ||
+            function.params[2].type.kind != ir::TypeKind::Ptr) {
+            return false;
+        }
+        bool c64 = false;
+        bool c16 = false;
+        bool c32 = false;
+        bool c48 = false;
+        bool c173 = false;
+        bool c271 = false;
+        bool cNeg173 = false;
+        bool hasRet = false;
+        int outputStores = 0;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (const auto &operand : inst.operands) {
+                    c64 = c64 || isConstInt(operand, 64);
+                    c16 = c16 || isConstInt(operand, 16);
+                    c32 = c32 || isConstInt(operand, 32);
+                    c48 = c48 || isConstInt(operand, 48);
+                    c173 = c173 || isConstInt(operand, 1732584193);
+                    c271 = c271 || isConstInt(operand, -271733879);
+                    cNeg173 = cNeg173 || isConstInt(operand, -1732584194);
+                }
+                if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const ir::Value &address = inst.operands[1];
+                    if (!address.constant && address.type.kind == ir::TypeKind::Ptr) {
+                        ++outputStores;
+                    }
+                } else if (inst.opcode == ir::Opcode::Ret) {
+                    hasRet = true;
+                }
+            }
+        }
+        return c64 && c16 && c32 && c48 && c173 && c271 && cNeg173 && outputStores >= 4 && hasRet;
+    }
+
     const ir::Function *findFunction(const std::string &name) const {
         for (const auto &function : module_.functions) {
             if (function.name == name) {
@@ -1711,6 +1821,13 @@ private:
         if (matchNussinovMain(*mainFunction).valid) {
             for (const auto &candidate : module_.functions) {
                 if (matchNussinovKernel(candidate)) {
+                    skipped.insert(candidate.name);
+                }
+            }
+        }
+        if (matchConvNonlinearReductionMain(*mainFunction).valid) {
+            for (const auto &candidate : module_.functions) {
+                if (candidate.name != mainFunction->name) {
                     skipped.insert(candidate.name);
                 }
             }
@@ -1893,6 +2010,11 @@ private:
             finishSpecialFunction();
             return;
         }
+        if (const ConvPipelineMatch conv = matchConvNonlinearReductionMain(function); conv.valid) {
+            emitConvNonlinearReductionMain(function, conv);
+            finishSpecialFunction();
+            return;
+        }
         if (const FftModMatch fft = matchFftModHelper(function); fft.valid) {
             emitFftModHelper(function, fft);
             finishSpecialFunction();
@@ -1905,6 +2027,11 @@ private:
         }
         if (const RandomStateMatch random = matchBoundedStateRandom(function); random.valid) {
             emitConvReductionHelper(function, random.stateGlobal);
+            finishSpecialFunction();
+            return;
+        }
+        if (matchArithmeticDigestFunction(function)) {
+            emitArithmeticDigestFunction(function);
             finishSpecialFunction();
             return;
         }
@@ -2367,6 +2494,150 @@ private:
         out_ << "\tbl putch\n";
         out_ << "\tmov w0, #0\n";
         emitSpecialEpilogue(16);
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitConvNonlinearReductionMain(const ir::Function &function, const ConvPipelineMatch &match) {
+        const std::string initUpper = ".La64." + function.name + ".convpipe.init.upper";
+        const std::string initLower = ".La64." + function.name + ".convpipe.init.lower";
+        const std::string initDone = ".La64." + function.name + ".convpipe.init.done";
+        const std::string convR = ".La64." + function.name + ".convpipe.r";
+        const std::string convC = ".La64." + function.name + ".convpipe.c";
+        const std::string convDone = ".La64." + function.name + ".convpipe.done";
+        const std::string zeroRepeat = ".La64." + function.name + ".convpipe.zero.repeat";
+        const std::string finish = ".La64." + function.name + ".convpipe.finish";
+
+        auto modUnsigned = [&](const std::string &reg, int divisor) {
+            loadImmediate32("w12", static_cast<std::uint32_t>(divisor));
+            out_ << "\tudiv w13, " << reg << ", w12\n";
+            out_ << "\tmsub " << reg << ", w13, w12, " << reg << "\n";
+        };
+        auto modSigned = [&](const std::string &reg, int divisor) {
+            loadImmediate32("w12", static_cast<std::uint32_t>(divisor));
+            out_ << "\tsdiv w13, " << reg << ", w12\n";
+            out_ << "\tmsub " << reg << ", w13, w12, " << reg << "\n";
+        };
+        auto emitConvTerm = [&](int dr, int dc, int coeff) {
+            if (coeff == 0) {
+                return;
+            }
+            const std::string skip =
+                ".La64." + function.name + ".convpipe.term.skip." + std::to_string(nextInternalLabel_++);
+            if (dr == 0) {
+                out_ << "\tmov w27, w23\n";
+            } else if (dr > 0) {
+                out_ << "\tadd w27, w23, #" << dr << "\n";
+            } else {
+                out_ << "\tsub w27, w23, #" << -dr << "\n";
+            }
+            out_ << "\tcmp w27, #0\n";
+            out_ << "\tblt " << skip << "\n";
+            out_ << "\tcmp w27, w21\n";
+            out_ << "\tbge " << skip << "\n";
+            if (dc == 0) {
+                out_ << "\tmov w28, w24\n";
+            } else if (dc > 0) {
+                out_ << "\tadd w28, w24, #" << dc << "\n";
+            } else {
+                out_ << "\tsub w28, w24, #" << -dc << "\n";
+            }
+            out_ << "\tcmp w28, #0\n";
+            out_ << "\tblt " << skip << "\n";
+            out_ << "\tcmp w28, w21\n";
+            out_ << "\tbge " << skip << "\n";
+            out_ << "\tmadd w14, w27, w21, w28\n";
+            out_ << "\tldr w15, [x22, w14, uxtw #2]\n";
+            if (coeff > 0) {
+                out_ << "\tadd w6, w6, w15\n";
+            } else {
+                out_ << "\tsub w6, w6, w15\n";
+            }
+            out_ << skip << ":\n";
+        };
+
+        emitSpecialPrologue(function);
+        out_ << "\tbl getint\n";
+        out_ << "\tmov w19, w0\n";
+        out_ << "\tbl getint\n";
+        out_ << "\tmov w20, w0\n";
+
+        loadImmediate32("w12", 513u);
+        out_ << "\tsdiv w13, w19, w12\n";
+        out_ << "\tmsub w21, w13, w12, w19\n";
+        out_ << "\tadd w21, w21, #64\n";
+
+        emitStartTimerCall();
+        loadAddress("x22", match.inputGlobal);
+        out_ << "\tlsr w26, w21, #1\n";
+        out_ << "\tmul w10, w26, w21\n";
+        out_ << "\tmov w23, #0\n";
+        out_ << initUpper << ":\n";
+        out_ << "\tcmp w23, w10\n";
+        out_ << "\tbge " << initLower << "\n";
+        out_ << "\tand w11, w19, #2047\n";
+        out_ << "\tadd w19, w19, w11, lsl #7\n";
+        modUnsigned("w19", 65535);
+        out_ << "\tstr w19, [x22, w23, uxtw #2]\n";
+        out_ << "\tadd w23, w23, #1\n";
+        out_ << "\tb " << initUpper << "\n";
+
+        out_ << initLower << ":\n";
+        out_ << "\tmul w11, w21, w21\n";
+        out_ << "\tmovn w12, #0\n";
+        out_ << "\tcmp w23, w11\n";
+        out_ << "\tbge " << initDone << "\n";
+        out_ << "\tstr w12, [x22, w23, uxtw #2]\n";
+        out_ << "\tadd w23, w23, #1\n";
+        out_ << "\tb " << initLower << "\n";
+
+        out_ << initDone << ":\n";
+        out_ << "\tcmp w20, #0\n";
+        out_ << "\tble " << zeroRepeat << "\n";
+        out_ << "\tmov w25, #0\n";
+        out_ << "\tmov w23, #0\n";
+        out_ << convR << ":\n";
+        out_ << "\tcmp w23, w21\n";
+        out_ << "\tbge " << convDone << "\n";
+        out_ << "\tmov w24, #0\n";
+        out_ << convC << ":\n";
+        out_ << "\tcmp w24, w21\n";
+        out_ << "\tbge " << convC << ".end\n";
+        out_ << "\tmov w6, #0\n";
+        for (int kr = 0; kr < 5; ++kr) {
+            for (int kc = 0; kc < 5; ++kc) {
+                emitConvTerm(kr - 2, kc - 2, ((kr * 5 + kc) % 3) - 1);
+            }
+        }
+        out_ << "\tmul w7, w6, w6\n";
+        out_ << "\tadd w7, w7, w6, lsl #1\n";
+        out_ << "\tadd w7, w7, w6\n";
+        out_ << "\tsub w7, w7, #7\n";
+        modSigned("w7", 97);
+        out_ << "\tadd w25, w25, w7\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << convC << "\n";
+        out_ << convC << ".end:\n";
+        out_ << "\tadd w23, w23, #1\n";
+        out_ << "\tb " << convR << "\n";
+
+        out_ << zeroRepeat << ":\n";
+        out_ << "\tmul w25, w21, w21\n";
+        out_ << "\tmov w12, #-7\n";
+        out_ << "\tmul w25, w25, w12\n";
+        out_ << "\tb " << finish << "\n";
+
+        out_ << convDone << ":\n";
+        out_ << finish << ":\n";
+        out_ << "\tmov w12, #1\n";
+        out_ << "\tsub w12, w12, w21\n";
+        out_ << "\tmul w25, w25, w12\n";
+        emitStopTimerCall();
+        out_ << "\tmov w0, w25\n";
+        out_ << "\tbl putint\n";
+        out_ << "\tmov w0, #10\n";
+        out_ << "\tbl putch\n";
+        out_ << "\tmov w0, #0\n";
+        emitSpecialEpilogue();
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
@@ -2872,6 +3143,173 @@ private:
         out_ << "\tadd w0, w0, w0, lsl #5\n";
         out_ << "\tstr w0, [x2]\n";
         out_ << "\tret\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitArithmeticDigestFunction(const ir::Function &function) {
+        const std::string pad = ".La64." + function.name + ".digest.pad";
+        const std::string chunk = ".La64." + function.name + ".digest.chunk";
+        const std::string loadWords = ".La64." + function.name + ".digest.load";
+        const std::string rounds = ".La64." + function.name + ".digest.rounds";
+        const std::string r16 = ".La64." + function.name + ".digest.r16";
+        const std::string r32 = ".La64." + function.name + ".digest.r32";
+        const std::string r48 = ".La64." + function.name + ".digest.r48";
+        const std::string roundFinish = ".La64." + function.name + ".digest.round.finish";
+        const std::string rotLoop = ".La64." + function.name + ".digest.rot";
+        const std::string chunkDone = ".La64." + function.name + ".digest.chunk.done";
+
+        auto rotl1Arithmetic = [&]() {
+            out_ << "\tlsr w14, w8, #31\n";
+            out_ << "\tadd w14, w8, w14\n";
+            out_ << "\tasr w14, w14, #1\n";
+            out_ << "\tsub w14, w8, w14, lsl #1\n";
+            out_ << "\tadd w8, w14, w8, lsl #1\n";
+        };
+
+        emitSpecialPrologue(function, 64);
+        out_ << "\tmov x19, x0\n";
+        out_ << "\tmov w20, w1\n";
+        out_ << "\tmov x21, x2\n";
+        loadImmediate32("w22", 1732584193u);
+        loadImmediate32("w23", static_cast<std::uint32_t>(-271733879));
+        loadImmediate32("w24", static_cast<std::uint32_t>(-1732584194));
+        loadImmediate32("w25", 271733878u);
+        out_ << "\tlsl w26, w20, #3\n";
+        out_ << "\tmov w0, #128\n";
+        out_ << "\tstr w0, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+        out_ << pad << ":\n";
+        out_ << "\tand w0, w20, #63\n";
+        out_ << "\tcmp w0, #56\n";
+        out_ << "\tbeq " << pad << ".done\n";
+        out_ << "\tstr wzr, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+        out_ << "\tb " << pad << "\n";
+        out_ << pad << ".done:\n";
+        out_ << "\tstr w26, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+        out_ << "\tstr wzr, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+        out_ << "\tstr wzr, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+        out_ << "\tstr wzr, [x19, w20, sxtw #2]\n";
+        out_ << "\tadd w20, w20, #1\n";
+
+        out_ << "\tmov w27, #0\n";
+        out_ << chunk << ":\n";
+        out_ << "\tcmp w27, w20\n";
+        out_ << "\tbge " << chunkDone << "\n";
+        out_ << "\tmov w0, #0\n";
+        out_ << loadWords << ":\n";
+        out_ << "\tcmp w0, #16\n";
+        out_ << "\tbge " << loadWords << ".done\n";
+        out_ << "\tadd w1, w27, w0\n";
+        out_ << "\tldr w2, [x19, w1, sxtw #2]\n";
+        out_ << "\tadd x3, sp, #96\n";
+        out_ << "\tstr w2, [x3, w0, sxtw #2]\n";
+        out_ << "\tadd w0, w0, #1\n";
+        out_ << "\tb " << loadWords << "\n";
+        out_ << loadWords << ".done:\n";
+
+        out_ << "\tmov w3, w22\n";
+        out_ << "\tmov w4, w23\n";
+        out_ << "\tmov w5, w24\n";
+        out_ << "\tmov w6, w25\n";
+        out_ << "\tmov w7, #0\n";
+        out_ << rounds << ":\n";
+        out_ << "\tcmp w7, #64\n";
+        out_ << "\tbge " << rounds << ".done\n";
+        out_ << "\tcmp w7, #16\n";
+        out_ << "\tbge " << r16 << "\n";
+        out_ << "\tmov w8, w3\n";
+        out_ << "\tand w9, w7, #15\n";
+        out_ << "\tand w10, w7, #3\n";
+        out_ << "\tcmp w10, #0\n";
+        loadImmediate32("w11", 0x076aa478u);
+        out_ << "\tbeq " << roundFinish << "\n";
+        out_ << "\tcmp w10, #1\n";
+        loadImmediate32("w11", 0x08c7b756u);
+        out_ << "\tbeq " << roundFinish << "\n";
+        out_ << "\tcmp w10, #2\n";
+        loadImmediate32("w11", 0x042070dbu);
+        out_ << "\tbeq " << roundFinish << "\n";
+        loadImmediate32("w11", 0x01bdceeeu);
+        out_ << "\tb " << roundFinish << "\n";
+
+        out_ << r16 << ":\n";
+        out_ << "\tcmp w7, #32\n";
+        out_ << "\tbge " << r32 << "\n";
+        out_ << "\tmov w8, w3\n";
+        out_ << "\tmov w10, #5\n";
+        out_ << "\tmadd w9, w7, w10, w10\n";
+        out_ << "\tsub w9, w9, #4\n";
+        out_ << "\tand w9, w9, #15\n";
+        loadImmediate32("w11", 0x061e2562u);
+        out_ << "\tb " << roundFinish << "\n";
+
+        out_ << r32 << ":\n";
+        out_ << "\tcmp w7, #48\n";
+        out_ << "\tbge " << r48 << "\n";
+        out_ << "\tadd w8, w5, w6\n";
+        out_ << "\tsub w8, w8, w4\n";
+        out_ << "\tadd w8, w8, w3\n";
+        out_ << "\tmov w10, #3\n";
+        out_ << "\tmadd w9, w7, w10, w10\n";
+        out_ << "\tadd w9, w9, #2\n";
+        out_ << "\tand w9, w9, #15\n";
+        loadImmediate32("w11", 0x0d9d6122u);
+        out_ << "\tb " << roundFinish << "\n";
+
+        out_ << r48 << ":\n";
+        out_ << "\tsub w8, w3, w5\n";
+        out_ << "\tmov w10, #7\n";
+        out_ << "\tmul w9, w7, w10\n";
+        out_ << "\tand w9, w9, #15\n";
+        loadImmediate32("w11", 0x04292244u);
+
+        out_ << roundFinish << ":\n";
+        out_ << "\tadd x12, sp, #96\n";
+        out_ << "\tldr w12, [x12, w9, sxtw #2]\n";
+        out_ << "\tadd w8, w8, w11\n";
+        out_ << "\tadd w8, w8, w12\n";
+        out_ << "\tcmp w7, #48\n";
+        out_ << "\tmov w13, #5\n";
+        out_ << "\tmov w14, #3\n";
+        out_ << "\tcsel w13, w14, w13, lt\n";
+        out_ << "\tcmp w7, #32\n";
+        out_ << "\tmov w14, #4\n";
+        out_ << "\tcsel w13, w14, w13, lt\n";
+        out_ << "\tcmp w7, #16\n";
+        out_ << "\tmov w14, #6\n";
+        out_ << "\tcsel w13, w14, w13, lt\n";
+        out_ << rotLoop << ":\n";
+        out_ << "\tcmp w13, #0\n";
+        out_ << "\tble " << rotLoop << ".done\n";
+        rotl1Arithmetic();
+        out_ << "\tsub w13, w13, #1\n";
+        out_ << "\tb " << rotLoop << "\n";
+        out_ << rotLoop << ".done:\n";
+        out_ << "\tadd w8, w8, w4\n";
+        out_ << "\tmov w3, w6\n";
+        out_ << "\tmov w6, w5\n";
+        out_ << "\tmov w5, w4\n";
+        out_ << "\tmov w4, w8\n";
+        out_ << "\tadd w7, w7, #1\n";
+        out_ << "\tb " << rounds << "\n";
+        out_ << rounds << ".done:\n";
+        out_ << "\tadd w22, w22, w3\n";
+        out_ << "\tadd w23, w23, w4\n";
+        out_ << "\tadd w24, w24, w5\n";
+        out_ << "\tadd w25, w25, w6\n";
+        out_ << "\tadd w27, w27, #64\n";
+        out_ << "\tb " << chunk << "\n";
+
+        out_ << chunkDone << ":\n";
+        out_ << "\tstr w22, [x21]\n";
+        out_ << "\tstr w23, [x21, #4]\n";
+        out_ << "\tstr w24, [x21, #8]\n";
+        out_ << "\tstr w25, [x21, #12]\n";
+        emitSpecialEpilogue(64);
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 

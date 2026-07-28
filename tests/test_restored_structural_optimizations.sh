@@ -7,7 +7,7 @@ mkdir -p "$tmp_dir"
 
 make -C "$root" >/dev/null
 
-perf_dir="$root/compiler2026/2026初赛ARM赛道性能用例"
+perf_dir="$root/compiler2026/2026初赛ARM赛道性能用例/performance"
 "$root/compiler" "$perf_dir/many_mat_cal-1.sy" -S -o "$tmp_dir/many_mat_cal-1.s"
 
 grep -q '\.many\.' "$tmp_dir/many_mat_cal-1.s"
