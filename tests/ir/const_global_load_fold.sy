@@ -1,0 +1,7 @@
+const int table[4] = {3, 5, 8, 13};
+
+int main() {
+    int x = table[2];
+    int y = table[3];
+    return x + y;
+}

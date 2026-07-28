@@ -63,6 +63,187 @@ std::vector<std::string> splitLabels(const std::string &text) {
     return labels;
 }
 
+struct FrameAccess {
+    bool valid = false;
+    bool load = false;
+    std::string mnemonic;
+    std::string reg;
+    std::string base;
+    std::string offset;
+};
+
+FrameAccess parseFrameAccess(const std::string &line) {
+    FrameAccess access;
+    if (line.empty() || line[0] != '\t') {
+        return access;
+    }
+    const std::size_t space = line.find(' ');
+    if (space == std::string::npos) {
+        return access;
+    }
+    const std::string mnemonic = line.substr(1, space - 1);
+    const bool load = mnemonic == "ldur" || mnemonic == "ldr";
+    const bool store = mnemonic == "stur" || mnemonic == "str";
+    if (!load && !store) {
+        return access;
+    }
+    const std::size_t comma = line.find(',', space + 1);
+    if (comma == std::string::npos) {
+        return access;
+    }
+    const std::string reg = trimLabel(line.substr(space + 1, comma - space - 1));
+    const std::size_t lbracket = line.find('[', comma + 1);
+    const std::size_t rbracket = line.find(']', lbracket == std::string::npos ? comma + 1 : lbracket + 1);
+    if (lbracket == std::string::npos || rbracket == std::string::npos) {
+        return access;
+    }
+    const std::string address = line.substr(lbracket + 1, rbracket - lbracket - 1);
+    const std::size_t addressComma = address.find(',');
+    const std::string base = trimLabel(address.substr(0, addressComma));
+    if (base != "x29" && base != "sp") {
+        return access;
+    }
+    std::string offset;
+    if (addressComma != std::string::npos) {
+        offset = trimLabel(address.substr(addressComma + 1));
+    }
+    if (!offset.empty() && offset.rfind("#", 0) == 0) {
+        offset = offset.substr(1);
+    }
+    access = FrameAccess{true, load, mnemonic, reg, base, offset};
+    return access;
+}
+
+bool samePhysicalRegister(const std::string &lhs, const std::string &rhs) {
+    if (lhs.size() < 2 || rhs.size() < 2) {
+        return lhs == rhs;
+    }
+    const bool lhsGp = lhs[0] == 'w' || lhs[0] == 'x';
+    const bool rhsGp = rhs[0] == 'w' || rhs[0] == 'x';
+    if (lhsGp && rhsGp) {
+        return lhs.substr(1) == rhs.substr(1);
+    }
+    return lhs == rhs;
+}
+
+std::optional<std::string> writtenRegister(const std::string &line) {
+    if (line.empty() || line[0] != '\t') {
+        return std::nullopt;
+    }
+    const std::size_t space = line.find(' ');
+    if (space == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string mnemonic = line.substr(1, space - 1);
+    if (mnemonic == "str" || mnemonic == "stur" || mnemonic == "stp" ||
+        mnemonic == "b" || mnemonic.rfind("b.", 0) == 0 || mnemonic == "bl" ||
+        mnemonic == "ret" || mnemonic == "cmp") {
+        return std::nullopt;
+    }
+    const std::size_t comma = line.find(',', space + 1);
+    const std::size_t end = comma == std::string::npos ? line.size() : comma;
+    std::string reg = trimLabel(line.substr(space + 1, end - space - 1));
+    if (!reg.empty() && (reg[0] == 'w' || reg[0] == 'x' || reg[0] == 's' || reg[0] == 'd')) {
+        return reg;
+    }
+    return std::nullopt;
+}
+
+bool safeBetweenFrameStoreLoad(const std::vector<std::string> &lines,
+                               std::size_t begin,
+                               std::size_t end,
+                               const std::string &sourceReg) {
+    for (std::size_t i = begin; i < end; ++i) {
+        const std::string trimmed = trimLabel(lines[i]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            return false;
+        }
+        if (trimmed == "ret" || trimmed.rfind("b ", 0) == 0 || trimmed.rfind("b.", 0) == 0 ||
+            trimmed.rfind("bl ", 0) == 0 || trimmed.rfind("str ", 0) == 0 ||
+            trimmed.rfind("stur ", 0) == 0 || trimmed.rfind("stp ", 0) == 0) {
+            return false;
+        }
+        const auto written = writtenRegister(lines[i]);
+        if (written && samePhysicalRegister(*written, sourceReg)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string optimizeAssemblyPeepholes(const std::string &assembly) {
+    std::vector<std::string> lines;
+    std::istringstream input(assembly);
+    std::string line;
+    while (std::getline(input, line)) {
+        lines.push_back(line);
+    }
+
+    std::ostringstream output;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const std::string &current = lines[i];
+        bool handled = false;
+        if (i + 1 < lines.size()) {
+            const std::string trimmedCurrent = trimLabel(current);
+            const std::string trimmedNext = trimLabel(lines[i + 1]);
+            if (trimmedCurrent.rfind("cmp ", 0) == 0 &&
+                trimmedNext.rfind("b.", 0) == 0) {
+                const std::size_t comma = trimmedCurrent.find(',');
+                const std::size_t space = trimmedNext.find(' ');
+                if (comma != std::string::npos && space != std::string::npos &&
+                    trimLabel(trimmedCurrent.substr(comma + 1)) == "#0") {
+                    const std::string reg = trimLabel(trimmedCurrent.substr(4, comma - 4));
+                    const std::string cond = trimmedNext.substr(2, space - 2);
+                    const std::string target = trimLabel(trimmedNext.substr(space + 1));
+                    if ((cond == "eq" || cond == "ne") && !reg.empty() && !target.empty()) {
+                        output << '\t' << (cond == "eq" ? "cbz " : "cbnz ") << reg << ", " << target << '\n';
+                        ++i;
+                        continue;
+                    }
+                }
+            }
+
+            const FrameAccess store = parseFrameAccess(current);
+            if (store.valid && !store.load) {
+                const std::size_t maxLookahead = std::min<std::size_t>(lines.size() - 1, i + 5);
+                for (std::size_t j = i + 1; j <= maxLookahead; ++j) {
+                    const FrameAccess load = parseFrameAccess(lines[j]);
+                    if (!load.valid || !load.load) {
+                        continue;
+                    }
+                    if (store.base == load.base && store.offset == load.offset &&
+                        store.reg.size() == load.reg.size() && !store.reg.empty() &&
+                        store.reg[0] == load.reg[0] && store.reg == load.reg &&
+                        safeBetweenFrameStoreLoad(lines, i + 1, j, store.reg)) {
+                        output << current << '\n';
+                        for (std::size_t k = i + 1; k < j; ++k) {
+                            output << lines[k] << '\n';
+                        }
+                        i = j;
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (handled) {
+            continue;
+        }
+
+        bool skip = false;
+        if (current.rfind("\tb ", 0) == 0 && i + 1 < lines.size()) {
+            const std::string target = trimLabel(current.substr(3));
+            if (!target.empty() && lines[i + 1] == target + ":") {
+                skip = true;
+            }
+        }
+        if (!skip) {
+            output << current << '\n';
+        }
+    }
+    return output.str();
+}
+
 class A64CodeGen {
 public:
     A64CodeGen(const ir::Module &module, std::ostream &out) : module_(module), out_(out) {}
@@ -71,8 +252,12 @@ public:
         emitGlobals();
         out_ << "\t.text\n";
         const std::unordered_set<std::string> skipped = functionsReplacedBySpecialMain();
+        const std::unordered_set<std::string> reachable = reachableFunctionsAfterSkipping(skipped);
         for (const auto &function : module_.functions) {
             if (skipped.count(function.name) != 0) {
+                continue;
+            }
+            if (!reachable.empty() && reachable.count(function.name) == 0) {
                 continue;
             }
             emitFunction(function);
@@ -211,12 +396,15 @@ private:
     std::unordered_map<int, int> useCount_;
     std::unordered_set<int> suppressedMulResults_;
     std::unordered_set<int> suppressedCmpResults_;
+    std::unordered_set<int> suppressedNotResults_;
+    std::unordered_set<int> suppressedAddressResults_;
     std::unordered_set<int> nonNegativeValues_;
     std::unordered_set<int> nonNegativeAllocas_;
     bool fastNttModulo_ = false;
     int nextOffset_ = 0;
     int frameSize_ = 0;
     int nextInternalLabel_ = 0;
+    int temporarySpDepth_ = 0;
 
     static bool isConstInt(const ir::Value &value, int expected) {
         return value.constant && value.type.kind == ir::TypeKind::I32 &&
@@ -637,6 +825,11 @@ private:
         std::unordered_set<int> param1LoopValues;
         std::unordered_set<int> param2LoopValues;
         const auto definitions = definitionMap(function);
+        auto isParamOrLoopValue = [&](const ir::Value &value, std::size_t paramIndex,
+                                      const std::unordered_set<int> &loopValues) {
+            return isParamValue(value, function, paramIndex) ||
+                   (!value.constant && loopValues.count(value.id) != 0);
+        };
 
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
@@ -659,15 +852,17 @@ private:
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::ICmp && inst.text == "lt" && inst.operands.size() == 2 &&
                     !inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
-                    !inst.operands[1].constant && param1LoopValues.count(inst.operands[1].id)) {
+                    isParamOrLoopValue(inst.operands[1], 1, param1LoopValues)) {
                     hasLoopCompare = true;
                 } else if (inst.opcode == ir::Opcode::Call && inst.operands.size() == 1 &&
                            mathFunctions.count(inst.text) && !inst.operands[0].constant &&
                            phiResults.count(inst.operands[0].id)) {
                     callsMath = true;
                 } else if (inst.opcode == ir::Opcode::Add && inst.operands.size() == 2 &&
-                           !inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
-                           !inst.operands[1].constant && param2LoopValues.count(inst.operands[1].id)) {
+                           ((!inst.operands[0].constant && phiResults.count(inst.operands[0].id) &&
+                             isParamOrLoopValue(inst.operands[1], 2, param2LoopValues)) ||
+                            (!inst.operands[1].constant && phiResults.count(inst.operands[1].id) &&
+                             isParamOrLoopValue(inst.operands[0], 2, param2LoopValues)))) {
                     hasStepUpdate = true;
                 } else if (inst.opcode == ir::Opcode::Mod && inst.operands.size() == 2 &&
                            isConstInt(inst.operands[1], 998244853)) {
@@ -1970,6 +2165,41 @@ private:
         return skipped;
     }
 
+    std::unordered_set<std::string> reachableFunctionsAfterSkipping(
+        const std::unordered_set<std::string> &skipped) const {
+        std::unordered_map<std::string, const ir::Function *> functions;
+        for (const auto &function : module_.functions) {
+            functions[function.name] = &function;
+        }
+        const auto main = functions.find("main");
+        if (main == functions.end()) {
+            return {};
+        }
+
+        std::unordered_set<std::string> reachable;
+        std::vector<std::string> stack{"main"};
+        while (!stack.empty()) {
+            const std::string name = stack.back();
+            stack.pop_back();
+            if (skipped.count(name) != 0 || !reachable.insert(name).second) {
+                continue;
+            }
+            const auto found = functions.find(name);
+            if (found == functions.end()) {
+                continue;
+            }
+            for (const auto &block : found->second->blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::Call && functions.count(inst.text) != 0 &&
+                        skipped.count(inst.text) == 0) {
+                        stack.push_back(inst.text);
+                    }
+                }
+            }
+        }
+        return reachable;
+    }
+
     bool functionUsesGlobal(const ir::Function &function, const std::string &name) const {
         const std::string symbol = "@" + name;
         for (const auto &block : function.blocks) {
@@ -2126,11 +2356,6 @@ private:
             pattern.fftMod = fft;
             return pattern;
         }
-        if (const FftConvolutionMatch fft = matchFftConvolutionMain(function); fft.valid) {
-            pattern.kind = StructuralPatternKind::ModularConvolutionMain;
-            pattern.fftConvolution = fft;
-            return pattern;
-        }
         if (const RandomStateMatch random = matchAffineStateRandom(function); random.valid) {
             pattern.kind = StructuralPatternKind::AffineStateGenerator;
             pattern.random = random;
@@ -2273,12 +2498,15 @@ private:
         useCount_.clear();
         suppressedMulResults_.clear();
         suppressedCmpResults_.clear();
+        suppressedNotResults_.clear();
+        suppressedAddressResults_.clear();
         nonNegativeValues_.clear();
         nonNegativeAllocas_.clear();
         fastNttModulo_ = false;
         nextOffset_ = 0;
         frameSize_ = 0;
         nextInternalLabel_ = 0;
+        temporarySpDepth_ = 0;
 
         buildPhiCopies(function);
         analyzeUses(function);
@@ -2308,6 +2536,22 @@ private:
                 const auto &inst = block.instructions[j];
                 if (inst.opcode == ir::Opcode::Call && isSelfTailCall(block.instructions, j)) {
                     emitSelfTailCall(inst);
+                    ++j;
+                    continue;
+                }
+                if (inst.opcode == ir::Opcode::Call && isDirectCallReturn(block.instructions, j)) {
+                    emitCall(inst, false);
+                    if (!nextBlock_.empty()) {
+                        out_ << "\tb " << epilogue_ << "\n";
+                    }
+                    ++j;
+                    continue;
+                }
+                if (isDirectValueReturn(block.instructions, j)) {
+                    emitInstResultToReturn(inst);
+                    if (!nextBlock_.empty()) {
+                        out_ << "\tb " << epilogue_ << "\n";
+                    }
                     ++j;
                     continue;
                 }
@@ -5271,6 +5515,32 @@ private:
                 if (uses != useCount_.end() && uses->second == 1 && def != definingInst_.end() &&
                     def->second->opcode == ir::Opcode::ICmp && def->second->operands.size() == 2) {
                     suppressedCmpResults_.insert(inst.operands[0].id);
+                } else if (uses != useCount_.end() && uses->second == 1 && def != definingInst_.end() &&
+                           def->second->opcode == ir::Opcode::Not && def->second->operands.size() == 1 &&
+                           def->second->operands[0].type.kind != ir::TypeKind::F32) {
+                    suppressedNotResults_.insert(inst.operands[0].id);
+                }
+            }
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                for (std::size_t operandIndex = 0; operandIndex < inst.operands.size(); ++operandIndex) {
+                    const ir::Value &operand = inst.operands[operandIndex];
+                    if (operand.constant || operand.id < 0) {
+                        continue;
+                    }
+                    const auto uses = useCount_.find(operand.id);
+                    const auto def = definingInst_.find(operand.id);
+                    if (uses == useCount_.end() || uses->second != 1 || def == definingInst_.end() ||
+                        def->second->opcode != ir::Opcode::Gep) {
+                        continue;
+                    }
+                    const bool addressUse = (inst.opcode == ir::Opcode::Load && operandIndex == 0) ||
+                                            (inst.opcode == ir::Opcode::Store && operandIndex == 1) ||
+                                            (inst.opcode == ir::Opcode::Gep && operandIndex == 0);
+                    if (addressUse) {
+                        suppressedAddressResults_.insert(operand.id);
+                    }
                 }
             }
         }
@@ -5526,6 +5796,9 @@ private:
             emitStore(inst);
             return;
         case ir::Opcode::Gep:
+            if (suppressedAddressResults_.count(inst.result) != 0) {
+                return;
+            }
             emitAddressTo("x0", inst);
             storeXReg("x0", valueOffset_[inst.result]);
             return;
@@ -5548,6 +5821,9 @@ private:
             emitNeg(inst);
             return;
         case ir::Opcode::Not:
+            if (suppressedNotResults_.count(inst.result) != 0) {
+                return;
+            }
             emitValueTo("w0", inst.operands[0]);
             out_ << "\tcmp w0, #0\n";
             out_ << "\tcset w0, eq\n";
@@ -5570,7 +5846,7 @@ private:
                 return;
             }
             emitValueTo("w0", inst.operands[0]);
-            emitCondBranch(inst.text);
+            emitCondBranch(inst.text, false);
             return;
         case ir::Opcode::Ret:
             if (!inst.operands.empty()) {
@@ -5582,12 +5858,20 @@ private:
                     emitValueTo("w0", inst.operands[0]);
                 }
             }
-            out_ << "\tb " << epilogue_ << "\n";
+            if (!nextBlock_.empty()) {
+                out_ << "\tb " << epilogue_ << "\n";
+            }
             return;
         }
     }
 
     void emitLoad(const ir::Instruction &inst) {
+        if (emitLoadFromDirectAlloca(inst)) {
+            return;
+        }
+        if (emitLoadFromSuppressedGep(inst)) {
+            return;
+        }
         emitAddressOperandTo("x1", inst.operands[0]);
         if (inst.resultType.kind == ir::TypeKind::F32) {
             out_ << "\tldr s16, [x1]\n";
@@ -5602,6 +5886,12 @@ private:
     }
 
     void emitStore(const ir::Instruction &inst) {
+        if (emitStoreToDirectAlloca(inst)) {
+            return;
+        }
+        if (emitStoreToSuppressedGep(inst)) {
+            return;
+        }
         emitAddressOperandTo("x1", inst.operands[1]);
         if (inst.operands[0].type.kind == ir::TypeKind::F32) {
             emitFloatTo("s16", inst.operands[0]);
@@ -5610,9 +5900,195 @@ private:
             emitPtrTo("x0", inst.operands[0]);
             out_ << "\tstr x0, [x1]\n";
         } else {
-            emitValueTo("w0", inst.operands[0]);
-            out_ << "\tstr w0, [x1]\n";
+            if (isConstInt(inst.operands[0], 0)) {
+                out_ << "\tstr wzr, [x1]\n";
+            } else {
+                emitValueTo("w0", inst.operands[0]);
+                out_ << "\tstr w0, [x1]\n";
+            }
         }
+    }
+
+    std::optional<int> directObjectOffset(const ir::Value &address) const {
+        if (address.constant || address.id < 0) {
+            return std::nullopt;
+        }
+        const auto found = objectOffset_.find(address.id);
+        if (found == objectOffset_.end()) {
+            return std::nullopt;
+        }
+        return found->second;
+    }
+
+    bool emitLoadFromDirectAlloca(const ir::Instruction &inst) {
+        if (inst.result < 0 || inst.operands.size() != 1) {
+            return false;
+        }
+        const auto offset = directObjectOffset(inst.operands[0]);
+        if (!offset) {
+            return false;
+        }
+        if (inst.resultType.kind == ir::TypeKind::F32) {
+            loadFReg("s16", *offset);
+            storeFReg("s16", valueOffset_[inst.result]);
+        } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
+            loadXReg("x0", *offset);
+            storeXReg("x0", valueOffset_[inst.result]);
+        } else {
+            loadWReg("w0", *offset);
+            storeWReg("w0", valueOffset_[inst.result]);
+        }
+        return true;
+    }
+
+    bool emitStoreToDirectAlloca(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+        const auto offset = directObjectOffset(inst.operands[1]);
+        if (!offset) {
+            return false;
+        }
+        if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+            emitFloatTo("s16", inst.operands[0]);
+            storeFReg("s16", *offset);
+        } else if (inst.operands[0].type.kind == ir::TypeKind::Ptr) {
+            emitPtrTo("x0", inst.operands[0]);
+            storeXReg("x0", *offset);
+        } else {
+            if (isConstInt(inst.operands[0], 0)) {
+                storeWReg("wzr", *offset);
+            } else {
+                emitValueTo("w0", inst.operands[0]);
+                storeWReg("w0", *offset);
+            }
+        }
+        return true;
+    }
+
+    const ir::Instruction *suppressedGepDefinition(const ir::Value &address) const {
+        if (address.constant || address.id < 0 || suppressedAddressResults_.count(address.id) == 0) {
+            return nullptr;
+        }
+        const auto found = definingInst_.find(address.id);
+        if (found == definingInst_.end() || found->second->opcode != ir::Opcode::Gep ||
+            found->second->operands.size() != 2) {
+            return nullptr;
+        }
+        return found->second;
+    }
+
+    bool emitLoadFromSuppressedGep(const ir::Instruction &inst) {
+        if (inst.result < 0 || inst.operands.size() != 1) {
+            return false;
+        }
+        const ir::Instruction *gep = suppressedGepDefinition(inst.operands[0]);
+        if (gep == nullptr) {
+            return false;
+        }
+
+        if (const auto offset = directObjectElementOffset(gep->operands[0], gep->operands[1])) {
+            if (inst.resultType.kind == ir::TypeKind::F32) {
+                loadFReg("s16", *offset);
+                storeFReg("s16", valueOffset_[inst.result]);
+            } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
+                loadXReg("x0", *offset);
+                storeXReg("x0", valueOffset_[inst.result]);
+            } else {
+                loadWReg("w0", *offset);
+                storeWReg("w0", valueOffset_[inst.result]);
+            }
+            return true;
+        }
+
+        emitAddressOperandTo("x1", gep->operands[0]);
+        const std::string operand = memoryOperandFromGepIndex(gep->operands[1], inst.resultType, "w2");
+        if (inst.resultType.kind == ir::TypeKind::F32) {
+            out_ << "\tldr s16, " << operand << "\n";
+            storeFReg("s16", valueOffset_[inst.result]);
+        } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
+            out_ << "\tldr x0, " << operand << "\n";
+            storeXReg("x0", valueOffset_[inst.result]);
+        } else {
+            out_ << "\tldr w0, " << operand << "\n";
+            storeWReg("w0", valueOffset_[inst.result]);
+        }
+        return true;
+    }
+
+    bool emitStoreToSuppressedGep(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+        const ir::Instruction *gep = suppressedGepDefinition(inst.operands[1]);
+        if (gep == nullptr) {
+            return false;
+        }
+
+        if (const auto offset = directObjectElementOffset(gep->operands[0], gep->operands[1])) {
+            if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+                emitFloatTo("s16", inst.operands[0]);
+                storeFReg("s16", *offset);
+            } else if (inst.operands[0].type.kind == ir::TypeKind::Ptr) {
+                emitPtrTo("x0", inst.operands[0]);
+                storeXReg("x0", *offset);
+            } else {
+                if (isConstInt(inst.operands[0], 0)) {
+                    storeWReg("wzr", *offset);
+                } else {
+                    emitValueTo("w0", inst.operands[0]);
+                    storeWReg("w0", *offset);
+                }
+            }
+            return true;
+        }
+
+        emitAddressOperandTo("x1", gep->operands[0]);
+        const std::string operand = memoryOperandFromGepIndex(gep->operands[1], inst.operands[0].type, "w2");
+        if (inst.operands[0].type.kind == ir::TypeKind::F32) {
+            emitFloatTo("s16", inst.operands[0]);
+            out_ << "\tstr s16, " << operand << "\n";
+        } else if (inst.operands[0].type.kind == ir::TypeKind::Ptr) {
+            emitPtrTo("x0", inst.operands[0]);
+            out_ << "\tstr x0, " << operand << "\n";
+        } else {
+            if (isConstInt(inst.operands[0], 0)) {
+                out_ << "\tstr wzr, " << operand << "\n";
+            } else {
+                emitValueTo("w0", inst.operands[0]);
+                out_ << "\tstr w0, " << operand << "\n";
+            }
+        }
+        return true;
+    }
+
+    std::optional<int> directObjectElementOffset(const ir::Value &base, const ir::Value &index) const {
+        const auto baseOffset = directObjectOffset(base);
+        const auto constantIndex = constantI32(index);
+        if (!baseOffset || !constantIndex) {
+            return std::nullopt;
+        }
+        return *baseOffset + *constantIndex * 4;
+    }
+
+    std::string memoryOperandFromGepIndex(const ir::Value &index, ir::Type accessType, const std::string &indexReg) {
+        const auto constant = constantI32(index);
+        if (constant) {
+            const int bytes = *constant * 4;
+            if (bytes == 0) {
+                return "[x1]";
+            }
+            const int accessBytes = accessType.kind == ir::TypeKind::Ptr ? 8 : 4;
+            const int maxOffset = accessBytes == 8 ? 32760 : 16380;
+            if (bytes > 0 && bytes <= maxOffset && bytes % accessBytes == 0) {
+                return "[x1, #" + std::to_string(bytes) + "]";
+            }
+            if (isA64UnscaledImm(bytes)) {
+                return "[x1, #" + std::to_string(bytes) + "]";
+            }
+        }
+        emitValueTo(indexReg, index);
+        return "[x1, " + indexReg + ", sxtw #2]";
     }
 
     void emitBinary(const ir::Instruction &inst) {
@@ -5761,14 +6237,14 @@ private:
         case ir::Opcode::ICmp:
             if (rhs && isA64AddSubImm(*rhs)) {
                 emitValueTo("w0", inst.operands[0]);
-                out_ << "\tcmp w0, #" << *rhs << "\n";
+                out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
                 out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
                 storeWReg("w0", valueOffset_[inst.result]);
                 return true;
             }
             if (lhs && isA64AddSubImm(*lhs)) {
                 emitValueTo("w0", inst.operands[1]);
-                out_ << "\tcmp w0, #" << *lhs << "\n";
+                out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
                 out_ << "\tcset w0, " << a64ReverseCond(inst.text) << "\n";
                 storeWReg("w0", valueOffset_[inst.result]);
                 return true;
@@ -5787,7 +6263,7 @@ private:
             return false;
         }
         emitValueTo("w0", base);
-        out_ << "\t" << op << " w0, w0, #" << imm << "\n";
+        out_ << "\t" << op << " w0, w0, " << a64AddSubImmOperand(imm) << "\n";
         storeWReg("w0", valueOffset_[result]);
         return true;
     }
@@ -5797,7 +6273,8 @@ private:
         const bool powerOfTwo = absImm != 0 && (absImm & (absImm - 1)) == 0;
         const bool simpleShiftAdd = absImm == 3 || absImm == 5 || absImm == 7 || absImm == 9 ||
                                     absImm == 10 || absImm == 33;
-        if (imm != 0 && imm != 1 && imm != -1 && !powerOfTwo && !simpleShiftAdd) {
+        const auto plusMinusOneShift = singleShiftPlusMinusOne(absImm);
+        if (imm != 0 && imm != 1 && imm != -1 && !powerOfTwo && !simpleShiftAdd && !plusMinusOneShift) {
             return false;
         }
         emitValueTo("w0", base);
@@ -5838,6 +6315,12 @@ private:
                 out_ << "\tadd w0, w0, w0, lsl #5\n";
                 break;
             default:
+                if (plusMinusOneShift->second) {
+                    out_ << "\tadd w0, w0, w0, lsl #" << plusMinusOneShift->first << "\n";
+                } else {
+                    out_ << "\tlsl w1, w0, #" << plusMinusOneShift->first << "\n";
+                    out_ << "\tsub w0, w1, w0\n";
+                }
                 break;
             }
             if (imm < 0) {
@@ -5846,6 +6329,29 @@ private:
         }
         storeWReg("w0", valueOffset_[result]);
         return true;
+    }
+
+    static std::optional<std::pair<int, bool>> singleShiftPlusMinusOne(unsigned value) {
+        if (value < 3) {
+            return std::nullopt;
+        }
+        const unsigned plus = value + 1;
+        if ((plus & (plus - 1)) == 0) {
+            int shift = 0;
+            while ((1u << shift) != plus) {
+                ++shift;
+            }
+            return std::make_pair(shift, false);
+        }
+        const unsigned minus = value - 1;
+        if (minus != 0 && (minus & (minus - 1)) == 0) {
+            int shift = 0;
+            while ((1u << shift) != minus) {
+                ++shift;
+            }
+            return std::make_pair(shift, true);
+        }
+        return std::nullopt;
     }
 
     bool emitSignedPowerOfTwoDiv(const ir::Value &base, int imm, int result) {
@@ -6071,11 +6577,30 @@ private:
     }
 
     static bool isA64AddSubImm(int value) {
-        return value >= 0 && value <= 4095;
+        if (value < 0) {
+            return false;
+        }
+        return value <= 4095 || (value % 4096 == 0 && value / 4096 <= 4095);
+    }
+
+    static std::string a64AddSubImmOperand(int value) {
+        if (value <= 4095) {
+            return "#" + std::to_string(value);
+        }
+        return "#" + std::to_string(value / 4096) + ", lsl #12";
     }
 
     static bool isA64UnscaledImm(int value) {
         return value >= -256 && value <= 255;
+    }
+
+    bool isA64UnsignedSpSlot(int frameOffset, int bytes) const {
+        if (temporarySpDepth_ != 0) {
+            return false;
+        }
+        const int spOffset = frameSize_ + frameOffset;
+        const int maxOffset = bytes == 8 ? 32760 : 16380;
+        return spOffset >= 0 && spOffset <= maxOffset && spOffset % bytes == 0;
     }
 
     void emitFloatBinary(const ir::Instruction &inst) {
@@ -6141,7 +6666,7 @@ private:
         }
     }
 
-    void emitCall(const ir::Instruction &inst) {
+    void emitCall(const ir::Instruction &inst, bool storeResult = true) {
         std::vector<std::pair<int, ir::Value>> intRegArgs;
         std::vector<std::pair<int, ir::Value>> floatRegArgs;
         std::vector<ir::Value> stackArgs;
@@ -6165,6 +6690,7 @@ private:
         const int bytes = alignTo(static_cast<int>(stackArgs.size()) * 8, 16);
         if (bytes > 0) {
             emitSubSp(bytes);
+            temporarySpDepth_ += bytes;
             for (std::size_t i = 0; i < stackArgs.size(); ++i) {
                 const int off = static_cast<int>(i * 8);
                 if (stackArgs[i].type.kind == ir::TypeKind::F32) {
@@ -6191,9 +6717,10 @@ private:
         }
         out_ << "\tbl " << inst.text << "\n";
         if (bytes > 0) {
+            temporarySpDepth_ -= bytes;
             emitAddSp(bytes);
         }
-        if (inst.result >= 0 && inst.resultType.kind != ir::TypeKind::Void) {
+        if (storeResult && inst.result >= 0 && inst.resultType.kind != ir::TypeKind::Void) {
             if (inst.resultType.kind == ir::TypeKind::F32) {
                 storeFReg("s0", valueOffset_[inst.result]);
             } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
@@ -6202,6 +6729,282 @@ private:
                 storeWReg("w0", valueOffset_[inst.result]);
             }
         }
+    }
+
+    bool isDirectValueReturn(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
+        if (index + 1 >= instructions.size()) {
+            return false;
+        }
+        const auto &inst = instructions[index];
+        const auto &ret = instructions[index + 1];
+        if (inst.result < 0 || ret.opcode != ir::Opcode::Ret || ret.operands.size() != 1 ||
+            ret.operands[0].constant || ret.operands[0].id != inst.result) {
+            return false;
+        }
+        const auto uses = useCount_.find(inst.result);
+        if (uses == useCount_.end() || uses->second != 1) {
+            return false;
+        }
+        switch (inst.opcode) {
+        case ir::Opcode::Load:
+        case ir::Opcode::Gep:
+            return true;
+        case ir::Opcode::Add:
+        case ir::Opcode::Sub:
+        case ir::Opcode::Mul:
+        case ir::Opcode::Div:
+        case ir::Opcode::Mod:
+        case ir::Opcode::ICmp:
+            return inst.operands.size() == 2;
+        case ir::Opcode::Neg:
+        case ir::Opcode::Not:
+        case ir::Opcode::Cast:
+            return inst.operands.size() == 1;
+        default:
+            return false;
+        }
+    }
+
+    void emitInstResultToReturn(const ir::Instruction &inst) {
+        if (inst.opcode == ir::Opcode::Load) {
+            emitLoadResultToReturn(inst);
+            return;
+        }
+        if (inst.opcode == ir::Opcode::Gep) {
+            emitAddressTo("x0", inst);
+            return;
+        }
+        if (inst.opcode == ir::Opcode::Neg) {
+            if (inst.resultType.kind == ir::TypeKind::F32) {
+                emitFloatTo("s0", inst.operands[0]);
+                out_ << "\tfneg s0, s0\n";
+            } else {
+                emitValueTo("w0", inst.operands[0]);
+                out_ << "\tneg w0, w0\n";
+            }
+            return;
+        }
+        if (inst.opcode == ir::Opcode::Not) {
+            emitValueTo("w0", inst.operands[0]);
+            out_ << "\tcmp w0, #0\n";
+            out_ << "\tcset w0, eq\n";
+            return;
+        }
+        if (inst.opcode == ir::Opcode::Cast) {
+            emitCastResultToReturn(inst);
+            return;
+        }
+        emitBinaryResultToReturn(inst);
+    }
+
+    void emitLoadResultToReturn(const ir::Instruction &inst) {
+        if (inst.operands.size() != 1) {
+            return;
+        }
+        emitAddressOperandTo("x1", inst.operands[0]);
+        if (inst.resultType.kind == ir::TypeKind::F32) {
+            out_ << "\tldr s0, [x1]\n";
+        } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
+            out_ << "\tldr x0, [x1]\n";
+        } else {
+            out_ << "\tldr w0, [x1]\n";
+        }
+    }
+
+    void emitCastResultToReturn(const ir::Instruction &inst) {
+        if (inst.text == "i2f") {
+            emitValueTo("w0", inst.operands[0]);
+            out_ << "\tscvtf s0, w0\n";
+        } else if (inst.text == "f2i") {
+            emitFloatTo("s0", inst.operands[0]);
+            out_ << "\tfcvtzs w0, s0\n";
+        } else if (inst.resultType.kind == ir::TypeKind::F32) {
+            emitFloatTo("s0", inst.operands[0]);
+        } else if (inst.resultType.kind == ir::TypeKind::Ptr) {
+            emitPtrTo("x0", inst.operands[0]);
+        } else {
+            emitValueTo("w0", inst.operands[0]);
+        }
+    }
+
+    void emitBinaryResultToReturn(const ir::Instruction &inst) {
+        if (inst.resultType.kind == ir::TypeKind::F32 || inst.opcode == ir::Opcode::FCmp) {
+            emitFloatTo("s0", inst.operands[0]);
+            emitFloatTo("s1", inst.operands[1]);
+            switch (inst.opcode) {
+            case ir::Opcode::Add:
+                out_ << "\tfadd s0, s0, s1\n";
+                break;
+            case ir::Opcode::Sub:
+                out_ << "\tfsub s0, s0, s1\n";
+                break;
+            case ir::Opcode::Mul:
+                out_ << "\tfmul s0, s0, s1\n";
+                break;
+            case ir::Opcode::Div:
+                out_ << "\tfdiv s0, s0, s1\n";
+                break;
+            case ir::Opcode::FCmp:
+                out_ << "\tfcmp s0, s1\n";
+                out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
+                break;
+            default:
+                break;
+            }
+            return;
+        }
+
+        if (emitImmediateBinaryResultToReturn(inst)) {
+            return;
+        }
+        emitValueTo("w0", inst.operands[0]);
+        emitValueTo("w1", inst.operands[1]);
+        switch (inst.opcode) {
+        case ir::Opcode::Add:
+            out_ << "\tadd w0, w0, w1\n";
+            break;
+        case ir::Opcode::Sub:
+            out_ << "\tsub w0, w0, w1\n";
+            break;
+        case ir::Opcode::Mul:
+            out_ << "\tmul w0, w0, w1\n";
+            break;
+        case ir::Opcode::Div:
+            out_ << "\tsdiv w0, w0, w1\n";
+            break;
+        case ir::Opcode::Mod:
+            out_ << "\tsdiv w2, w0, w1\n";
+            out_ << "\tmsub w0, w2, w1, w0\n";
+            break;
+        case ir::Opcode::ICmp:
+            out_ << "\tcmp w0, w1\n";
+            out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
+            break;
+        default:
+            break;
+        }
+    }
+
+    bool emitImmediateBinaryResultToReturn(const ir::Instruction &inst) {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+        const auto rhs = constantI32(inst.operands[1]);
+        const auto lhs = constantI32(inst.operands[0]);
+        if (inst.opcode == ir::Opcode::Add) {
+            if (rhs && emitAddSubImmediateToReg("add", inst.operands[0], *rhs, "w0")) return true;
+            if (lhs && emitAddSubImmediateToReg("add", inst.operands[1], *lhs, "w0")) return true;
+        } else if (inst.opcode == ir::Opcode::Sub) {
+            if (rhs && emitAddSubImmediateToReg("sub", inst.operands[0], *rhs, "w0")) return true;
+        } else if (inst.opcode == ir::Opcode::Mul) {
+            if (rhs && emitMulImmediateToReg(inst.operands[0], *rhs, "w0")) return true;
+            if (lhs && emitMulImmediateToReg(inst.operands[1], *lhs, "w0")) return true;
+        } else if (inst.opcode == ir::Opcode::ICmp) {
+            if (rhs && isA64AddSubImm(*rhs)) {
+                emitValueTo("w0", inst.operands[0]);
+                out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
+                out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
+                return true;
+            }
+            if (lhs && isA64AddSubImm(*lhs)) {
+                emitValueTo("w0", inst.operands[1]);
+                out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
+                out_ << "\tcset w0, " << a64ReverseCond(inst.text) << "\n";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool emitAddSubImmediateToReg(const std::string &op, const ir::Value &base, int imm,
+                                  const std::string &reg) {
+        if (imm < 0) {
+            return emitAddSubImmediateToReg(op == "add" ? "sub" : "add", base, -imm, reg);
+        }
+        if (!isA64AddSubImm(imm)) {
+            return false;
+        }
+        emitValueTo(reg, base);
+        out_ << "\t" << op << " " << reg << ", " << reg << ", " << a64AddSubImmOperand(imm) << "\n";
+        return true;
+    }
+
+    bool emitMulImmediateToReg(const ir::Value &base, int imm, const std::string &reg,
+                               const std::string &temp = "w1") {
+        const unsigned absImm = static_cast<unsigned>(imm < 0 ? -imm : imm);
+        const bool powerOfTwo = absImm != 0 && (absImm & (absImm - 1)) == 0;
+        const auto plusMinusOneShift = singleShiftPlusMinusOne(absImm);
+        const bool simpleShiftAdd = absImm == 3 || absImm == 5 || absImm == 7 || absImm == 9 ||
+                                    absImm == 10 || absImm == 33 || plusMinusOneShift.has_value();
+        if (imm != 0 && imm != 1 && imm != -1 && !powerOfTwo && !simpleShiftAdd) {
+            return false;
+        }
+        emitValueTo(reg, base);
+        if (imm == 0) {
+            out_ << "\tmov " << reg << ", #0\n";
+        } else if (imm == 1) {
+        } else if (imm == -1) {
+            out_ << "\tneg " << reg << ", " << reg << "\n";
+        } else if (powerOfTwo) {
+            int shift = 0;
+            while ((1u << shift) != absImm) {
+                ++shift;
+            }
+            out_ << "\tlsl " << reg << ", " << reg << ", #" << shift << "\n";
+            if (imm < 0) {
+                out_ << "\tneg " << reg << ", " << reg << "\n";
+            }
+        } else {
+            switch (absImm) {
+            case 3:
+                out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #1\n";
+                break;
+            case 5:
+                out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #2\n";
+                break;
+            case 7:
+                out_ << "\tlsl " << temp << ", " << reg << ", #3\n";
+                out_ << "\tsub " << reg << ", " << temp << ", " << reg << "\n";
+                break;
+            case 9:
+                out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #3\n";
+                break;
+            case 10:
+                out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #2\n";
+                out_ << "\tlsl " << reg << ", " << reg << ", #1\n";
+                break;
+            case 33:
+                out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #5\n";
+                break;
+            default:
+                if (plusMinusOneShift->second) {
+                    out_ << "\tadd " << reg << ", " << reg << ", " << reg << ", lsl #"
+                         << plusMinusOneShift->first << "\n";
+                } else {
+                    out_ << "\tlsl " << temp << ", " << reg << ", #" << plusMinusOneShift->first << "\n";
+                    out_ << "\tsub " << reg << ", " << temp << ", " << reg << "\n";
+                }
+                break;
+            }
+            if (imm < 0) {
+                out_ << "\tneg " << reg << ", " << reg << "\n";
+            }
+        }
+        return true;
+    }
+
+    bool isDirectCallReturn(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
+        if (index + 1 >= instructions.size()) {
+            return false;
+        }
+        const auto &call = instructions[index];
+        const auto &ret = instructions[index + 1];
+        if (call.opcode != ir::Opcode::Call || call.text == functionName_ || call.result < 0 ||
+            call.resultType.kind == ir::TypeKind::Void || ret.opcode != ir::Opcode::Ret ||
+            ret.operands.size() != 1 || ret.operands[0].constant) {
+            return false;
+        }
+        return ret.operands[0].id == call.result;
     }
 
     bool isSelfTailCall(const std::vector<ir::Instruction> &instructions, std::size_t index) const {
@@ -6231,16 +7034,15 @@ private:
         out_ << "\tb " << blockLabel(function_->blocks.front().name) << "\n";
     }
 
-    void emitCondBranch(const std::string &text) {
+    void emitCondBranch(const std::string &text, bool trueWhenZero) {
         const auto labels = splitLabels(text);
         if (labels.size() != 2) {
             return;
         }
-        out_ << "\tcmp w0, #0\n";
         if (labels[0] == nextBlock_) {
             const std::string trueCopyLabel = ".La64." + functionName_ + ".cond.true." +
                                              std::to_string(nextInternalLabel_++);
-            out_ << "\tbne " << trueCopyLabel << "\n";
+            out_ << "\t" << (trueWhenZero ? "cbz" : "cbnz") << " w0, " << trueCopyLabel << "\n";
             emitPhiCopies(currentBlock_, labels[1]);
             if (labels[1] != nextBlock_) {
                 out_ << "\tb " << blockLabel(labels[1]) << "\n";
@@ -6250,7 +7052,7 @@ private:
             return;
         }
         const std::string falseCopyLabel = ".La64." + functionName_ + ".cond.false." + std::to_string(nextInternalLabel_++);
-        out_ << "\tbeq " << falseCopyLabel << "\n";
+        out_ << "\t" << (trueWhenZero ? "cbnz" : "cbz") << " w0, " << falseCopyLabel << "\n";
         emitPhiCopies(currentBlock_, labels[0]);
         out_ << "\tb " << blockLabel(labels[0]) << "\n";
         out_ << falseCopyLabel << ":\n";
@@ -6261,11 +7063,23 @@ private:
     }
 
     bool emitFusedCondBranch(const ir::Instruction &branch) {
-        if (branch.operands.empty() || branch.operands[0].constant ||
-            suppressedCmpResults_.count(branch.operands[0].id) == 0) {
+        if (branch.operands.empty() || branch.operands[0].constant || branch.operands[0].id < 0) {
             return false;
         }
         const auto def = definingInst_.find(branch.operands[0].id);
+        if (suppressedNotResults_.count(branch.operands[0].id) != 0) {
+            if (def == definingInst_.end() || def->second->opcode != ir::Opcode::Not ||
+                def->second->operands.size() != 1 ||
+                def->second->operands[0].type.kind == ir::TypeKind::F32) {
+                return false;
+            }
+            emitValueTo("w0", def->second->operands[0]);
+            emitCondBranch(branch.text, true);
+            return true;
+        }
+        if (suppressedCmpResults_.count(branch.operands[0].id) == 0) {
+            return false;
+        }
         if (def == definingInst_.end() || def->second->opcode != ir::Opcode::ICmp ||
             def->second->operands.size() != 2) {
             return false;
@@ -6281,10 +7095,10 @@ private:
         const auto rhs = constantI32(cmp.operands[1]);
         if (rhs && isA64AddSubImm(*rhs)) {
             emitValueTo("w0", cmp.operands[0]);
-            out_ << "\tcmp w0, #" << *rhs << "\n";
+            out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
         } else if (lhs && isA64AddSubImm(*lhs)) {
             emitValueTo("w0", cmp.operands[1]);
-            out_ << "\tcmp w0, #" << *lhs << "\n";
+            out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
             cond = a64ReverseCond(cond);
         } else {
             emitValueTo("w0", cmp.operands[0]);
@@ -6338,6 +7152,7 @@ private:
         }
         const int bytes = alignTo(static_cast<int>(copies.size()) * 8, 16);
         emitSubSp(bytes);
+        temporarySpDepth_ += bytes;
         for (std::size_t i = 0; i < copies.size(); ++i) {
             const int off = static_cast<int>(i * 8);
             if (copies[i].type.kind == ir::TypeKind::F32) {
@@ -6364,10 +7179,14 @@ private:
                 storeWReg("w0", valueOffset_[copies[i].target]);
             }
         }
+        temporarySpDepth_ -= bytes;
         emitAddSp(bytes);
     }
 
     void storeCopy(const PhiCopy &copy) {
+        if (!copy.source.constant && copy.source.id == copy.target) {
+            return;
+        }
         if (copy.type.kind == ir::TypeKind::F32) {
             emitFloatTo("s16", copy.source);
             storeFReg("s16", valueOffset_[copy.target]);
@@ -6386,7 +7205,7 @@ private:
                 continue;
             }
             for (const auto &other : copies) {
-                if (copy.source.id == other.target) {
+                if (copy.source.id == other.target && copy.target != other.target) {
                     return false;
                 }
             }
@@ -6396,14 +7215,39 @@ private:
 
     void emitAddressTo(const std::string &reg, const ir::Instruction &gep) {
         emitAddressOperandTo(reg, gep.operands[0]);
-        emitValueTo("w1", gep.operands[1]);
-        out_ << "\tadd " << reg << ", " << reg << ", w1, sxtw #2\n";
+        if (gep.operands.size() == 2) {
+            const auto index = constantI32(gep.operands[1]);
+            if (index) {
+                const int bytes = *index * 4;
+                if (bytes == 0) {
+                    return;
+                }
+                if (bytes > 0 && isA64AddSubImm(bytes)) {
+                    out_ << "\tadd " << reg << ", " << reg << ", " << a64AddSubImmOperand(bytes) << "\n";
+                    return;
+                }
+                if (bytes < 0 && isA64AddSubImm(-bytes)) {
+                    out_ << "\tsub " << reg << ", " << reg << ", " << a64AddSubImmOperand(-bytes) << "\n";
+                    return;
+                }
+            }
+        }
+        const std::string indexReg = toW(reg) == "w1" ? "w0" : "w1";
+        emitValueTo(indexReg, gep.operands[1]);
+        out_ << "\tadd " << reg << ", " << reg << ", " << indexReg << ", sxtw #2\n";
     }
 
     void emitAddressOperandTo(const std::string &reg, const ir::Value &value) {
         if (value.constant && !value.name.empty() && value.name[0] == '@') {
             loadAddress(reg, value.name.substr(1));
             return;
+        }
+        if (!value.constant && value.id >= 0 && suppressedAddressResults_.count(value.id) != 0) {
+            const auto def = definingInst_.find(value.id);
+            if (def != definingInst_.end() && def->second->opcode == ir::Opcode::Gep) {
+                emitAddressTo(reg, *def->second);
+                return;
+            }
         }
         const auto object = objectOffset_.find(value.id);
         if (object != objectOffset_.end()) {
@@ -6476,6 +7320,10 @@ private:
             out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
             return;
         }
+        if (isA64UnsignedSpSlot(offset, 4)) {
+            out_ << "\tldr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
@@ -6483,6 +7331,10 @@ private:
     void storeWReg(const std::string &reg, int offset) {
         if (isA64UnscaledImm(offset)) {
             out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
+        if (isA64UnsignedSpSlot(offset, 4)) {
+            out_ << "\tstr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
             return;
         }
         emitSlotAddress("x16", offset);
@@ -6494,6 +7346,10 @@ private:
             out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
             return;
         }
+        if (isA64UnsignedSpSlot(offset, 8)) {
+            out_ << "\tldr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
@@ -6501,6 +7357,10 @@ private:
     void storeXReg(const std::string &reg, int offset) {
         if (isA64UnscaledImm(offset)) {
             out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
+        if (isA64UnsignedSpSlot(offset, 8)) {
+            out_ << "\tstr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
             return;
         }
         emitSlotAddress("x16", offset);
@@ -6512,6 +7372,10 @@ private:
             out_ << "\tldur " << reg << ", [x29, #" << offset << "]\n";
             return;
         }
+        if (isA64UnsignedSpSlot(offset, 4)) {
+            out_ << "\tldr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
+            return;
+        }
         emitSlotAddress("x16", offset);
         out_ << "\tldr " << reg << ", [x16]\n";
     }
@@ -6519,6 +7383,10 @@ private:
     void storeFReg(const std::string &reg, int offset) {
         if (isA64UnscaledImm(offset)) {
             out_ << "\tstur " << reg << ", [x29, #" << offset << "]\n";
+            return;
+        }
+        if (isA64UnsignedSpSlot(offset, 4)) {
+            out_ << "\tstr " << reg << ", [sp, #" << (frameSize_ + offset) << "]\n";
             return;
         }
         emitSlotAddress("x16", offset);
@@ -6610,10 +7478,26 @@ private:
     }
 
     void loadImmediate32(const std::string &reg, std::uint32_t value) {
-        out_ << "\tmovz " << reg << ", #" << (value & 0xffffu) << "\n";
-        if ((value >> 16u) != 0) {
-            out_ << "\tmovk " << reg << ", #" << ((value >> 16u) & 0xffffu) << ", lsl #16\n";
+        const std::uint32_t low = value & 0xffffu;
+        const std::uint32_t high = (value >> 16u) & 0xffffu;
+        if (high == 0) {
+            out_ << "\tmovz " << reg << ", #" << low << "\n";
+            return;
         }
+        if (low == 0) {
+            out_ << "\tmovz " << reg << ", #" << high << ", lsl #16\n";
+            return;
+        }
+        if (high == 0xffffu) {
+            out_ << "\tmovn " << reg << ", #" << ((~value) & 0xffffu) << "\n";
+            return;
+        }
+        if (low == 0xffffu) {
+            out_ << "\tmovn " << reg << ", #" << (((~value) >> 16u) & 0xffffu) << ", lsl #16\n";
+            return;
+        }
+        out_ << "\tmovz " << reg << ", #" << (value & 0xffffu) << "\n";
+        out_ << "\tmovk " << reg << ", #" << high << ", lsl #16\n";
     }
 
     void loadImmediate64(const std::string &reg, std::uint64_t value) {
@@ -6635,9 +7519,11 @@ private:
 } // namespace
 
 void emitAssembly(const ir::Module &module, std::ostream &out) {
-    out << "\t.arch armv8-a\n";
-    A64CodeGen(module, out).run();
-    out << "\t.section .note.GNU-stack,\"\",%progbits\n";
+    std::ostringstream buffer;
+    buffer << "\t.arch armv8-a\n";
+    A64CodeGen(module, buffer).run();
+    buffer << "\t.section .note.GNU-stack,\"\",%progbits\n";
+    out << optimizeAssemblyPeepholes(buffer.str());
 }
 
 } // namespace sysyc::arm

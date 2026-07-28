@@ -1,0 +1,9 @@
+int main() {
+  int a = getint();
+  int b = getint();
+  int x = a / b;
+  if (a > b) {
+    x = x + 1;
+  }
+  return x + a / b;
+}

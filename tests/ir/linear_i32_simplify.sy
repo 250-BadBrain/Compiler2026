@@ -1,0 +1,8 @@
+int main() {
+    int a = getint();
+    int b = getint();
+    int c = a + b;
+    int d = a - c;
+    int e = d + b;
+    return e;
+}

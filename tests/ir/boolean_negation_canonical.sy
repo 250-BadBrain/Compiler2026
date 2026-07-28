@@ -1,0 +1,13 @@
+int cmp_not(int a, int b) {
+    return !(a < b);
+}
+
+int boolize(int x) {
+    return !!x;
+}
+
+int main() {
+    int x = getint();
+    int y = getint();
+    return cmp_not(x, y) + boolize(x);
+}

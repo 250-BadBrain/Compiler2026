@@ -1,0 +1,12 @@
+int main() {
+  int n = getint();
+  int a = getint();
+  int b = getint();
+  int i = 0;
+  int sum = 0;
+  while (i < n) {
+    sum = sum + a / b;
+    i = i + 1;
+  }
+  return sum;
+}

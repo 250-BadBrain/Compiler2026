@@ -1,0 +1,13 @@
+int first(int a[], int i) {
+    return a[i];
+}
+
+int plus_five(int x) {
+    putint(x);
+    return x + 5;
+}
+
+int main() {
+    int a[2] = {3, 4};
+    return first(a, 1) + plus_five(getint());
+}

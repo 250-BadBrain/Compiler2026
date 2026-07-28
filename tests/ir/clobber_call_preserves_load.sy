@@ -1,0 +1,9 @@
+int g[1];
+
+int main() {
+    g[0] = 1;
+    int x = g[0];
+    getarray(g);
+    int y = g[0];
+    return x + y;
+}

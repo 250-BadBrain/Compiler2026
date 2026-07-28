@@ -1,0 +1,8 @@
+int table[4] = {2, 4, 6, 8};
+
+int main() {
+    int x = table[1];
+    putint(x);
+    int y = table[3];
+    return x + y;
+}

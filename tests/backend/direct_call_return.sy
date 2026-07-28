@@ -1,0 +1,12 @@
+int callee(int x) {
+    putint(x);
+    return x + 1;
+}
+
+int wrapper(int x) {
+    return callee(x);
+}
+
+int main() {
+    return wrapper(getint());
+}

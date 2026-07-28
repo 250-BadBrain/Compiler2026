@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
@@ -376,6 +378,10 @@ bool simplifyAlgebra(const Instruction &inst, Value &result) {
                 result = Value{-1, Type{TypeKind::I32}, "0", true};
                 return true;
             }
+            if (!lhs.constant && !rhs.constant && lhs.id == rhs.id) {
+                result = Value{-1, Type{TypeKind::I32}, "0", true};
+                return true;
+            }
         } else if (inst.opcode == Opcode::ICmp && !lhs.constant && !rhs.constant && lhs.id == rhs.id) {
             const bool folded = inst.text == "eq" || inst.text == "le" || inst.text == "ge";
             if (inst.text == "eq" || inst.text == "ne" || inst.text == "lt" || inst.text == "gt" || inst.text == "le" || inst.text == "ge") {
@@ -400,13 +406,22 @@ std::string instKey(const Instruction &inst) {
     for (const auto &operand : inst.operands) {
         operands.push_back(valueKey(operand));
     }
+    std::string text = inst.text;
+    if ((inst.opcode == Opcode::ICmp || inst.opcode == Opcode::FCmp) && operands.size() == 2 &&
+        (text == "lt" || text == "gt" || text == "le" || text == "ge") && operands[1] < operands[0]) {
+        std::swap(operands[0], operands[1]);
+        if (text == "lt") text = "gt";
+        else if (text == "gt") text = "lt";
+        else if (text == "le") text = "ge";
+        else if (text == "ge") text = "le";
+    }
     const bool commutative = inst.opcode == Opcode::Add || inst.opcode == Opcode::Mul ||
-                             (inst.opcode == Opcode::ICmp && (inst.text == "eq" || inst.text == "ne")) ||
-                             (inst.opcode == Opcode::FCmp && (inst.text == "eq" || inst.text == "ne"));
+                             (inst.opcode == Opcode::ICmp && (text == "eq" || text == "ne")) ||
+                             (inst.opcode == Opcode::FCmp && (text == "eq" || text == "ne"));
     if (commutative) {
         std::sort(operands.begin(), operands.end());
     }
-    std::string key = opcodeName(inst.opcode) + ":" + typeName(inst.resultType) + ":" + inst.text;
+    std::string key = opcodeName(inst.opcode) + ":" + typeName(inst.resultType) + ":" + text;
     for (const auto &operand : operands) {
         key += "|" + operand;
     }
@@ -427,6 +442,8 @@ Value zeroValue(Type type) {
     }
     return Value{-1, type, "0", true};
 }
+
+std::optional<long long> constantI32Value(const Value &value);
 
 bool promoteSingleBlockAllocas(Function &function) {
     struct Candidate {
@@ -537,6 +554,15 @@ bool promoteSingleBlockAllocas(Function &function) {
     return changed;
 }
 
+std::string trimBranchLabel(const std::string &label) {
+    const std::size_t first = label.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const std::size_t last = label.find_last_not_of(" \t\r\n");
+    return label.substr(first, last - first + 1);
+}
+
 std::vector<std::vector<int>> computePredecessors(const Function &function) {
     std::unordered_map<std::string, int> blockIndex;
     for (std::size_t i = 0; i < function.blocks.size(); ++i) {
@@ -559,8 +585,8 @@ std::vector<std::vector<int>> computePredecessors(const Function &function) {
         } else if (term.opcode == Opcode::CondBr) {
             const std::size_t comma = term.text.find(',');
             if (comma != std::string::npos) {
-                add(term.text.substr(0, comma));
-                add(term.text.substr(comma + 2));
+                add(trimBranchLabel(term.text.substr(0, comma)));
+                add(trimBranchLabel(term.text.substr(comma + 1)));
             }
         }
     }
@@ -951,6 +977,70 @@ std::unordered_set<std::string> pureFunctionNames(const Module &module) {
                 }
                 if (inst.opcode == Opcode::Call) {
                     callees[function.name].push_back(inst.text);
+                }
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        if (ok) {
+            candidates.insert(function.name);
+        }
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto it = candidates.begin(); it != candidates.end();) {
+            bool ok = true;
+            for (const auto &callee : callees[*it]) {
+                if (!candidates.count(callee)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                it = candidates.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+    return candidates;
+}
+
+bool runtimeCallDoesNotWriteUserMemory(const std::string &name) {
+    return name == "getint" || name == "getch" || name == "getfloat" ||
+           name == "putint" || name == "putch" || name == "putfloat" ||
+           name == "putarray" || name == "putfarray" ||
+           name == "starttime" || name == "stoptime" ||
+           name == "_sysy_starttime" || name == "_sysy_stoptime";
+}
+
+std::unordered_set<std::string> memoryNonClobberingFunctionNames(const Module &module) {
+    std::unordered_set<std::string> userFunctions;
+    for (const auto &function : module.functions) {
+        userFunctions.insert(function.name);
+    }
+
+    std::unordered_set<std::string> candidates;
+    std::unordered_map<std::string, std::vector<std::string>> callees;
+    for (const auto &function : module.functions) {
+        bool ok = true;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == Opcode::Store) {
+                    ok = false;
+                    break;
+                }
+                if (inst.opcode == Opcode::Call) {
+                    if (userFunctions.count(inst.text) != 0) {
+                        callees[function.name].push_back(inst.text);
+                    } else if (!runtimeCallDoesNotWriteUserMemory(inst.text)) {
+                        ok = false;
+                        break;
+                    }
                 }
             }
             if (!ok) {
@@ -1538,14 +1628,24 @@ bool forwardCrossBlockMemory(Function &function) {
     return replaced;
 }
 
-std::string memoryAddressKey(const Value &address);
+std::string exactMemoryAddressKey(const Value &address,
+                                  const std::unordered_map<int, Instruction> &definitions);
 
-bool forwardCrossBlockExactMemory(Function &function) {
+bool forwardCrossBlockExactMemory(Function &function,
+                                  const std::unordered_set<std::string> &nonClobberingCalls) {
     if (function.blocks.empty() || hugeFunction(function)) {
         return false;
     }
 
     const auto predecessors = computePredecessors(function);
+    std::unordered_map<int, Instruction> definitions;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                definitions[inst.result] = inst;
+            }
+        }
+    }
     std::vector<std::unordered_map<std::string, Value>> in(function.blocks.size());
     std::vector<std::unordered_map<std::string, Value>> out(function.blocks.size());
 
@@ -1571,12 +1671,12 @@ bool forwardCrossBlockExactMemory(Function &function) {
 
             std::unordered_map<std::string, Value> nextOut = nextIn;
             for (const auto &inst : function.blocks[blockIndex].instructions) {
-                if (inst.opcode == Opcode::Call) {
+                if (inst.opcode == Opcode::Call && nonClobberingCalls.count(inst.text) == 0) {
                     nextOut.clear();
                     continue;
                 }
                 if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
-                    const std::string key = memoryAddressKey(inst.operands[1]);
+                    const std::string key = exactMemoryAddressKey(inst.operands[1], definitions);
                     nextOut.clear();
                     if (!key.empty()) {
                         nextOut[key] = inst.operands[0];
@@ -1607,7 +1707,7 @@ bool forwardCrossBlockExactMemory(Function &function) {
             }
 
             if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
-                const std::string key = memoryAddressKey(inst.operands[0]);
+                const std::string key = exactMemoryAddressKey(inst.operands[0], definitions);
                 const auto found = key.empty() ? current.end() : current.find(key);
                 if (found != current.end()) {
                     replacements[inst.result] = found->second;
@@ -1616,10 +1716,10 @@ bool forwardCrossBlockExactMemory(Function &function) {
                 }
             }
 
-            if (inst.opcode == Opcode::Call) {
+            if (inst.opcode == Opcode::Call && nonClobberingCalls.count(inst.text) == 0) {
                 current.clear();
             } else if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
-                const std::string key = memoryAddressKey(inst.operands[1]);
+                const std::string key = exactMemoryAddressKey(inst.operands[1], definitions);
                 current.clear();
                 if (!key.empty()) {
                     current[key] = inst.operands[0];
@@ -1647,18 +1747,18 @@ bool isHoistableOpcode(Opcode opcode) {
     case Opcode::Add:
     case Opcode::Sub:
     case Opcode::Mul:
+    case Opcode::Div:
+    case Opcode::Mod:
     case Opcode::Neg:
     case Opcode::Not:
     case Opcode::ICmp:
     case Opcode::Cast:
+    case Opcode::Gep:
         return true;
     case Opcode::Alloca:
     case Opcode::Load:
     case Opcode::Store:
-    case Opcode::Div:
-    case Opcode::Mod:
     case Opcode::FCmp:
-    case Opcode::Gep:
     case Opcode::Phi:
     case Opcode::Call:
     case Opcode::Br:
@@ -1707,8 +1807,8 @@ bool hoistLoopInvariants(Function &function) {
         } else if (term.opcode == Opcode::CondBr) {
             const std::size_t comma = term.text.find(',');
             if (comma != std::string::npos) {
-                addTarget(term.text.substr(0, comma));
-                addTarget(term.text.substr(comma + 2));
+                addTarget(trimBranchLabel(term.text.substr(0, comma)));
+                addTarget(trimBranchLabel(term.text.substr(comma + 1)));
             }
         }
 
@@ -1824,6 +1924,290 @@ bool foldConstants(Function &function) {
     return changed;
 }
 
+std::optional<long long> constantI32Value(const Value &value) {
+    if (!value.constant || value.type.kind != TypeKind::I32) {
+        return std::nullopt;
+    }
+    return std::strtoll(value.name.c_str(), nullptr, 0);
+}
+
+Value i32Constant(long long value) {
+    return Value{-1, Type{TypeKind::I32}, std::to_string(value), true};
+}
+
+bool splitAdditiveConstant(const Instruction &inst, Value &base, long long &constant) {
+    if (inst.resultType.kind != TypeKind::I32 || inst.operands.size() != 2) {
+        return false;
+    }
+    if (inst.opcode == Opcode::Add) {
+        if (const auto rhs = constantI32Value(inst.operands[1])) {
+            base = inst.operands[0];
+            constant = *rhs;
+            return !base.constant;
+        }
+        if (const auto lhs = constantI32Value(inst.operands[0])) {
+            base = inst.operands[1];
+            constant = *lhs;
+            return !base.constant;
+        }
+    } else if (inst.opcode == Opcode::Sub) {
+        if (const auto rhs = constantI32Value(inst.operands[1])) {
+            base = inst.operands[0];
+            constant = -*rhs;
+            return !base.constant;
+        }
+    }
+    return false;
+}
+
+bool combineAdditiveConstants(Function &function) {
+    std::unordered_map<int, Instruction *> definitions;
+    for (auto &block : function.blocks) {
+        for (auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                definitions[inst.result] = &inst;
+            }
+        }
+    }
+
+    bool changed = false;
+    for (auto &block : function.blocks) {
+        for (auto &inst : block.instructions) {
+            if (inst.result < 0 || inst.resultType.kind != TypeKind::I32 ||
+                (inst.opcode != Opcode::Add && inst.opcode != Opcode::Sub) ||
+                inst.operands.size() != 2) {
+                continue;
+            }
+
+            Value outerBase;
+            long long outerConstant = 0;
+            if (!splitAdditiveConstant(inst, outerBase, outerConstant) ||
+                outerBase.constant || outerBase.id < 0) {
+                continue;
+            }
+            const auto found = definitions.find(outerBase.id);
+            if (found == definitions.end()) {
+                continue;
+            }
+
+            Value innerBase;
+            long long innerConstant = 0;
+            if (!splitAdditiveConstant(*found->second, innerBase, innerConstant)) {
+                continue;
+            }
+
+            inst.opcode = Opcode::Add;
+            inst.text.clear();
+            inst.operands = {innerBase, i32Constant(innerConstant + outerConstant)};
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+struct LinearI32Form {
+    std::map<int, long long> coeffs;
+    std::unordered_map<int, Value> values;
+    long long constant = 0;
+};
+
+void addLinearTerm(LinearI32Form &form, const Value &value, long long coeff) {
+    if (coeff == 0) {
+        return;
+    }
+    form.coeffs[value.id] += coeff;
+    form.values[value.id] = value;
+    if (form.coeffs[value.id] == 0) {
+        form.coeffs.erase(value.id);
+        form.values.erase(value.id);
+    }
+}
+
+bool sameOperands(const std::vector<Value> &lhs, const std::vector<Value> &rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!sameValue(lhs[i], rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<LinearI32Form> linearFormForValue(
+    const Value &value,
+    const std::unordered_map<int, LinearI32Form> &knownForms) {
+    if (value.type.kind != TypeKind::I32) {
+        return std::nullopt;
+    }
+    LinearI32Form form;
+    if (value.constant) {
+        form.constant = std::strtoll(value.name.c_str(), nullptr, 0);
+        return form;
+    }
+    if (value.id < 0) {
+        return std::nullopt;
+    }
+    const auto found = knownForms.find(value.id);
+    if (found != knownForms.end()) {
+        return found->second;
+    }
+    addLinearTerm(form, value, 1);
+    return form;
+}
+
+std::optional<LinearI32Form> linearFormForInstruction(
+    const Instruction &inst,
+    const std::unordered_map<int, LinearI32Form> &knownForms) {
+    if (inst.result < 0 || inst.resultType.kind != TypeKind::I32) {
+        return std::nullopt;
+    }
+    if (inst.opcode == Opcode::Neg && inst.operands.size() == 1) {
+        auto form = linearFormForValue(inst.operands[0], knownForms);
+        if (!form) {
+            return std::nullopt;
+        }
+        form->constant = -form->constant;
+        for (auto &[id, coeff] : form->coeffs) {
+            coeff = -coeff;
+        }
+        return form;
+    }
+    if ((inst.opcode != Opcode::Add && inst.opcode != Opcode::Sub) || inst.operands.size() != 2) {
+        return std::nullopt;
+    }
+    auto lhs = linearFormForValue(inst.operands[0], knownForms);
+    auto rhs = linearFormForValue(inst.operands[1], knownForms);
+    if (!lhs || !rhs) {
+        return std::nullopt;
+    }
+
+    LinearI32Form result = *lhs;
+    const long long sign = inst.opcode == Opcode::Add ? 1 : -1;
+    result.constant += sign * rhs->constant;
+    for (const auto &[id, coeff] : rhs->coeffs) {
+        addLinearTerm(result, rhs->values.at(id), sign * coeff);
+    }
+    return result;
+}
+
+bool rewriteInstructionAsLinearForm(Instruction &inst, const LinearI32Form &form, Value &replacement) {
+    if (form.coeffs.empty()) {
+        replacement = i32Constant(form.constant);
+        return true;
+    }
+    if (form.coeffs.size() == 1) {
+        const auto term = form.coeffs.begin();
+        const Value value = form.values.at(term->first);
+        if (term->second == 1 && form.constant == 0) {
+            replacement = value;
+            return true;
+        }
+        if (term->second == -1 && form.constant == 0) {
+            inst.opcode = Opcode::Neg;
+            inst.operands = {value};
+            inst.text.clear();
+            return false;
+        }
+        if (term->second == 1) {
+            inst.opcode = form.constant >= 0 ? Opcode::Add : Opcode::Sub;
+            inst.operands = {value, i32Constant(std::llabs(form.constant))};
+            inst.text.clear();
+            return false;
+        }
+        if (term->second == -1) {
+            inst.opcode = Opcode::Sub;
+            inst.operands = {i32Constant(form.constant), value};
+            inst.text.clear();
+            return false;
+        }
+    }
+    if (form.constant != 0 || form.coeffs.size() != 2) {
+        return false;
+    }
+    auto first = form.coeffs.begin();
+    auto second = std::next(first);
+    const Value lhs = form.values.at(first->first);
+    const Value rhs = form.values.at(second->first);
+    if (first->second == 1 && second->second == 1) {
+        inst.opcode = Opcode::Add;
+        inst.operands = {lhs, rhs};
+        inst.text.clear();
+        return false;
+    }
+    if (first->second == 1 && second->second == -1) {
+        inst.opcode = Opcode::Sub;
+        inst.operands = {lhs, rhs};
+        inst.text.clear();
+        return false;
+    }
+    if (first->second == -1 && second->second == 1) {
+        inst.opcode = Opcode::Sub;
+        inst.operands = {rhs, lhs};
+        inst.text.clear();
+        return false;
+    }
+    if (inst.opcode == Opcode::Sub && inst.operands.size() == 2 &&
+        isConstInt(inst.operands[0], 0) && !inst.operands[1].constant &&
+        inst.operands[1].type.kind == TypeKind::I32) {
+        inst.opcode = Opcode::Neg;
+        inst.operands = {inst.operands[1]};
+        inst.text.clear();
+    }
+    return false;
+}
+
+bool simplifyLinearI32Expressions(Function &function) {
+    bool changed = false;
+    std::unordered_map<int, Value> replacements;
+
+    for (auto &block : function.blocks) {
+        std::unordered_map<int, LinearI32Form> knownForms;
+        std::vector<Instruction> kept;
+        kept.reserve(block.instructions.size());
+
+        for (auto inst : block.instructions) {
+            for (auto &operand : inst.operands) {
+                operand = resolve(operand, replacements);
+            }
+
+            const auto form = linearFormForInstruction(inst, knownForms);
+            if (form) {
+                Value replacement;
+                const Opcode oldOpcode = inst.opcode;
+                const std::vector<Value> oldOperands = inst.operands;
+                if (rewriteInstructionAsLinearForm(inst, *form, replacement)) {
+                    replacements[inst.result] = replacement;
+                    knownForms[inst.result] = *form;
+                    changed = true;
+                    continue;
+                }
+                if (inst.opcode != oldOpcode || !sameOperands(inst.operands, oldOperands)) {
+                    changed = true;
+                }
+                knownForms[inst.result] = *form;
+            } else if (inst.result >= 0) {
+                knownForms.erase(inst.result);
+            }
+
+            kept.push_back(std::move(inst));
+        }
+        block.instructions = std::move(kept);
+    }
+
+    if (changed) {
+        for (auto &block : function.blocks) {
+            for (auto &inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 bool simplifyTrivialPhis(Function &function) {
     bool changed = false;
     std::unordered_map<int, Value> replacements;
@@ -1842,6 +2226,9 @@ bool simplifyTrivialPhis(Function &function) {
                 bool allSame = true;
 
                 for (const auto &operand : inst.operands) {
+                    if (!operand.constant && operand.id == inst.result) {
+                        continue;
+                    }
                     const Value value = operand;
                     if (!haveMerged) {
                         merged = value;
@@ -1874,6 +2261,61 @@ bool simplifyTrivialPhis(Function &function) {
         }
     }
 
+    return changed;
+}
+
+std::string inversePredicate(const std::string &predicate) {
+    if (predicate == "eq") return "ne";
+    if (predicate == "ne") return "eq";
+    if (predicate == "lt") return "ge";
+    if (predicate == "le") return "gt";
+    if (predicate == "gt") return "le";
+    if (predicate == "ge") return "lt";
+    return {};
+}
+
+bool simplifyBooleanNegations(Function &function) {
+    std::unordered_map<int, const Instruction *> definitions;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                definitions[inst.result] = &inst;
+            }
+        }
+    }
+
+    bool changed = false;
+    for (auto &block : function.blocks) {
+        for (auto &inst : block.instructions) {
+            if (inst.opcode != Opcode::Not || inst.result < 0 || inst.operands.size() != 1 ||
+                inst.operands[0].constant || inst.operands[0].id < 0) {
+                continue;
+            }
+            const auto found = definitions.find(inst.operands[0].id);
+            if (found == definitions.end()) {
+                continue;
+            }
+            const Instruction &def = *found->second;
+            if (def.opcode == Opcode::ICmp && def.operands.size() == 2) {
+                const std::string inverse = inversePredicate(def.text);
+                if (inverse.empty()) {
+                    continue;
+                }
+                inst.opcode = Opcode::ICmp;
+                inst.text = inverse;
+                inst.operands = def.operands;
+                inst.resultType = Type{TypeKind::I32};
+                changed = true;
+            } else if (def.opcode == Opcode::Not && def.operands.size() == 1 &&
+                       def.operands[0].type.kind == TypeKind::I32) {
+                inst.opcode = Opcode::ICmp;
+                inst.text = "ne";
+                inst.operands = {def.operands[0], i32Constant(0)};
+                inst.resultType = Type{TypeKind::I32};
+                changed = true;
+            }
+        }
+    }
     return changed;
 }
 
@@ -1933,18 +2375,18 @@ bool globallyCseEligible(Opcode opcode) {
     case Opcode::Add:
     case Opcode::Sub:
     case Opcode::Mul:
+    case Opcode::Div:
+    case Opcode::Mod:
     case Opcode::Neg:
     case Opcode::Not:
     case Opcode::ICmp:
     case Opcode::Cast:
+    case Opcode::Gep:
         return true;
-    case Opcode::Div:
-    case Opcode::Mod:
     case Opcode::FCmp:
     case Opcode::Alloca:
     case Opcode::Load:
     case Opcode::Store:
-    case Opcode::Gep:
     case Opcode::Phi:
     case Opcode::Call:
     case Opcode::Br:
@@ -1957,6 +2399,9 @@ bool globallyCseEligible(Opcode opcode) {
 
 int globalCseCost(Opcode opcode) {
     switch (opcode) {
+    case Opcode::Div:
+    case Opcode::Mod:
+        return 5;
     case Opcode::Mul:
         return 3;
     case Opcode::Gep:
@@ -1968,8 +2413,6 @@ int globalCseCost(Opcode opcode) {
     case Opcode::Not:
     case Opcode::Cast:
         return 1;
-    case Opcode::Div:
-    case Opcode::Mod:
     case Opcode::FCmp:
     case Opcode::Alloca:
     case Opcode::Load:
@@ -2063,17 +2506,121 @@ bool eliminateGlobalCommonSubexpressions(Function &function) {
     return changed;
 }
 
-std::string memoryAddressKey(const Value &address) {
+std::string exactMemoryAddressKey(const Value &address,
+                                  const std::unordered_map<int, Instruction> &definitions) {
     if (address.constant) {
         if (!address.name.empty() && address.name[0] == '@') {
             return "global:" + address.name;
         }
         return {};
     }
-    if (address.id >= 0) {
+    if (address.id < 0) {
+        return {};
+    }
+
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end()) {
         return "value:" + std::to_string(address.id);
     }
-    return {};
+    const Instruction &def = found->second;
+    if (def.opcode == Opcode::Alloca) {
+        return "alloca:" + std::to_string(address.id);
+    }
+    if (def.opcode != Opcode::Gep || def.operands.size() != 2) {
+        return "value:" + std::to_string(address.id);
+    }
+
+    const std::string base = exactMemoryAddressKey(def.operands[0], definitions);
+    const auto index = constantI32Value(def.operands[1]);
+    if (base.empty() || !index) {
+        return "value:" + std::to_string(address.id);
+    }
+    return base + ":i32:" + std::to_string(*index);
+}
+
+std::string directNonAliasingAddressKey(
+    const Value &address,
+    const std::unordered_map<int, const Instruction *> &definitions) {
+    if (address.constant) {
+        return !address.name.empty() && address.name[0] == '@' ? "global:" + address.name : std::string{};
+    }
+    if (address.id < 0) {
+        return {};
+    }
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end()) {
+        return {};
+    }
+    const Instruction &def = *found->second;
+    if (def.opcode == Opcode::Alloca) {
+        return "alloca:" + std::to_string(address.id);
+    }
+    if (def.opcode != Opcode::Gep || def.operands.size() != 2) {
+        return {};
+    }
+    const std::string base = directNonAliasingAddressKey(def.operands[0], definitions);
+    const auto index = constantI32Value(def.operands[1]);
+    if (base.empty() || !index) {
+        return {};
+    }
+    return base + ":i32:" + std::to_string(*index);
+}
+
+bool eliminateLocalDeadStores(Function &function) {
+    bool changed = false;
+    std::unordered_map<int, const Instruction *> definitions;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                definitions[inst.result] = &inst;
+            }
+        }
+    }
+
+    for (auto &block : function.blocks) {
+        std::unordered_set<std::string> overwritten;
+        std::vector<char> remove(block.instructions.size(), 0);
+        for (std::size_t index = block.instructions.size(); index-- > 0;) {
+            const Instruction &inst = block.instructions[index];
+            if (inst.opcode == Opcode::Call) {
+                overwritten.clear();
+                continue;
+            }
+            if (inst.opcode == Opcode::Load && inst.operands.size() == 1) {
+                const std::string key = directNonAliasingAddressKey(inst.operands[0], definitions);
+                if (key.empty()) {
+                    overwritten.clear();
+                } else {
+                    overwritten.erase(key);
+                }
+                continue;
+            }
+            if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                const std::string key = directNonAliasingAddressKey(inst.operands[1], definitions);
+                if (key.empty()) {
+                    overwritten.clear();
+                    continue;
+                }
+                if (overwritten.count(key)) {
+                    remove[index] = 1;
+                    changed = true;
+                }
+                overwritten.insert(key);
+            }
+        }
+        if (!changed) {
+            continue;
+        }
+        std::vector<Instruction> kept;
+        kept.reserve(block.instructions.size());
+        for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+            if (!remove[index]) {
+                kept.push_back(std::move(block.instructions[index]));
+            }
+        }
+        block.instructions = std::move(kept);
+    }
+    return changed;
 }
 
 bool simplifyBranches(Function &function) {
@@ -2083,16 +2630,28 @@ bool simplifyBranches(Function &function) {
             continue;
         }
         Instruction &inst = block.instructions.back();
-        if (inst.opcode != Opcode::CondBr || inst.operands.empty() || !inst.operands[0].constant) {
+        if (inst.opcode != Opcode::CondBr || inst.operands.empty()) {
             continue;
         }
-        const bool takeTrue = std::strtoll(inst.operands[0].name.c_str(), nullptr, 0) != 0;
         const std::size_t comma = inst.text.find(',');
         if (comma == std::string::npos) {
             continue;
         }
-        const std::string trueLabel = inst.text.substr(0, comma);
-        const std::string falseLabel = inst.text.substr(comma + 2);
+        const std::string trueLabel = trimBranchLabel(inst.text.substr(0, comma));
+        const std::string falseLabel = trimBranchLabel(inst.text.substr(comma + 1));
+        if (trueLabel == falseLabel) {
+            inst.opcode = Opcode::Br;
+            inst.operands.clear();
+            inst.text = trueLabel;
+            inst.result = -1;
+            inst.resultType = Type{TypeKind::Void};
+            changed = true;
+            continue;
+        }
+        if (!inst.operands[0].constant) {
+            continue;
+        }
+        const bool takeTrue = std::strtoll(inst.operands[0].name.c_str(), nullptr, 0) != 0;
         inst.opcode = Opcode::Br;
         inst.operands.clear();
         inst.text = takeTrue ? trueLabel : falseLabel;
@@ -2129,8 +2688,8 @@ bool removeUnreachableBlocks(Function &function) {
         } else if (term.opcode == Opcode::CondBr) {
             const std::size_t comma = term.text.find(',');
             if (comma != std::string::npos) {
-                const auto t = index.find(term.text.substr(0, comma));
-                const auto f = index.find(term.text.substr(comma + 2));
+                const auto t = index.find(trimBranchLabel(term.text.substr(0, comma)));
+                const auto f = index.find(trimBranchLabel(term.text.substr(comma + 1)));
                 if (t != index.end()) stack.push_back(t->second);
                 if (f != index.end()) stack.push_back(f->second);
             }
@@ -2149,6 +2708,263 @@ bool removeUnreachableBlocks(Function &function) {
     }
     function.blocks = std::move(kept);
     return true;
+}
+
+bool blockStartsWithPhi(const BasicBlock &block) {
+    return !block.instructions.empty() && block.instructions.front().opcode == Opcode::Phi;
+}
+
+std::string trimBlockLabel(const std::string &label);
+
+void retargetBranchText(Instruction &inst, const std::unordered_map<std::string, std::string> &redirect) {
+    if (inst.opcode == Opcode::Br) {
+        const auto found = redirect.find(inst.text);
+        if (found != redirect.end()) {
+            inst.text = found->second;
+        }
+        return;
+    }
+    if (inst.opcode != Opcode::CondBr) {
+        return;
+    }
+    const std::size_t comma = inst.text.find(',');
+    if (comma == std::string::npos) {
+        return;
+    }
+    std::string trueLabel = trimBranchLabel(inst.text.substr(0, comma));
+    std::string falseLabel = trimBranchLabel(inst.text.substr(comma + 1));
+    const auto trueFound = redirect.find(trueLabel);
+    if (trueFound != redirect.end()) {
+        trueLabel = trueFound->second;
+    }
+    const auto falseFound = redirect.find(falseLabel);
+    if (falseFound != redirect.end()) {
+        falseLabel = falseFound->second;
+    }
+    inst.text = trueLabel + ", " + falseLabel;
+}
+
+bool removeEmptyJumpBlocks(Function &function) {
+    if (function.blocks.size() < 2) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::size_t> index;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        index[function.blocks[i].name] = i;
+    }
+
+    std::unordered_map<std::string, std::string> redirect;
+    for (std::size_t i = 1; i < function.blocks.size(); ++i) {
+        const BasicBlock &block = function.blocks[i];
+        if (block.instructions.size() != 1 || block.instructions.front().opcode != Opcode::Br ||
+            block.instructions.front().text == block.name) {
+            continue;
+        }
+        const auto target = index.find(block.instructions.front().text);
+        if (target == index.end() || blockStartsWithPhi(function.blocks[target->second])) {
+            continue;
+        }
+        redirect[block.name] = block.instructions.front().text;
+    }
+
+    if (redirect.empty()) {
+        return false;
+    }
+
+    auto finalTarget = [&](std::string label) {
+        std::unordered_set<std::string> seen;
+        while (true) {
+            const auto found = redirect.find(label);
+            if (found == redirect.end() || !seen.insert(label).second) {
+                return label;
+            }
+            label = found->second;
+        }
+    };
+    for (auto &[from, to] : redirect) {
+        to = finalTarget(to);
+    }
+
+    for (auto &block : function.blocks) {
+        if (!block.instructions.empty()) {
+            retargetBranchText(block.instructions.back(), redirect);
+        }
+    }
+
+    std::vector<BasicBlock> kept;
+    kept.reserve(function.blocks.size() - redirect.size());
+    for (auto &block : function.blocks) {
+        if (redirect.count(block.name) == 0) {
+            kept.push_back(std::move(block));
+        }
+    }
+    function.blocks = std::move(kept);
+    return true;
+}
+
+std::string trimBlockLabel(const std::string &label) {
+    const std::size_t first = label.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const std::size_t last = label.find_last_not_of(" \t\r\n");
+    return label.substr(first, last - first + 1);
+}
+
+std::vector<std::string> splitBlockLabels(const std::string &text) {
+    std::vector<std::string> labels;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::size_t end = comma == std::string::npos ? text.size() : comma;
+        labels.push_back(trimBlockLabel(text.substr(start, end - start)));
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return labels;
+}
+
+bool simplifyBooleanReturnBranches(Function &function) {
+    if (function.blocks.size() < 3) {
+        return false;
+    }
+
+    std::unordered_map<std::string, std::size_t> blockIndex;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        blockIndex[function.blocks[i].name] = i;
+    }
+    const auto predecessors = computePredecessors(function);
+
+    auto singleConstantReturn = [&](std::size_t index) -> std::optional<int> {
+        if (index == 0 || predecessors[index].size() != 1) {
+            return std::nullopt;
+        }
+        const BasicBlock &block = function.blocks[index];
+        if (block.instructions.size() != 1 || block.instructions.front().opcode != Opcode::Ret ||
+            block.instructions.front().operands.size() != 1) {
+            return std::nullopt;
+        }
+        return constantI32Value(block.instructions.front().operands[0]);
+    };
+
+    bool changed = false;
+    int nextId = nextValueId(function);
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        BasicBlock &block = function.blocks[i];
+        if (block.instructions.empty()) {
+            continue;
+        }
+        Instruction &term = block.instructions.back();
+        if (term.opcode != Opcode::CondBr || term.operands.size() != 1) {
+            continue;
+        }
+        const std::vector<std::string> labels = splitBlockLabels(term.text);
+        if (labels.size() != 2) {
+            continue;
+        }
+        const auto trueFound = blockIndex.find(labels[0]);
+        const auto falseFound = blockIndex.find(labels[1]);
+        if (trueFound == blockIndex.end() || falseFound == blockIndex.end()) {
+            continue;
+        }
+
+        const auto trueValue = singleConstantReturn(trueFound->second);
+        const auto falseValue = singleConstantReturn(falseFound->second);
+        if (!trueValue || !falseValue || *trueValue != 1 || *falseValue != 0) {
+            if (!trueValue || !falseValue || *trueValue != 0 || *falseValue != 1 ||
+                term.operands[0].type.kind != TypeKind::I32) {
+                continue;
+            }
+            const Value condition = term.operands[0];
+            const int notId = nextId++;
+            Instruction notInst{notId,
+                                Type{TypeKind::I32},
+                                Opcode::Not,
+                                {condition},
+                                {}};
+            block.instructions.insert(block.instructions.end() - 1, std::move(notInst));
+            Instruction &ret = block.instructions.back();
+            ret.opcode = Opcode::Ret;
+            ret.operands = {Value{notId, Type{TypeKind::I32}, {}, false}};
+            ret.text.clear();
+            ret.result = -1;
+            ret.resultType = Type{TypeKind::Void};
+            changed = true;
+            continue;
+        }
+
+        term.opcode = Opcode::Ret;
+        term.operands = {term.operands[0]};
+        term.text.clear();
+        term.result = -1;
+        term.resultType = Type{TypeKind::Void};
+        changed = true;
+    }
+    return changed;
+}
+
+void replacePhiPredecessorLabel(Function &function, const std::string &from, const std::string &to) {
+    for (auto &block : function.blocks) {
+        for (auto &inst : block.instructions) {
+            if (inst.opcode != Opcode::Phi) {
+                break;
+            }
+            std::vector<std::string> labels = splitBlockLabels(inst.text);
+            bool changed = false;
+            for (auto &label : labels) {
+                if (label == from) {
+                    label = to;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                continue;
+            }
+            std::ostringstream text;
+            for (std::size_t i = 0; i < labels.size(); ++i) {
+                if (i != 0) {
+                    text << ", ";
+                }
+                text << labels[i];
+            }
+            inst.text = text.str();
+        }
+    }
+}
+
+bool mergeLinearBlocks(Function &function) {
+    if (function.blocks.size() < 2) {
+        return false;
+    }
+    const auto predecessors = computePredecessors(function);
+    for (std::size_t blockIndex = 1; blockIndex < function.blocks.size(); ++blockIndex) {
+        BasicBlock &block = function.blocks[blockIndex];
+        if (blockStartsWithPhi(block) || predecessors[blockIndex].size() != 1) {
+            continue;
+        }
+        const int predIndex = predecessors[blockIndex].front();
+        if (predIndex < 0 || static_cast<std::size_t>(predIndex) >= blockIndex) {
+            continue;
+        }
+        BasicBlock &pred = function.blocks[static_cast<std::size_t>(predIndex)];
+        if (pred.instructions.empty() || pred.instructions.back().opcode != Opcode::Br ||
+            pred.instructions.back().text != block.name) {
+            continue;
+        }
+
+        pred.instructions.pop_back();
+        pred.instructions.reserve(pred.instructions.size() + block.instructions.size());
+        for (auto &inst : block.instructions) {
+            pred.instructions.push_back(std::move(inst));
+        }
+        replacePhiPredecessorLabel(function, block.name, pred.name);
+        function.blocks.erase(function.blocks.begin() + static_cast<long>(blockIndex));
+        return true;
+    }
+    return false;
 }
 
 bool eliminateDeadCode(Function &function) {
@@ -2179,9 +2995,18 @@ bool eliminateDeadCode(Function &function) {
     return changed;
 }
 
-bool forwardLocalMemory(Function &function) {
+bool forwardLocalMemory(Function &function,
+                        const std::unordered_set<std::string> &nonClobberingCalls) {
     bool changed = false;
     std::unordered_map<int, Value> replacements;
+    std::unordered_map<int, Instruction> definitions;
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                definitions[inst.result] = inst;
+            }
+        }
+    }
 
     for (auto &block : function.blocks) {
         std::unordered_map<std::string, Value> knownMemory;
@@ -2195,9 +3020,11 @@ bool forwardLocalMemory(Function &function) {
 
             if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
                 const Value &address = inst.operands[1];
-                const std::string key = memoryAddressKey(address);
+                const std::string key = exactMemoryAddressKey(address, definitions);
                 if (!key.empty()) {
                     knownMemory[key] = inst.operands[0];
+                } else {
+                    knownMemory.clear();
                 }
                 kept.push_back(std::move(inst));
                 continue;
@@ -2205,7 +3032,7 @@ bool forwardLocalMemory(Function &function) {
 
             if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.operands.size() == 1) {
                 const Value &address = inst.operands[0];
-                const std::string key = memoryAddressKey(address);
+                const std::string key = exactMemoryAddressKey(address, definitions);
                 if (!key.empty()) {
                     const auto found = knownMemory.find(key);
                     if (found != knownMemory.end()) {
@@ -2217,7 +3044,7 @@ bool forwardLocalMemory(Function &function) {
                 }
             }
 
-            if (inst.opcode == Opcode::Call) {
+            if (inst.opcode == Opcode::Call && nonClobberingCalls.count(inst.text) == 0) {
                 knownMemory.clear();
             }
             kept.push_back(std::move(inst));
@@ -2408,7 +3235,7 @@ bool collapseIdempotentCountedLoops(Module &module) {
             if (comma == std::string::npos) {
                 continue;
             }
-            const std::string bodyLabel = term.text.substr(0, comma);
+            const std::string bodyLabel = trimBranchLabel(term.text.substr(0, comma));
             const auto bodyIt = blockIndex.find(bodyLabel);
             if (bodyIt == blockIndex.end()) {
                 continue;
@@ -2558,6 +3385,151 @@ std::string globalNameFromValue(const Value &value) {
         return {};
     }
     return value.name.substr(1);
+}
+
+std::optional<long long> constantGlobalIndex(const Value &address,
+                                             const std::unordered_map<int, Instruction> &definitions,
+                                             std::string &globalName) {
+    const std::string directGlobal = globalNameFromValue(address);
+    if (!directGlobal.empty()) {
+        globalName = directGlobal;
+        return 0;
+    }
+    if (address.constant || address.id < 0) {
+        return std::nullopt;
+    }
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end() || found->second.opcode != Opcode::Gep ||
+        found->second.operands.size() != 2) {
+        return std::nullopt;
+    }
+    const auto baseIndex = constantGlobalIndex(found->second.operands[0], definitions, globalName);
+    const auto offset = constantI32Value(found->second.operands[1]);
+    if (!baseIndex || !offset) {
+        return std::nullopt;
+    }
+    return *baseIndex + *offset;
+}
+
+std::string globalBaseName(const Value &address,
+                           const std::unordered_map<int, Instruction> &definitions) {
+    const std::string directGlobal = globalNameFromValue(address);
+    if (!directGlobal.empty()) {
+        return directGlobal;
+    }
+    if (address.constant || address.id < 0) {
+        return {};
+    }
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end() || found->second.opcode != Opcode::Gep ||
+        found->second.operands.empty()) {
+        return {};
+    }
+    return globalBaseName(found->second.operands[0], definitions);
+}
+
+std::unordered_set<std::string> readOnlyGlobalNames(const Module &module,
+                                                    const std::unordered_set<std::string> &nonClobberingCalls) {
+    std::unordered_set<std::string> readOnly;
+    for (const auto &global : module.globals) {
+        if (global.type.kind == TypeKind::I32) {
+            readOnly.insert(global.name);
+        }
+    }
+
+    for (const auto &function : module.functions) {
+        std::unordered_map<int, Instruction> definitions;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definitions[inst.result] = inst;
+                }
+            }
+        }
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
+                    const std::string globalName = globalBaseName(inst.operands[1], definitions);
+                    if (!globalName.empty()) {
+                        readOnly.erase(globalName);
+                    }
+                } else if (inst.opcode == Opcode::Call &&
+                           nonClobberingCalls.count(inst.text) == 0) {
+                    for (const auto &operand : inst.operands) {
+                        const std::string globalName = globalBaseName(operand, definitions);
+                        if (!globalName.empty()) {
+                            readOnly.erase(globalName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return readOnly;
+}
+
+bool foldReadOnlyGlobalLoads(Module &module,
+                             const std::unordered_set<std::string> &nonClobberingCalls) {
+    const std::unordered_set<std::string> readOnlyGlobals = readOnlyGlobalNames(module, nonClobberingCalls);
+    if (readOnlyGlobals.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (auto &function : module.functions) {
+        std::unordered_map<int, Instruction> definitions;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definitions[inst.result] = inst;
+                }
+            }
+        }
+
+        std::unordered_map<int, Value> replacements;
+        for (auto &block : function.blocks) {
+            std::vector<Instruction> kept;
+            kept.reserve(block.instructions.size());
+            for (auto inst : block.instructions) {
+                for (auto &operand : inst.operands) {
+                    operand = resolve(operand, replacements);
+                }
+
+                if (inst.opcode == Opcode::Load && inst.result >= 0 && inst.resultType.kind == TypeKind::I32 &&
+                    inst.operands.size() == 1) {
+                    std::string globalName;
+                    const auto index = constantGlobalIndex(inst.operands[0], definitions, globalName);
+                    const Global *global = index ? findGlobal(module, globalName) : nullptr;
+                    if (global != nullptr && readOnlyGlobals.count(globalName) != 0 &&
+                        global->type.kind == TypeKind::I32 &&
+                        *index >= 0) {
+                        std::string value = "0";
+                        if (static_cast<std::size_t>(*index) < global->initValues.size()) {
+                            value = global->initValues[static_cast<std::size_t>(*index)];
+                        }
+                        replacements[inst.result] = Value{-1, Type{TypeKind::I32}, value, true};
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                kept.push_back(std::move(inst));
+            }
+            block.instructions = std::move(kept);
+        }
+
+        if (!replacements.empty()) {
+            for (auto &block : function.blocks) {
+                for (auto &inst : block.instructions) {
+                    for (auto &operand : inst.operands) {
+                        operand = resolve(operand, replacements);
+                    }
+                }
+            }
+        }
+    }
+    return changed;
 }
 
 bool functionHasRuntimeBoundary(const Function &function) {
@@ -2837,6 +3809,7 @@ bool optimize(Module &module) {
     }
     while (again) {
         again = false;
+        const std::unordered_set<std::string> nonClobberingCalls = memoryNonClobberingFunctionNames(module);
         if (collapseIdempotentCountedLoops(module)) {
             changed = true;
             again = true;
@@ -2846,6 +3819,10 @@ bool optimize(Module &module) {
             again = true;
         }
         if (removeUnreachableFunctions(module)) {
+            changed = true;
+            again = true;
+        }
+        if (foldReadOnlyGlobalLoads(module, nonClobberingCalls)) {
             changed = true;
             again = true;
         }
@@ -2862,7 +3839,7 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
-            if (forwardLocalMemory(function)) {
+            if (forwardLocalMemory(function, nonClobberingCalls)) {
                 changed = true;
                 again = true;
             }
@@ -2870,11 +3847,27 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
-            if (forwardCrossBlockExactMemory(function)) {
+            if (forwardCrossBlockExactMemory(function, nonClobberingCalls)) {
+                changed = true;
+                again = true;
+            }
+            if (eliminateLocalDeadStores(function)) {
                 changed = true;
                 again = true;
             }
             if (foldConstants(function)) {
+                changed = true;
+                again = true;
+            }
+            if (combineAdditiveConstants(function)) {
+                changed = true;
+                again = true;
+            }
+            if (simplifyLinearI32Expressions(function)) {
+                changed = true;
+                again = true;
+            }
+            if (simplifyBooleanNegations(function)) {
                 changed = true;
                 again = true;
             }
@@ -2894,7 +3887,19 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
+            if (simplifyBooleanReturnBranches(function)) {
+                changed = true;
+                again = true;
+            }
             if (removeUnreachableBlocks(function)) {
+                changed = true;
+                again = true;
+            }
+            if (removeEmptyJumpBlocks(function)) {
+                changed = true;
+                again = true;
+            }
+            if (mergeLinearBlocks(function)) {
                 changed = true;
                 again = true;
             }
@@ -2915,7 +3920,12 @@ bool optimize(Module &module) {
     bool ssaAgain = true;
     while (ssaAgain) {
         ssaAgain = false;
+        const std::unordered_set<std::string> nonClobberingCalls = memoryNonClobberingFunctionNames(module);
         if (eliminatePureCallCommonSubexpressions(module)) {
+            changed = true;
+            ssaAgain = true;
+        }
+        if (foldReadOnlyGlobalLoads(module, nonClobberingCalls)) {
             changed = true;
             ssaAgain = true;
         }
@@ -2928,11 +3938,31 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
+            if (forwardLocalMemory(function, nonClobberingCalls)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (forwardCrossBlockExactMemory(function, nonClobberingCalls)) {
+                changed = true;
+                ssaAgain = true;
+            }
             if (simplifyTrivialPhis(function)) {
                 changed = true;
                 ssaAgain = true;
             }
             if (foldConstants(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (combineAdditiveConstants(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (simplifyLinearI32Expressions(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (simplifyBooleanNegations(function)) {
                 changed = true;
                 ssaAgain = true;
             }
@@ -2948,11 +3978,39 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
+            if (simplifyBranches(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (simplifyBooleanReturnBranches(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (removeUnreachableBlocks(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (eliminateLocalDeadStores(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
             if (eliminateDeadCode(function)) {
                 changed = true;
                 ssaAgain = true;
             }
             if (eliminateDeadAllocas(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (removeEmptyJumpBlocks(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (mergeLinearBlocks(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
+            if (hoistLoopInvariants(function)) {
                 changed = true;
                 ssaAgain = true;
             }

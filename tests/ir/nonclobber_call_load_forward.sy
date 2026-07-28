@@ -1,0 +1,13 @@
+int g[1];
+
+int helper(int x) {
+    return x + 1;
+}
+
+int main() {
+    g[0] = getint();
+    int x = g[0];
+    int y = helper(x);
+    int z = g[0];
+    return y + z;
+}

@@ -1,0 +1,6 @@
+int table[4] = {2, 4, 6, 8};
+
+int main() {
+    getarray(table);
+    return table[1];
+}
