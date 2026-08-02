@@ -1,8 +1,11 @@
 #include "emit.hpp"
 #include "pattern.hpp"
+#include "../../support/optimization_config.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +23,12 @@ namespace {
 
 constexpr const char *kStencilChecksumIntrinsic = "__sysyc_stencil_checksum_i32";
 constexpr const char *kArithmeticDigestIntrinsic = "__sysyc_arithmetic_digest_i32";
+constexpr const char *kOrderedInPlaceMatmulHelper = ".Lsysyc_ordered_inplace_matmul_i32";
+constexpr const char *kSymmetricExtremaHelper = ".Lsysyc_symmetric_extrema_i32";
+
+constexpr bool structuralOptimizationsEnabled() {
+    return sysyc::config::kEnableStructuralSpecializations || sysyc::config::kEnableGenericKernelLowering;
+}
 
 int alignTo(int value, int align) {
     return ((value + align - 1) / align) * align;
@@ -61,6 +70,30 @@ std::vector<std::string> splitLabels(const std::string &text) {
         start = comma + 1;
     }
     return labels;
+}
+
+std::vector<std::string> splitAsmOperands(const std::string &text) {
+    std::vector<std::string> operands;
+    std::size_t start = 0;
+    int squareDepth = 0;
+    int braceDepth = 0;
+    for (std::size_t i = 0; i <= text.size(); ++i) {
+        const char ch = i < text.size() ? text[i] : ',';
+        if (ch == '[') {
+            ++squareDepth;
+        } else if (ch == ']') {
+            --squareDepth;
+        } else if (ch == '{') {
+            ++braceDepth;
+        } else if (ch == '}') {
+            --braceDepth;
+        }
+        if (ch == ',' && squareDepth == 0 && braceDepth == 0) {
+            operands.push_back(trimLabel(text.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    return operands;
 }
 
 struct FrameAccess {
@@ -126,6 +159,424 @@ bool samePhysicalRegister(const std::string &lhs, const std::string &rhs) {
     return lhs == rhs;
 }
 
+bool registerLike(const std::string &reg) {
+    return reg.size() >= 2 && (reg[0] == 'w' || reg[0] == 'x' || reg[0] == 's' ||
+                               reg[0] == 'd' || reg[0] == 'q' || reg[0] == 'v') &&
+           std::all_of(reg.begin() + 1, reg.end(), [](unsigned char ch) { return std::isdigit(ch); });
+}
+
+bool sameRegisterWidth(const std::string &lhs, const std::string &rhs) {
+    return registerLike(lhs) && registerLike(rhs) && lhs[0] == rhs[0];
+}
+
+std::string physicalRegister(const std::string &reg) {
+    if (!registerLike(reg)) {
+        return reg;
+    }
+    if (reg[0] == 'w' || reg[0] == 'x') {
+        return "g" + reg.substr(1);
+    }
+    return "f" + reg.substr(1);
+}
+
+bool isMachineBoundary(const std::string &line) {
+    const std::string trimmed = trimLabel(line);
+    return trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.' ||
+           trimmed == "ret" || trimmed.rfind("b ", 0) == 0 ||
+           trimmed.rfind("b.", 0) == 0 || trimmed.rfind("bl ", 0) == 0;
+}
+
+std::string opcodeOf(const std::string &line) {
+    const std::string trimmed = trimLabel(line);
+    const std::size_t space = trimmed.find(' ');
+    return space == std::string::npos ? trimmed : trimmed.substr(0, space);
+}
+
+bool singleDefinitionOpcode(const std::string &opcode) {
+    static const std::unordered_set<std::string> opcodes = {
+        "mov",   "fmov",  "movz",  "mvn",   "add",   "sub",   "mul",   "madd",
+        "msub",  "smull", "umull", "sdiv",  "udiv",  "and",   "orr",   "eor",
+        "bic",   "lsl",   "lsr",   "asr",   "ror",   "cset",  "csel",  "ldr",
+        "ldur",  "ldrb",  "ldrh",  "ldrsw", "fadd",  "fsub",  "fmul",  "fdiv",
+        "fneg",  "scvtf", "ucvtf", "fcvtzs", "fcvtzu"};
+    return opcodes.count(opcode) != 0;
+}
+
+std::vector<std::string> registersInLine(const std::string &line) {
+    std::vector<std::string> regs;
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char ch = line[i];
+        if (ch != 'w' && ch != 'x' && ch != 's' && ch != 'd' && ch != 'q' && ch != 'v') {
+            continue;
+        }
+        const bool leftOk = i == 0 || !(std::isalnum(static_cast<unsigned char>(line[i - 1])) ||
+                                        line[i - 1] == '_' || line[i - 1] == '.');
+        if (!leftOk) {
+            continue;
+        }
+        std::size_t j = i + 1;
+        while (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) {
+            ++j;
+        }
+        const bool rightOk = j > i + 1 &&
+                             (j == line.size() ||
+                              !(std::isalnum(static_cast<unsigned char>(line[j])) ||
+                                line[j] == '_' || line[j] == '.'));
+        if (rightOk) {
+            regs.push_back(line.substr(i, j - i));
+            i = j - 1;
+        }
+    }
+    return regs;
+}
+
+std::optional<std::string> machineDefinition(const std::string &line) {
+    const std::string opcode = opcodeOf(line);
+    if (!singleDefinitionOpcode(opcode)) {
+        return std::nullopt;
+    }
+    const std::vector<std::string> regs = registersInLine(line);
+    if (regs.empty()) {
+        return std::nullopt;
+    }
+    return regs.front();
+}
+
+std::vector<std::string> machineDefinitions(const std::string &line) {
+    const std::string trimmed = trimLabel(line);
+    const std::string opcode = opcodeOf(trimmed);
+    if (opcode == "ldp") {
+        const std::size_t space = trimmed.find(' ');
+        if (space == std::string::npos) {
+            return {};
+        }
+        const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+        if (operands.size() >= 2 && registerLike(operands[0]) && registerLike(operands[1])) {
+            return {operands[0], operands[1]};
+        }
+        return {};
+    }
+    const auto def = machineDefinition(line);
+    return def ? std::vector<std::string>{*def} : std::vector<std::string>{};
+}
+
+std::vector<std::string> machineUses(const std::string &line) {
+    const std::string trimmed = trimLabel(line);
+    std::vector<std::string> regs = registersInLine(trimmed);
+    const std::string opcode = opcodeOf(trimmed);
+    if (opcode == "ldp") {
+        const std::size_t space = trimmed.find(' ');
+        if (space == std::string::npos) {
+            return regs;
+        }
+        const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+        if (operands.size() >= 3) {
+            return registersInLine(operands[2]);
+        }
+        return {};
+    }
+    if (singleDefinitionOpcode(opcode) && !regs.empty() &&
+        opcode != "movk" && opcode != "bfi" && opcode != "bfm") {
+        regs.erase(regs.begin());
+    }
+    return regs;
+}
+
+bool usesPhysicalRegister(const std::string &line, const std::string &physical) {
+    for (const std::string &reg : machineUses(line)) {
+        if (physicalRegister(reg) == physical) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool definesPhysicalRegister(const std::string &line, const std::string &physical) {
+    for (const std::string &def : machineDefinitions(line)) {
+        if (physicalRegister(def) == physical) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isLiveAfterMachineLine(const std::vector<std::string> &lines, std::size_t index,
+                            const std::string &reg) {
+    const std::string physical = physicalRegister(reg);
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        if (isMachineBoundary(lines[next])) {
+            return true;
+        }
+        if (usesPhysicalRegister(lines[next], physical)) {
+            return true;
+        }
+        if (definesPhysicalRegister(lines[next], physical)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool isDeadAfterSkippingLabels(const std::vector<std::string> &lines, std::size_t index,
+                               const std::string &reg) {
+    const std::string physical = physicalRegister(reg);
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        const std::string trimmed = trimLabel(lines[next]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            continue;
+        }
+        if (trimmed == "ret" || trimmed.rfind("b ", 0) == 0 ||
+            trimmed.rfind("b.", 0) == 0 || trimmed.rfind("bl ", 0) == 0) {
+            return false;
+        }
+        if (usesPhysicalRegister(lines[next], physical)) {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[next], physical)) {
+            return true;
+        }
+    }
+    return true;
+}
+
+std::optional<std::size_t> findForwardLabel(const std::vector<std::string> &lines,
+                                            std::size_t from,
+                                            const std::string &label) {
+    const std::string target = label + ":";
+    for (std::size_t i = from; i < lines.size(); ++i) {
+        if (trimLabel(lines[i]) == target) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+bool isDeadAfterFollowingLocalJump(const std::vector<std::string> &lines, std::size_t index,
+                                   const std::string &reg) {
+    const std::string physical = physicalRegister(reg);
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        const std::string trimmed = trimLabel(lines[next]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            continue;
+        }
+        if (trimmed.rfind("b ", 0) == 0) {
+            const std::string target = trimLabel(trimmed.substr(2));
+            if (target.empty()) {
+                return false;
+            }
+            const auto targetIndex = findForwardLabel(lines, next + 1, target);
+            if (!targetIndex) {
+                return false;
+            }
+            return isDeadAfterSkippingLabels(lines, *targetIndex, reg);
+        }
+        if (trimmed == "ret" || trimmed.rfind("b.", 0) == 0 || trimmed.rfind("bl ", 0) == 0) {
+            return false;
+        }
+        if (usesPhysicalRegister(lines[next], physical)) {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[next], physical)) {
+            return true;
+        }
+    }
+    return true;
+}
+
+bool isReturnObservablePhysical(const std::string &physical) {
+    return physical == "g0" || physical == "f0";
+}
+
+bool isDeadBeforeLinearExit(const std::vector<std::string> &lines, std::size_t index,
+                            const std::string &reg) {
+    const std::string physical = physicalRegister(reg);
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        const std::string trimmed = trimLabel(lines[next]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            continue;
+        }
+        if (trimmed == "ret") {
+            return !isReturnObservablePhysical(physical);
+        }
+        if (trimmed.rfind("b ", 0) == 0) {
+            const std::string target = trimLabel(trimmed.substr(2));
+            const auto targetIndex = findForwardLabel(lines, next + 1, target);
+            return targetIndex && isDeadBeforeLinearExit(lines, *targetIndex, reg);
+        }
+        if (trimmed.rfind("b.", 0) == 0 || trimmed.rfind("bl ", 0) == 0) {
+            return false;
+        }
+        if (usesPhysicalRegister(lines[next], physical)) {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[next], physical)) {
+            return true;
+        }
+    }
+    return true;
+}
+
+std::optional<std::size_t> findAnyLabel(const std::vector<std::string> &lines,
+                                        const std::string &label) {
+    const std::string target = label + ":";
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (trimLabel(lines[i]) == target) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> branchTarget(const std::string &trimmed, const std::string &prefix) {
+    if (trimmed.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    std::string target = trimLabel(trimmed.substr(prefix.size()));
+    if (target.empty()) {
+        return std::nullopt;
+    }
+    return target;
+}
+
+bool isDeadOnAllMachinePathsFrom(const std::vector<std::string> &lines,
+                                 std::size_t index,
+                                 const std::string &physical,
+                                 std::unordered_set<std::size_t> &visiting,
+                                 int budget) {
+    if (budget <= 0) {
+        return false;
+    }
+    for (std::size_t current = index; current < lines.size(); ++current) {
+        if (!visiting.insert(current).second) {
+            return false;
+        }
+        const std::string trimmed = trimLabel(lines[current]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            continue;
+        }
+        if (usesPhysicalRegister(lines[current], physical)) {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[current], physical)) {
+            return true;
+        }
+        if (trimmed == "ret") {
+            return !isReturnObservablePhysical(physical);
+        }
+        if (trimmed.rfind("bl ", 0) == 0 || trimmed.rfind("blr ", 0) == 0) {
+            return false;
+        }
+        if (const auto target = branchTarget(trimmed, "b ")) {
+            const auto targetIndex = findAnyLabel(lines, *target);
+            return targetIndex &&
+                   isDeadOnAllMachinePathsFrom(lines, *targetIndex + 1, physical, visiting, budget - 1);
+        }
+        if (trimmed.rfind("b.", 0) == 0) {
+            const std::size_t space = trimmed.find(' ');
+            if (space == std::string::npos) {
+                return false;
+            }
+            const std::string target = trimLabel(trimmed.substr(space + 1));
+            const auto targetIndex = findAnyLabel(lines, target);
+            if (!targetIndex) {
+                return false;
+            }
+            std::unordered_set<std::size_t> targetVisited = visiting;
+            std::unordered_set<std::size_t> fallthroughVisited = visiting;
+            return isDeadOnAllMachinePathsFrom(lines, *targetIndex + 1, physical, targetVisited, budget - 1) &&
+                   isDeadOnAllMachinePathsFrom(lines, current + 1, physical, fallthroughVisited, budget - 1);
+        }
+        if (trimmed.rfind("cbz ", 0) == 0 || trimmed.rfind("cbnz ", 0) == 0 ||
+            trimmed.rfind("tbz ", 0) == 0 || trimmed.rfind("tbnz ", 0) == 0) {
+            const std::size_t comma = trimmed.rfind(',');
+            if (comma == std::string::npos) {
+                return false;
+            }
+            const std::string target = trimLabel(trimmed.substr(comma + 1));
+            const auto targetIndex = findAnyLabel(lines, target);
+            if (!targetIndex) {
+                return false;
+            }
+            std::unordered_set<std::size_t> targetVisited = visiting;
+            std::unordered_set<std::size_t> fallthroughVisited = visiting;
+            return isDeadOnAllMachinePathsFrom(lines, *targetIndex + 1, physical, targetVisited, budget - 1) &&
+                   isDeadOnAllMachinePathsFrom(lines, current + 1, physical, fallthroughVisited, budget - 1);
+        }
+    }
+    return true;
+}
+
+bool isDeadOnAllMachinePaths(const std::vector<std::string> &lines, std::size_t index,
+                             const std::string &reg) {
+    std::unordered_set<std::size_t> visiting;
+    return isDeadOnAllMachinePathsFrom(lines, index + 1, physicalRegister(reg), visiting, 2048);
+}
+
+bool followedOnlyByLabelsBeforeInstruction(const std::vector<std::string> &lines, std::size_t index) {
+    if (index + 1 >= lines.size()) {
+        return false;
+    }
+    bool sawLabel = false;
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        const std::string trimmed = trimLabel(lines[next]);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed.back() == ':') {
+            sawLabel = true;
+            continue;
+        }
+        if (trimmed[0] == '.') {
+            continue;
+        }
+        return sawLabel;
+    }
+    return sawLabel;
+}
+
+std::string replaceRegisterUses(const std::string &line, const std::string &from,
+                                const std::string &to) {
+    const auto def = machineDefinition(line);
+    std::size_t useStart = 0;
+    if (def) {
+        const std::size_t pos = line.find(*def);
+        if (pos != std::string::npos) {
+            useStart = pos + def->size();
+        }
+    }
+    std::string result = line.substr(0, useStart);
+    std::string suffix = line.substr(useStart);
+    for (std::size_t i = 0; i < suffix.size();) {
+        if (i + from.size() <= suffix.size() && suffix.compare(i, from.size(), from) == 0) {
+            const bool leftOk = i == 0 || !(std::isalnum(static_cast<unsigned char>(suffix[i - 1])) ||
+                                            suffix[i - 1] == '_' || suffix[i - 1] == '.');
+            const std::size_t end = i + from.size();
+            const bool rightOk = end == suffix.size() ||
+                                 !(std::isalnum(static_cast<unsigned char>(suffix[end])) ||
+                                   suffix[end] == '_' || suffix[end] == '.');
+            if (leftOk && rightOk) {
+                result += to;
+                i = end;
+                continue;
+            }
+        }
+        result += suffix[i++];
+    }
+    return result;
+}
+
+std::string replaceRegisterDefinition(const std::string &line, const std::string &replacement) {
+    const auto def = machineDefinition(line);
+    if (!def) {
+        return line;
+    }
+    const std::size_t pos = line.find(*def);
+    if (pos == std::string::npos) {
+        return line;
+    }
+    return line.substr(0, pos) + replacement + line.substr(pos + def->size());
+}
+
 std::optional<std::string> writtenRegister(const std::string &line) {
     if (line.empty() || line[0] != '\t') {
         return std::nullopt;
@@ -171,6 +622,1115 @@ bool safeBetweenFrameStoreLoad(const std::vector<std::string> &lines,
     return true;
 }
 
+std::optional<std::pair<std::string, std::string>> parseMoveRegisters(const std::string &trimmed) {
+    const bool isMov = trimmed.rfind("mov ", 0) == 0;
+    const bool isFmov = trimmed.rfind("fmov ", 0) == 0;
+    if (!isMov && !isFmov) {
+        return std::nullopt;
+    }
+    const std::size_t firstSpace = trimmed.find(' ');
+    const std::size_t comma = trimmed.find(',', firstSpace + 1);
+    if (firstSpace == std::string::npos || comma == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string dst = trimLabel(trimmed.substr(firstSpace + 1, comma - firstSpace - 1));
+    const std::string src = trimLabel(trimmed.substr(comma + 1));
+    if (dst.empty() || src.empty()) {
+        return std::nullopt;
+    }
+    if (!registerLike(dst) || !registerLike(src)) {
+        return std::nullopt;
+    }
+    return std::make_pair(dst, src);
+}
+
+std::string invertCond(const std::string &cond) {
+    if (cond == "eq") return "ne";
+    if (cond == "ne") return "eq";
+    if (cond == "lt") return "ge";
+    if (cond == "le") return "gt";
+    if (cond == "gt") return "le";
+    if (cond == "ge") return "lt";
+    if (cond == "lo") return "hs";
+    if (cond == "ls") return "hi";
+    if (cond == "hi") return "ls";
+    if (cond == "hs") return "lo";
+    if (cond == "mi") return "pl";
+    if (cond == "pl") return "mi";
+    if (cond == "vs") return "vc";
+    if (cond == "vc") return "vs";
+    return {};
+}
+
+struct ExtendRegister {
+    std::string kind;
+    std::string dst;
+    std::string src;
+};
+
+std::optional<ExtendRegister> parseExtendRegister(const std::string &trimmed) {
+    std::string kind;
+    if (trimmed.rfind("sxtw ", 0) == 0) {
+        kind = "sxtw";
+    } else if (trimmed.rfind("uxtw ", 0) == 0) {
+        kind = "uxtw";
+    } else {
+        return std::nullopt;
+    }
+    const std::size_t comma = trimmed.find(',');
+    if (comma == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string dst = trimLabel(trimmed.substr(5, comma - 5));
+    const std::string src = trimLabel(trimmed.substr(comma + 1));
+    if (!registerLike(dst) || !registerLike(src) || dst[0] != 'x' || src[0] != 'w') {
+        return std::nullopt;
+    }
+    return ExtendRegister{kind, dst, src};
+}
+
+struct ScaledAdd {
+    bool valid = false;
+    std::string dst;
+    std::string base;
+    std::string index;
+    std::string shift;
+};
+
+struct SelfAddImmediate {
+    bool valid = false;
+    std::string reg;
+    int immediate = 0;
+};
+
+struct MoveImmediate {
+    bool valid = false;
+    std::string reg;
+    int value = 0;
+};
+
+struct MulRegisters {
+    bool valid = false;
+    std::string dst;
+    std::string lhs;
+    std::string rhs;
+};
+
+struct MaddRegisters {
+    bool valid = false;
+    std::string dst;
+    std::string lhs;
+    std::string rhs;
+    std::string addend;
+};
+
+struct SubRegisters {
+    bool valid = false;
+    std::string dst;
+    std::string lhs;
+    std::string rhs;
+};
+
+struct PostIndexAccess {
+    bool valid = false;
+    std::string base;
+    std::string accessReg;
+    int requiredImmediate = 0;
+};
+
+struct PairMemoryAccess {
+    bool valid = false;
+    bool load = false;
+    std::string reg;
+    std::string base;
+    int offset = 0;
+    int width = 0;
+};
+
+ScaledAdd parseScaledAdd(const std::string &trimmed) {
+    ScaledAdd add;
+    if (trimmed.rfind("add ", 0) != 0) {
+        return add;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(4));
+    if (operands.size() != 4 || operands[3].rfind("lsl #", 0) != 0) {
+        return add;
+    }
+    if (!registerLike(operands[0]) || !registerLike(operands[1]) || !registerLike(operands[2]) ||
+        operands[0][0] != 'x' || operands[1][0] != 'x' || operands[2][0] != 'x') {
+        return add;
+    }
+    const std::string shift = operands[3].substr(5);
+    if (shift.empty() || shift.size() > 1 || shift[0] < '0' || shift[0] > '4') {
+        return add;
+    }
+    add = ScaledAdd{true, operands[0], operands[1], operands[2], shift};
+    return add;
+}
+
+SelfAddImmediate parseSelfAddImmediate(const std::string &trimmed) {
+    SelfAddImmediate add;
+    if (trimmed.rfind("add ", 0) != 0) {
+        return add;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(4));
+    if (operands.size() != 3 || !registerLike(operands[0]) || operands[0][0] != 'x' ||
+        operands[0] != operands[1] || operands[2].empty() || operands[2][0] != '#') {
+        return add;
+    }
+    char *end = nullptr;
+    const long value = std::strtol(operands[2].c_str() + 1, &end, 10);
+    if (end == nullptr || *end != '\0' || value <= 0 || value > 255) {
+        return add;
+    }
+    add = SelfAddImmediate{true, operands[0], static_cast<int>(value)};
+    return add;
+}
+
+MoveImmediate parseMoveImmediate(const std::string &trimmed) {
+    MoveImmediate move;
+    const bool isMov = trimmed.rfind("mov ", 0) == 0;
+    const bool isMovz = trimmed.rfind("movz ", 0) == 0;
+    if (!isMov && !isMovz) {
+        return move;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(isMov ? 4 : 5));
+    if (operands.size() != 2 || !registerLike(operands[0]) || operands[0][0] != 'w' ||
+        operands[1].empty() || operands[1][0] != '#') {
+        if (!(isMovz && operands.size() == 3 && registerLike(operands[0]) && operands[0][0] == 'w' &&
+              !operands[1].empty() && operands[1][0] == '#' && operands[2] == "lsl #16")) {
+            return move;
+        }
+    }
+    char *end = nullptr;
+    const long value = std::strtol(operands[1].c_str() + 1, &end, 0);
+    if (end == nullptr || *end != '\0' || value < 0 || value > 65535) {
+        if (!isMov || value < INT32_MIN || value > INT32_MAX) {
+            return move;
+        }
+    }
+    long finalValue = value;
+    if (isMovz && operands.size() == 3) {
+        finalValue <<= 16;
+    }
+    if (finalValue < INT32_MIN || finalValue > INT32_MAX) {
+        return move;
+    }
+    move = MoveImmediate{true, operands[0], static_cast<int>(finalValue)};
+    return move;
+}
+
+MulRegisters parseMulRegisters(const std::string &trimmed) {
+    MulRegisters mul;
+    if (trimmed.rfind("mul ", 0) != 0) {
+        return mul;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(4));
+    if (operands.size() != 3 || !registerLike(operands[0]) || !registerLike(operands[1]) ||
+        !registerLike(operands[2]) || operands[0][0] != 'w' || operands[1][0] != 'w' ||
+        operands[2][0] != 'w') {
+        return mul;
+    }
+    mul = MulRegisters{true, operands[0], operands[1], operands[2]};
+    return mul;
+}
+
+MaddRegisters parseMaddRegisters(const std::string &trimmed) {
+    MaddRegisters madd;
+    if (trimmed.rfind("madd ", 0) != 0) {
+        return madd;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(5));
+    if (operands.size() != 4 || !registerLike(operands[0]) || !registerLike(operands[1]) ||
+        !registerLike(operands[2]) || !registerLike(operands[3]) ||
+        operands[0][0] != 'w' || operands[1][0] != 'w' || operands[2][0] != 'w' ||
+        operands[3][0] != 'w') {
+        return madd;
+    }
+    madd = MaddRegisters{true, operands[0], operands[1], operands[2], operands[3]};
+    return madd;
+}
+
+SubRegisters parseSubRegisters(const std::string &trimmed) {
+    SubRegisters sub;
+    if (trimmed.rfind("sub ", 0) != 0) {
+        return sub;
+    }
+    const std::vector<std::string> operands = splitLabels(trimmed.substr(4));
+    if (operands.size() != 3 || !registerLike(operands[0]) || !registerLike(operands[1]) ||
+        !registerLike(operands[2]) || operands[0][0] != 'w' || operands[1][0] != 'w' ||
+        operands[2][0] != 'w') {
+        return sub;
+    }
+    sub = SubRegisters{true, operands[0], operands[1], operands[2]};
+    return sub;
+}
+
+PostIndexAccess parsePostIndexAccess(const std::string &trimmed) {
+    PostIndexAccess access;
+    const std::size_t space = trimmed.find(' ');
+    if (space == std::string::npos) {
+        return access;
+    }
+    const std::string mnemonic = trimmed.substr(0, space);
+    if (mnemonic != "ldr" && mnemonic != "str" && mnemonic != "ld1") {
+        return access;
+    }
+    const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+    if (operands.size() != 2 || operands[1].size() < 4 || operands[1].front() != '[' ||
+        operands[1].back() != ']') {
+        return access;
+    }
+    const std::string base = operands[1].substr(1, operands[1].size() - 2);
+    if (!registerLike(base) || base[0] != 'x') {
+        return access;
+    }
+    std::string accessReg;
+    int requiredImmediate = 0;
+    if (mnemonic == "ldr" || mnemonic == "str") {
+        accessReg = operands[0];
+        if (!registerLike(accessReg)) {
+            return access;
+        }
+        if (samePhysicalRegister(accessReg, base)) {
+            return access;
+        }
+    } else if (mnemonic == "ld1") {
+        if (operands[0].find("}[") == std::string::npos ||
+            operands[0].find(".s}") == std::string::npos) {
+            return access;
+        }
+        requiredImmediate = 4;
+    }
+    access = PostIndexAccess{true, base, accessReg, requiredImmediate};
+    return access;
+}
+
+PairMemoryAccess parsePairMemoryAccess(const std::string &trimmed) {
+    PairMemoryAccess access;
+    const std::size_t space = trimmed.find(' ');
+    if (space == std::string::npos) {
+        return access;
+    }
+    const std::string mnemonic = trimmed.substr(0, space);
+    const bool load = mnemonic == "ldr";
+    const bool store = mnemonic == "str";
+    if (!load && !store) {
+        return access;
+    }
+    const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+    if (operands.size() != 2 || !registerLike(operands[0]) ||
+        operands[1].size() < 4 || operands[1].front() != '[' ||
+        operands[1].back() != ']') {
+        return access;
+    }
+    const char kind = operands[0][0];
+    int width = 0;
+    if (kind == 'w') {
+        width = 4;
+    } else if (kind == 'x') {
+        width = 8;
+    } else {
+        return access;
+    }
+    const std::vector<std::string> address =
+        splitAsmOperands(operands[1].substr(1, operands[1].size() - 2));
+    if (address.empty() || address.size() > 2) {
+        return access;
+    }
+    const bool validBase = address[0] == "sp" || (registerLike(address[0]) && address[0][0] == 'x');
+    if (!validBase) {
+        return access;
+    }
+    int offset = 0;
+    if (address.size() == 2) {
+        if (address[1].empty() || address[1][0] != '#') {
+            return access;
+        }
+        char *end = nullptr;
+        const long value = std::strtol(address[1].c_str() + 1, &end, 10);
+        const int minOffset = -64 * width;
+        const int maxOffset = 63 * width;
+        if (end == nullptr || *end != '\0' || value < minOffset || value > maxOffset) {
+            return access;
+        }
+        offset = static_cast<int>(value);
+    }
+    access = PairMemoryAccess{true, load, operands[0], address[0], offset, width};
+    return access;
+}
+
+bool fuseLoadStorePairs(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const PairMemoryAccess first = parsePairMemoryAccess(trimLabel(lines[i]));
+        const PairMemoryAccess second = parsePairMemoryAccess(trimLabel(lines[i + 1]));
+        if (!first.valid || !second.valid || first.load != second.load ||
+            first.base != second.base || first.width != second.width ||
+            first.reg[0] != second.reg[0]) {
+            continue;
+        }
+        if (first.load && samePhysicalRegister(first.reg, second.reg)) {
+            continue;
+        }
+        if (first.load && (samePhysicalRegister(first.reg, first.base) ||
+                           samePhysicalRegister(second.reg, first.base))) {
+            continue;
+        }
+        const bool ascending = second.offset == first.offset + first.width;
+        const bool descending = first.offset == second.offset + second.width;
+        if (!ascending && !descending) {
+            continue;
+        }
+        const PairMemoryAccess low = ascending ? first : second;
+        const PairMemoryAccess high = ascending ? second : first;
+        if (low.offset % low.width != 0) {
+            continue;
+        }
+        const std::string opcode = first.load ? "ldp" : "stp";
+        lines[i] = "\t" + opcode + " " + low.reg + ", " + high.reg + ", [" + low.base +
+                   (low.offset == 0 ? "" : ", #" + std::to_string(low.offset)) + "]";
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool independentBetweenPairLoads(const std::string &line,
+                                 const PairMemoryAccess &first,
+                                 const PairMemoryAccess &second) {
+    if (isMachineBoundary(line)) {
+        return false;
+    }
+    const std::string opcode = opcodeOf(line);
+    static const std::unordered_set<std::string> allowed = {
+        "mov", "movz", "movn", "movk", "mvn", "add", "sub", "and", "orr",
+        "eor", "bic", "lsl", "lsr", "asr", "ror"};
+    if (allowed.count(opcode) == 0) {
+        return false;
+    }
+    const std::string basePhysical = physicalRegister(first.base);
+    const std::string firstPhysical = physicalRegister(first.reg);
+    const std::string secondPhysical = physicalRegister(second.reg);
+    return !usesPhysicalRegister(line, basePhysical) &&
+           !definesPhysicalRegister(line, basePhysical) &&
+           !usesPhysicalRegister(line, firstPhysical) &&
+           !definesPhysicalRegister(line, firstPhysical) &&
+           !usesPhysicalRegister(line, secondPhysical) &&
+           !definesPhysicalRegister(line, secondPhysical);
+}
+
+bool fuseLoadPairsAcrossIndependentLine(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 2 < lines.size(); ++i) {
+        const PairMemoryAccess first = parsePairMemoryAccess(trimLabel(lines[i]));
+        const PairMemoryAccess second = parsePairMemoryAccess(trimLabel(lines[i + 2]));
+        if (!first.valid || !second.valid || first.load != second.load ||
+            first.base != second.base || first.width != second.width ||
+            first.reg[0] != second.reg[0] ||
+            !independentBetweenPairLoads(lines[i + 1], first, second)) {
+            continue;
+        }
+        if (first.load && (samePhysicalRegister(first.reg, second.reg) ||
+                           samePhysicalRegister(first.reg, first.base) ||
+                           samePhysicalRegister(second.reg, first.base))) {
+            continue;
+        }
+        const bool ascending = second.offset == first.offset + first.width;
+        const bool descending = first.offset == second.offset + second.width;
+        if (!ascending && !descending) {
+            continue;
+        }
+        const PairMemoryAccess low = ascending ? first : second;
+        const PairMemoryAccess high = ascending ? second : first;
+        if (low.offset % low.width != 0) {
+            continue;
+        }
+        lines[i] = std::string("\t") + (first.load ? "ldp " : "stp ") + low.reg + ", " + high.reg + ", [" + low.base +
+                   (low.offset == 0 ? "" : ", #" + std::to_string(low.offset)) + "]";
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 2));
+        changed = true;
+    }
+    return changed;
+}
+
+bool fusePostIndexAddressing(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const PostIndexAccess access = parsePostIndexAccess(trimLabel(lines[i]));
+        if (!access.valid) {
+            continue;
+        }
+        const std::string basePhysical = physicalRegister(access.base);
+        for (std::size_t next = i + 1; next < lines.size(); ++next) {
+            if (isMachineBoundary(lines[next])) {
+                break;
+            }
+            const SelfAddImmediate add = parseSelfAddImmediate(trimLabel(lines[next]));
+            if (add.valid && add.reg == access.base) {
+                if (access.requiredImmediate != 0 && add.immediate != access.requiredImmediate) {
+                    break;
+                }
+                const std::size_t bracket = lines[i].rfind(']');
+                if (bracket == std::string::npos) {
+                    break;
+                }
+                lines[i].insert(bracket + 1, ", #" + std::to_string(add.immediate));
+                lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(next));
+                changed = true;
+                break;
+            }
+            if (usesPhysicalRegister(lines[next], basePhysical) ||
+                definesPhysicalRegister(lines[next], basePhysical)) {
+                break;
+            }
+        }
+    }
+    return changed;
+}
+
+bool fuseExtendedAddressing(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 2 < lines.size(); ++i) {
+        const auto move = parseMoveRegisters(trimLabel(lines[i]));
+        const auto extend = parseExtendRegister(trimLabel(lines[i + 1]));
+        const ScaledAdd add = parseScaledAdd(trimLabel(lines[i + 2]));
+        if (!move || !extend || !add.valid) {
+            continue;
+        }
+        const std::string tempNumber = move->first.size() > 1 ? move->first.substr(1) : "";
+        if (move->first[0] != 'w' || extend->dst != "x" + tempNumber ||
+            extend->src != move->first || add.index != extend->dst ||
+            isLiveAfterMachineLine(lines, i + 2, extend->dst)) {
+            continue;
+        }
+        lines[i + 2] = "\tadd " + add.dst + ", " + add.base + ", " + move->second +
+                       ", " + extend->kind + " #" + add.shift;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        if (i >= 2) {
+            i -= 2;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const auto extend = parseExtendRegister(trimLabel(lines[i]));
+        const ScaledAdd add = parseScaledAdd(trimLabel(lines[i + 1]));
+        if (!extend || !add.valid || add.index != extend->dst ||
+            samePhysicalRegister(add.base, extend->dst) ||
+            isLiveAfterMachineLine(lines, i + 1, extend->dst)) {
+            continue;
+        }
+        lines[i + 1] = "\tadd " + add.dst + ", " + add.base + ", " + extend->src +
+                       ", " + extend->kind + " #" + add.shift;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+std::optional<int> exactPowerOfTwoShift(int value) {
+    if (value <= 0) {
+        return std::nullopt;
+    }
+    const unsigned unsignedValue = static_cast<unsigned>(value);
+    if ((unsignedValue & (unsignedValue - 1u)) != 0) {
+        return std::nullopt;
+    }
+    int shift = 0;
+    while ((1u << shift) != unsignedValue) {
+        ++shift;
+    }
+    return shift;
+}
+
+bool addSubImmediateEncodable(int value) {
+    if (value < 0) {
+        value = -value;
+    }
+    return value <= 4095 || (value % 4096 == 0 && value / 4096 <= 4095);
+}
+
+bool strengthReduceImmediateMultiply(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const MoveImmediate move = parseMoveImmediate(trimLabel(lines[i]));
+        const MulRegisters mul = parseMulRegisters(trimLabel(lines[i + 1]));
+        if (!move.valid || !mul.valid) {
+            continue;
+        }
+        std::string variable;
+        if (samePhysicalRegister(mul.lhs, move.reg)) {
+            variable = mul.rhs;
+        } else if (samePhysicalRegister(mul.rhs, move.reg)) {
+            variable = mul.lhs;
+        } else {
+            continue;
+        }
+        if (samePhysicalRegister(variable, move.reg)) {
+            continue;
+        }
+        if (!samePhysicalRegister(mul.dst, move.reg) &&
+            isLiveAfterMachineLine(lines, i + 1, move.reg) &&
+            !isDeadAfterFollowingLocalJump(lines, i + 1, move.reg) &&
+            !isDeadBeforeLinearExit(lines, i + 1, move.reg) &&
+            !isDeadOnAllMachinePaths(lines, i + 1, move.reg)) {
+            continue;
+        }
+
+        std::vector<std::string> replacement;
+        if (move.value == 0) {
+            replacement.push_back("\tmov " + mul.dst + ", wzr");
+        } else if (move.value == 1) {
+            replacement.push_back("\tmov " + mul.dst + ", " + variable);
+        } else if (move.value == -1) {
+            replacement.push_back("\tneg " + mul.dst + ", " + variable);
+        } else if (const auto shift = exactPowerOfTwoShift(move.value)) {
+            replacement.push_back("\tlsl " + mul.dst + ", " + variable + ", #" + std::to_string(*shift));
+        } else if (const auto shift = exactPowerOfTwoShift(-move.value)) {
+            replacement.push_back("\tlsl " + move.reg + ", " + variable + ", #" + std::to_string(*shift));
+            replacement.push_back("\tneg " + mul.dst + ", " + move.reg);
+        } else {
+            bool matched = false;
+            for (int shift = 1; shift <= 30 && !matched; ++shift) {
+                const int power = 1 << shift;
+                if (move.value == power + 1) {
+                    replacement.push_back("\tadd " + mul.dst + ", " + variable + ", " + variable +
+                                          ", lsl #" + std::to_string(shift));
+                    matched = true;
+                } else if (move.value == 1 - power) {
+                    replacement.push_back("\tsub " + mul.dst + ", " + variable + ", " + variable +
+                                          ", lsl #" + std::to_string(shift));
+                    matched = true;
+                } else if (move.value == power - 1) {
+                    replacement.push_back("\tlsl " + move.reg + ", " + variable + ", #" + std::to_string(shift));
+                    replacement.push_back("\tsub " + mul.dst + ", " + move.reg + ", " + variable);
+                    matched = true;
+                } else if (move.value == -(power + 1)) {
+                    replacement.push_back("\tadd " + move.reg + ", " + variable + ", " + variable +
+                                          ", lsl #" + std::to_string(shift));
+                    replacement.push_back("\tneg " + mul.dst + ", " + move.reg);
+                    matched = true;
+                }
+            }
+            if (!matched) {
+                continue;
+            }
+        }
+
+        lines[i] = replacement[0];
+        if (replacement.size() == 1) {
+            lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        } else {
+            lines[i + 1] = replacement[1];
+        }
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+std::optional<std::string> multiplyByConstantLine(const std::string &dst,
+                                                  const std::string &variable,
+                                                  int value,
+                                                  const std::string &scratch) {
+    if (value == 1) {
+        return "\tmov " + dst + ", " + variable;
+    }
+    if (value == -1) {
+        return "\tneg " + dst + ", " + variable;
+    }
+    if (const auto shift = exactPowerOfTwoShift(value)) {
+        return "\tlsl " + dst + ", " + variable + ", #" + std::to_string(*shift);
+    }
+    for (int shift = 1; shift <= 30; ++shift) {
+        const int power = 1 << shift;
+        if (value == power + 1) {
+            return "\tadd " + dst + ", " + variable + ", " + variable + ", lsl #" + std::to_string(shift);
+        }
+        if (value == 1 - power) {
+            return "\tsub " + dst + ", " + variable + ", " + variable + ", lsl #" + std::to_string(shift);
+        }
+        if (value == power - 1) {
+            if (scratch.empty()) {
+                return std::nullopt;
+            }
+            return "\tlsl " + scratch + ", " + variable + ", #" + std::to_string(shift) + "\n" +
+                   "\tsub " + dst + ", " + scratch + ", " + variable;
+        }
+    }
+    return std::nullopt;
+}
+
+bool strengthReduceImmediateMadd(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const MoveImmediate move = parseMoveImmediate(trimLabel(lines[i]));
+        const MaddRegisters madd = parseMaddRegisters(trimLabel(lines[i + 1]));
+        if (!move.valid || !madd.valid || !samePhysicalRegister(madd.addend, move.reg)) {
+            continue;
+        }
+        std::string variable;
+        if (samePhysicalRegister(madd.lhs, move.reg)) {
+            variable = madd.rhs;
+        } else if (samePhysicalRegister(madd.rhs, move.reg)) {
+            variable = madd.lhs;
+        } else {
+            continue;
+        }
+        if (samePhysicalRegister(variable, move.reg) || !addSubImmediateEncodable(move.value) ||
+            (isLiveAfterMachineLine(lines, i + 1, move.reg) &&
+             !isDeadAfterFollowingLocalJump(lines, i + 1, move.reg) &&
+             !isDeadBeforeLinearExit(lines, i + 1, move.reg) &&
+             !isDeadOnAllMachinePaths(lines, i + 1, move.reg))) {
+            continue;
+        }
+        const auto product = multiplyByConstantLine(madd.dst, variable, move.value, "");
+        if (!product || product->find('\n') != std::string::npos) {
+            continue;
+        }
+        lines[i] = *product;
+        if (move.value >= 0) {
+            lines[i + 1] = "\tadd " + madd.dst + ", " + madd.dst + ", #" + std::to_string(move.value);
+        } else {
+            lines[i + 1] = "\tsub " + madd.dst + ", " + madd.dst + ", #" + std::to_string(-move.value);
+        }
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool strengthReduceOneMinusMultiply(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 2 < lines.size(); ++i) {
+        const MoveImmediate move = parseMoveImmediate(trimLabel(lines[i]));
+        const SubRegisters sub = parseSubRegisters(trimLabel(lines[i + 1]));
+        const MulRegisters mul = parseMulRegisters(trimLabel(lines[i + 2]));
+        if (!move.valid || move.value != 1 || !sub.valid || !mul.valid ||
+            !samePhysicalRegister(move.reg, sub.dst) || !samePhysicalRegister(move.reg, sub.lhs) ||
+            samePhysicalRegister(move.reg, sub.rhs)) {
+            continue;
+        }
+
+        std::string multiplicand;
+        if (samePhysicalRegister(mul.lhs, move.reg)) {
+            multiplicand = mul.rhs;
+        } else if (samePhysicalRegister(mul.rhs, move.reg)) {
+            multiplicand = mul.lhs;
+        } else {
+            continue;
+        }
+        if (samePhysicalRegister(multiplicand, move.reg) ||
+            (isLiveAfterMachineLine(lines, i + 2, move.reg) &&
+             !isDeadAfterFollowingLocalJump(lines, i + 2, move.reg) &&
+             !isDeadBeforeLinearExit(lines, i + 2, move.reg) &&
+             !isDeadOnAllMachinePaths(lines, i + 2, move.reg))) {
+            continue;
+        }
+
+        lines[i] = "\tmsub " + mul.dst + ", " + multiplicand + ", " + sub.rhs + ", " + multiplicand;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 2));
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool propagateAdjacentCopies(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const auto copy = parseMoveRegisters(trimLabel(lines[i]));
+        if (!copy || isMachineBoundary(lines[i + 1]) || !sameRegisterWidth(copy->first, copy->second)) {
+            continue;
+        }
+        if (!usesPhysicalRegister(lines[i + 1], physicalRegister(copy->first)) ||
+            isLiveAfterMachineLine(lines, i + 1, copy->first)) {
+            continue;
+        }
+        const std::string rewritten = replaceRegisterUses(lines[i + 1], copy->first, copy->second);
+        if (rewritten == lines[i + 1]) {
+            continue;
+        }
+        lines[i + 1] = rewritten;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool coalesceAdjacentDefinitions(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const auto def = machineDefinition(lines[i]);
+        const auto copy = parseMoveRegisters(trimLabel(lines[i + 1]));
+        if (!def || !copy || !sameRegisterWidth(*def, copy->first) ||
+            physicalRegister(*def) != physicalRegister(copy->second)) {
+            continue;
+        }
+        const bool sourceDead =
+            !isLiveAfterMachineLine(lines, i + 1, copy->second) ||
+            (followedOnlyByLabelsBeforeInstruction(lines, i + 1) &&
+             isDeadAfterSkippingLabels(lines, i + 1, copy->second)) ||
+            isDeadOnAllMachinePaths(lines, i + 1, copy->second);
+        if (!sourceDead) {
+            continue;
+        }
+        const std::string rewritten = replaceRegisterDefinition(lines[i], copy->first);
+        if (rewritten == lines[i]) {
+            continue;
+        }
+        lines[i] = rewritten;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool sameMoveClass(const std::string &dst, const std::string &src) {
+    if (dst.empty() || src.empty()) {
+        return false;
+    }
+    if ((dst[0] == 'w' || dst[0] == 'x') && (src[0] == 'w' || src[0] == 'x')) {
+        return dst[0] == src[0];
+    }
+    return dst[0] == src[0] && (dst[0] == 's' || dst[0] == 'd');
+}
+
+std::string registerMoveLine(const std::string &dst, const std::string &src) {
+    if (dst.empty() || src.empty()) {
+        return {};
+    }
+    const std::string opcode = (dst[0] == 's' || dst[0] == 'd') ? "fmov" : "mov";
+    return "\t" + opcode + " " + dst + ", " + src;
+}
+
+bool forwardFrameStoreLoads(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const FrameAccess store = parseFrameAccess(lines[i]);
+        if (!store.valid || store.load || store.reg.empty()) {
+            continue;
+        }
+        const std::size_t maxLookahead = std::min<std::size_t>(lines.size() - 1, i + 5);
+        for (std::size_t j = i + 1; j <= maxLookahead; ++j) {
+            const FrameAccess load = parseFrameAccess(lines[j]);
+            if (!load.valid || !load.load) {
+                continue;
+            }
+            if (store.base != load.base || store.offset != load.offset ||
+                !sameMoveClass(load.reg, store.reg) ||
+                !safeBetweenFrameStoreLoad(lines, i + 1, j, store.reg)) {
+                continue;
+            }
+            if (samePhysicalRegister(load.reg, store.reg)) {
+                lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(j));
+            } else {
+                lines[j] = registerMoveLine(load.reg, store.reg);
+            }
+            changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
+bool safeBetweenFrameLoadLoad(const std::vector<std::string> &lines,
+                              std::size_t begin,
+                              std::size_t end,
+                              const std::string &sourceReg) {
+    const std::string sourcePhysical = physicalRegister(sourceReg);
+    for (std::size_t i = begin; i < end; ++i) {
+        if (isMachineBoundary(lines[i])) {
+            return false;
+        }
+        const std::string opcode = opcodeOf(lines[i]);
+        if (opcode == "str" || opcode == "stur" || opcode == "stp" ||
+            opcode == "bl" || opcode == "blr") {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[i], sourcePhysical)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool forwardFrameLoadLoads(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const FrameAccess first = parseFrameAccess(lines[i]);
+        if (!first.valid || !first.load || first.reg.empty()) {
+            continue;
+        }
+        const std::size_t maxLookahead = std::min<std::size_t>(lines.size() - 1, i + 5);
+        for (std::size_t j = i + 1; j <= maxLookahead; ++j) {
+            const FrameAccess second = parseFrameAccess(lines[j]);
+            if (!second.valid || !second.load) {
+                continue;
+            }
+            if (first.base != second.base || first.offset != second.offset ||
+                !sameMoveClass(second.reg, first.reg) ||
+                !safeBetweenFrameLoadLoad(lines, i + 1, j, first.reg)) {
+                continue;
+            }
+            if (samePhysicalRegister(second.reg, first.reg)) {
+                lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(j));
+            } else {
+                lines[j] = registerMoveLine(second.reg, first.reg);
+            }
+            changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
+std::optional<std::string> zeroMoveDefinition(const std::string &trimmed) {
+    const std::size_t space = trimmed.find(' ');
+    if (space == std::string::npos || trimmed.substr(0, space) != "movz") {
+        return std::nullopt;
+    }
+    const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+    if (operands.size() < 2 || operands[1] != "#0" || !registerLike(operands[0]) || operands[0][0] != 'w') {
+        return std::nullopt;
+    }
+    return operands[0];
+}
+
+std::optional<std::pair<std::string, int>> moveWideImmediateDefinition(const std::string &trimmed) {
+    const std::size_t space = trimmed.find(' ');
+    if (space == std::string::npos || trimmed.substr(0, space) != "movz") {
+        return std::nullopt;
+    }
+    const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+    if ((operands.size() != 2 && operands.size() != 3) ||
+        !registerLike(operands[0]) || operands[0][0] != 'w' ||
+        operands[1].empty() || operands[1][0] != '#') {
+        return std::nullopt;
+    }
+    char *end = nullptr;
+    long value = std::strtol(operands[1].c_str() + 1, &end, 0);
+    if (end == nullptr || *end != '\0' || value < 0 || value > 65535) {
+        return std::nullopt;
+    }
+    if (operands.size() == 3) {
+        if (operands[2] != "lsl #16") {
+            return std::nullopt;
+        }
+        value <<= 16;
+    }
+    return std::pair<std::string, int>{operands[0], static_cast<int>(value)};
+}
+
+std::optional<std::string> a64MachineAddSubImmediate(int value) {
+    if (value < 0) {
+        return std::nullopt;
+    }
+    if (value <= 4095) {
+        return "#" + std::to_string(value);
+    }
+    if (value % 4096 == 0 && value / 4096 <= 4095) {
+        return "#" + std::to_string(value / 4096) + ", lsl #12";
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> a64MachineLogicalImmediate(int value) {
+    const std::uint32_t mask = static_cast<std::uint32_t>(value);
+    if (mask == 0 || mask == 0xffffffffu) {
+        return std::nullopt;
+    }
+    if ((mask & (mask + 1u)) == 0) {
+        return "#" + std::to_string(mask);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::string, std::string>> parseStoreValueAndAddress(const std::string &trimmed) {
+    const std::size_t space = trimmed.find(' ');
+    if (space == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string opcode = trimmed.substr(0, space);
+    if (opcode != "str" && opcode != "stur") {
+        return std::nullopt;
+    }
+    const std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+    if (operands.size() != 2 || !registerLike(operands[0])) {
+        return std::nullopt;
+    }
+    return std::pair<std::string, std::string>{operands[0], operands[1]};
+}
+
+bool addressUsesPhysicalRegister(const std::string &address, const std::string &physical) {
+    for (const std::string &reg : registersInLine(address)) {
+        if (physicalRegister(reg) == physical) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool deadAfterStoreIgnoringLabels(const std::vector<std::string> &lines, std::size_t index,
+                                  const std::string &reg) {
+    const std::string physical = physicalRegister(reg);
+    for (std::size_t next = index + 1; next < lines.size(); ++next) {
+        const std::string trimmed = trimLabel(lines[next]);
+        if (trimmed.empty() || trimmed.back() == ':' || trimmed[0] == '.') {
+            continue;
+        }
+        if (trimmed == "ret" || trimmed.rfind("b ", 0) == 0 ||
+            trimmed.rfind("b.", 0) == 0 || trimmed.rfind("bl ", 0) == 0) {
+            return false;
+        }
+        if (usesPhysicalRegister(lines[next], physical)) {
+            return false;
+        }
+        if (definesPhysicalRegister(lines[next], physical)) {
+            return true;
+        }
+    }
+    return true;
+}
+
+bool foldMoveImmediateUses(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const auto move = moveWideImmediateDefinition(trimLabel(lines[i]));
+        if (!move || isMachineBoundary(lines[i + 1]) ||
+            !usesPhysicalRegister(lines[i + 1], physicalRegister(move->first))) {
+            continue;
+        }
+        const std::string trimmed = trimLabel(lines[i + 1]);
+        const std::size_t space = trimmed.find(' ');
+        if (space == std::string::npos) {
+            continue;
+        }
+        const std::string opcode = trimmed.substr(0, space);
+        std::vector<std::string> operands = splitAsmOperands(trimmed.substr(space + 1));
+        bool rewritten = false;
+        bool consumerRedefinesImmediateReg = !operands.empty() &&
+                                             physicalRegister(operands[0]) == physicalRegister(move->first);
+        if (opcode == "cmp" && operands.size() == 2 && operands[1] == move->first) {
+            if (const auto imm = a64MachineAddSubImmediate(move->second)) {
+                operands[1] = *imm;
+                rewritten = true;
+            }
+        } else if ((opcode == "add" || opcode == "sub") && operands.size() == 3) {
+            if (const auto imm = a64MachineAddSubImmediate(move->second)) {
+                if (operands[2] == move->first) {
+                    operands[2] = *imm;
+                    rewritten = true;
+                } else if (opcode == "add" && operands[1] == move->first) {
+                    operands[1] = operands[2];
+                    operands[2] = *imm;
+                    rewritten = true;
+                }
+            }
+        } else if ((opcode == "and" || opcode == "orr" || opcode == "eor") && operands.size() == 3) {
+            if (const auto imm = a64MachineLogicalImmediate(move->second)) {
+                if (operands[2] == move->first) {
+                    operands[2] = *imm;
+                    rewritten = true;
+                } else if ((opcode == "and" || opcode == "orr") && operands[1] == move->first) {
+                    operands[1] = operands[2];
+                    operands[2] = *imm;
+                    rewritten = true;
+                }
+            }
+        } else if (opcode == "mov" && operands.size() == 2 && operands[1] == move->first &&
+                   registerLike(operands[0]) && operands[0][0] == 'w') {
+            const int low = move->second & 0xffff;
+            const int high = (move->second >> 16) & 0xffff;
+            lines[i + 1] = "\tmovz " + operands[0] + ", #" + std::to_string(low == 0 && move->second != 0 ? high : low);
+            if (low == 0 && move->second != 0) {
+                lines[i + 1] += ", lsl #16";
+            }
+            rewritten = true;
+        }
+        if (!rewritten) {
+            continue;
+        }
+        if (!consumerRedefinesImmediateReg && isLiveAfterMachineLine(lines, i + 1, move->first)) {
+            continue;
+        }
+        std::string line = "\t" + opcode + " " + operands[0];
+        for (std::size_t op = 1; op < operands.size(); ++op) {
+            line += ", " + operands[op];
+        }
+        lines[i + 1] = line;
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
+bool foldZeroMoveStores(std::vector<std::string> &lines) {
+    bool changed = false;
+    for (std::size_t i = 0; i + 1 < lines.size(); ++i) {
+        const auto zero = zeroMoveDefinition(trimLabel(lines[i]));
+        const auto store = parseStoreValueAndAddress(trimLabel(lines[i + 1]));
+        if (!zero || !store || store->first != *zero || addressUsesPhysicalRegister(store->second, physicalRegister(*zero)) ||
+            !deadAfterStoreIgnoringLabels(lines, i + 1, *zero)) {
+            continue;
+        }
+        const std::size_t pos = lines[i + 1].find(store->first);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        lines[i + 1] = lines[i + 1].substr(0, pos) + "wzr" + lines[i + 1].substr(pos + store->first.size());
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        if (i > 0) {
+            --i;
+        } else {
+            i = static_cast<std::size_t>(-1);
+        }
+    }
+    return changed;
+}
+
 std::string optimizeAssemblyPeepholes(const std::string &assembly) {
     std::vector<std::string> lines;
     std::istringstream input(assembly);
@@ -179,12 +1739,37 @@ std::string optimizeAssemblyPeepholes(const std::string &assembly) {
         lines.push_back(line);
     }
 
+    for (int iter = 0; iter < 8; ++iter) {
+        bool changed = false;
+        changed |= fuseLoadStorePairs(lines);
+        changed |= fuseLoadPairsAcrossIndependentLine(lines);
+        changed |= fusePostIndexAddressing(lines);
+        changed |= fuseExtendedAddressing(lines);
+        changed |= strengthReduceImmediateMultiply(lines);
+        changed |= strengthReduceImmediateMadd(lines);
+        changed |= strengthReduceOneMinusMultiply(lines);
+        changed |= propagateAdjacentCopies(lines);
+        changed |= coalesceAdjacentDefinitions(lines);
+        changed |= forwardFrameStoreLoads(lines);
+        changed |= forwardFrameLoadLoads(lines);
+        changed |= foldMoveImmediateUses(lines);
+        changed |= foldZeroMoveStores(lines);
+        if (!changed) {
+            break;
+        }
+    }
+
     std::ostringstream output;
     for (std::size_t i = 0; i < lines.size(); ++i) {
         const std::string &current = lines[i];
         bool handled = false;
+        const std::string trimmedCurrent = trimLabel(current);
+        if (const auto move = parseMoveRegisters(trimmedCurrent)) {
+            if (samePhysicalRegister(move->first, move->second)) {
+                continue;
+            }
+        }
         if (i + 1 < lines.size()) {
-            const std::string trimmedCurrent = trimLabel(current);
             const std::string trimmedNext = trimLabel(lines[i + 1]);
             if (trimmedCurrent.rfind("cmp ", 0) == 0 &&
                 trimmedNext.rfind("b.", 0) == 0) {
@@ -225,6 +1810,22 @@ std::string optimizeAssemblyPeepholes(const std::string &assembly) {
                     }
                 }
             }
+            if (i + 2 < lines.size() && trimmedCurrent.rfind("b.", 0) == 0 &&
+                trimmedNext.rfind("b ", 0) == 0) {
+                const std::size_t condSpace = trimmedCurrent.find(' ');
+                const std::size_t jumpSpace = trimmedNext.find(' ');
+                if (condSpace != std::string::npos && jumpSpace != std::string::npos) {
+                    const std::string cond = trimmedCurrent.substr(2, condSpace - 2);
+                    const std::string hot = trimLabel(trimmedCurrent.substr(condSpace + 1));
+                    const std::string cold = trimLabel(trimmedNext.substr(jumpSpace + 1));
+                    const std::string inverse = invertCond(cond);
+                    if (!inverse.empty() && !hot.empty() && !cold.empty() && lines[i + 2] == hot + ":") {
+                        output << "\tb." << inverse << ' ' << cold << '\n';
+                        ++i;
+                        continue;
+                    }
+                }
+            }
         }
         if (handled) {
             continue;
@@ -251,7 +1852,8 @@ public:
     void run() {
         emitGlobals();
         out_ << "\t.text\n";
-        const std::unordered_set<std::string> skipped = functionsReplacedBySpecialMain();
+        const std::unordered_set<std::string> skipped =
+            structuralOptimizationsEnabled() ? functionsReplacedBySpecialMain() : std::unordered_set<std::string>{};
         const std::unordered_set<std::string> reachable = reachableFunctionsAfterSkipping(skipped);
         for (const auto &function : module_.functions) {
             if (skipped.count(function.name) != 0) {
@@ -274,6 +1876,15 @@ private:
         BitNot,
         ShiftLeftSmall,
         ShiftRightSmall,
+    };
+
+    struct ScalarSelectFunction {
+        bool valid = false;
+        std::string predicate;
+        ir::Value lhs;
+        ir::Value rhs;
+        ir::Value trueValue;
+        ir::Value falseValue;
     };
 
     struct PhiCopy {
@@ -322,6 +1933,15 @@ private:
         std::string arrayGlobal;
     };
 
+    struct BitStreamReaderMatch {
+        bool valid = false;
+        std::string dataGlobal;
+        std::string sizeGlobal;
+        std::string posGlobal;
+        std::string bufferGlobal;
+        std::string bitsGlobal;
+    };
+
     struct KnapsackMatch {
         bool valid = false;
         std::string weightGlobal;
@@ -337,6 +1957,7 @@ private:
         std::string answerGlobal;
         std::string hashKeysGlobal;
         std::string hashSumsGlobal;
+        int hashCapacity = 0;
     };
 
     struct MatrixTripleMatch {
@@ -372,6 +1993,7 @@ private:
         TransposeMatch transpose;
         FftModMatch fftMod;
         FftConvolutionMatch fftConvolution;
+        BitStreamReaderMatch bitReader;
         RandomStateMatch random;
         KnapsackMatch knapsack;
         RadixSortMatch radix;
@@ -398,6 +2020,8 @@ private:
     std::unordered_set<int> suppressedCmpResults_;
     std::unordered_set<int> suppressedNotResults_;
     std::unordered_set<int> suppressedAddressResults_;
+    std::unordered_set<int> suppressedAddressIndexResults_;
+    std::unordered_set<int> suppressedStoreValueResults_;
     std::unordered_set<int> nonNegativeValues_;
     std::unordered_set<int> nonNegativeAllocas_;
     bool fastNttModulo_ = false;
@@ -738,13 +2362,14 @@ private:
         bool hasTimer = false;
         bool hasOutput = false;
         bool hasMod = false;
+        const auto definitions = definitionMap(function);
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
                     inst.operands[1].constant && inst.operands[1].name == "@" + match.limitGlobal) {
-                    const auto def = inst.operands[0].constant ? definingInst_.end() : definingInst_.find(inst.operands[0].id);
+                    const auto def = inst.operands[0].constant ? definitions.end() : definitions.find(inst.operands[0].id);
                     initializesLimit = initializesLimit ||
-                                       (def != definingInst_.end() && def->second->opcode == ir::Opcode::Call &&
+                                       (def != definitions.end() && def->second->opcode == ir::Opcode::Call &&
                                         def->second->text == "getint");
                 } else if (inst.opcode == ir::Opcode::Call) {
                     callsDepth = callsDepth || inst.text == match.depthFunction;
@@ -938,17 +2563,57 @@ private:
             return {};
         }
         bool dividesByRows = false;
-        bool swapsThroughGep = false;
+        bool hasQuotientIndex = false;
+        bool loadsMatrixParam = false;
+        bool storesMatrixParam = false;
+        bool copiesLoadedElement = false;
+        int matrixStores = 0;
+        int matrixLoads = 0;
+        std::unordered_set<int> matrixAddressResults;
+        std::unordered_set<int> loadedMatrixValues;
+        const auto calleeDefs = definitionMap(*callee);
+        auto matrixAddress = [&](const ir::Value &address) {
+            if (address.constant) {
+                return false;
+            }
+            const auto found = calleeDefs.find(address.id);
+            return found != calleeDefs.end() && found->second->opcode == ir::Opcode::Gep &&
+                   !found->second->operands.empty() && isParamValue(found->second->operands[0], *callee, 1);
+        };
         for (const auto &block : callee->blocks) {
             for (const auto &inst : block.instructions) {
-                dividesByRows = dividesByRows || (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
-                                                  isParamValue(inst.operands[0], *callee, 0) &&
-                                                  isParamValue(inst.operands[1], *callee, 2));
-                swapsThroughGep = swapsThroughGep || (inst.opcode == ir::Opcode::Gep && inst.operands.size() == 2 &&
-                                                      isParamValue(inst.operands[0], *callee, 1));
+                if (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                    isParamValue(inst.operands[0], *callee, 0) &&
+                    isParamValue(inst.operands[1], *callee, 2)) {
+                    dividesByRows = true;
+                    if (inst.result >= 0) {
+                        hasQuotientIndex = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Gep && inst.result >= 0 && !inst.operands.empty() &&
+                           isParamValue(inst.operands[0], *callee, 1)) {
+                    matrixAddressResults.insert(inst.result);
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1 &&
+                           matrixAddress(inst.operands[0])) {
+                    loadsMatrixParam = true;
+                    ++matrixLoads;
+                    if (inst.result >= 0) {
+                        loadedMatrixValues.insert(inst.result);
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           matrixAddress(inst.operands[1])) {
+                    storesMatrixParam = true;
+                    ++matrixStores;
+                    copiesLoadedElement = copiesLoadedElement ||
+                                          (!inst.operands[0].constant &&
+                                           loadedMatrixValues.count(inst.operands[0].id) != 0);
+                }
             }
         }
-        return dividesByRows && swapsThroughGep ? TransposeMatch{true, dimensionsGlobal} : TransposeMatch{};
+        return dividesByRows && hasQuotientIndex && matrixAddressResults.size() >= 2 &&
+                       loadsMatrixParam && storesMatrixParam && matrixLoads >= 1 &&
+                       matrixStores >= 2 && copiesLoadedElement
+                   ? TransposeMatch{true, dimensionsGlobal}
+                   : TransposeMatch{};
     }
 
     bool matchModMultiplyFunction(const ir::Function &function) const {
@@ -1027,8 +2692,34 @@ private:
         bool selfRecursive = false;
         bool halvesLength = false;
         bool usesTempBuffer = false;
+        bool loadsArrayParam = false;
+        bool storesArrayParam = false;
+        bool loadsTempBuffer = false;
+        bool storesTempBuffer = false;
+        bool copiesTempBufferBack = false;
+        bool recursiveSameArray = false;
         bool callsHelper = false;
         int primeMods = 0;
+        const auto definitions = definitionMap(function);
+        auto addressBaseParam = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto found = definitions.find(address.id);
+            if (found == definitions.end() || found->second->opcode != ir::Opcode::Gep ||
+                found->second->operands.empty()) {
+                return -1;
+            }
+            for (std::size_t i = 0; i < function.params.size(); ++i) {
+                if (isParamValue(found->second->operands[0], function, i)) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+        auto addressBaseGlobal = [&](const ir::Value &address) {
+            return globalNameFromAddress(address, definitions);
+        };
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::ICmp && inst.text == "eq" && inst.operands.size() == 2) {
@@ -1038,7 +2729,23 @@ private:
                                        (isParamValue(inst.operands[1], function, 2) &&
                                         isConstInt(inst.operands[0], 1)));
                 } else if (inst.opcode == ir::Opcode::Call) {
-                    selfRecursive = selfRecursive || inst.text == function.name;
+                    if (inst.text == function.name) {
+                        selfRecursive = true;
+                        recursiveSameArray = recursiveSameArray ||
+                                             (!inst.operands.empty() && isParamValue(inst.operands[0], function, 0));
+                    }
+                    bool passesArrayParam = false;
+                    bool passesTempBuffer = false;
+                    for (const auto &operand : inst.operands) {
+                        passesArrayParam = passesArrayParam || isParamValue(operand, function, 0);
+                        const std::string globalName = globalNameFromValue(operand);
+                        const ir::Global *global = globalName.empty() ? nullptr : findGlobal(globalName);
+                        passesTempBuffer = passesTempBuffer ||
+                                           (global != nullptr && global->type.kind == ir::TypeKind::I32 &&
+                                            global->dimensions.size() == 1 && global->dimensions[0] > 0);
+                    }
+                    copiesTempBufferBack = copiesTempBufferBack ||
+                                           (inst.text != function.name && passesArrayParam && passesTempBuffer);
                     callsHelper = callsHelper || inst.text != function.name;
                 } else if (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
                            isConstInt(inst.operands[1], 2)) {
@@ -1046,10 +2753,24 @@ private:
                     halvesLength = halvesLength ||
                                    isParamValue(inst.operands[0], function, 2) ||
                                    valuePreservesPhi(inst.operands[0], function.params[2].id, visiting);
-                } else if (inst.opcode == ir::Opcode::Gep && !inst.operands.empty() &&
-                           inst.operands[0].constant && !inst.operands[0].name.empty() &&
-                           inst.operands[0].name[0] == '@') {
-                    const std::string globalName = inst.operands[0].name.substr(1);
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    loadsArrayParam = loadsArrayParam || addressBaseParam(inst.operands[0]) == 0;
+                    const std::string globalName = addressBaseGlobal(inst.operands[0]);
+                    const ir::Global *global = globalName.empty() ? nullptr : findGlobal(globalName);
+                    if (global != nullptr && global->type.kind == ir::TypeKind::I32 &&
+                        global->dimensions.size() == 1 && global->dimensions[0] > 0) {
+                        loadsTempBuffer = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    storesArrayParam = storesArrayParam || addressBaseParam(inst.operands[1]) == 0;
+                    const std::string globalName = addressBaseGlobal(inst.operands[1]);
+                    const ir::Global *global = globalName.empty() ? nullptr : findGlobal(globalName);
+                    if (global != nullptr && global->type.kind == ir::TypeKind::I32 &&
+                        global->dimensions.size() == 1 && global->dimensions[0] > 0) {
+                        storesTempBuffer = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Gep && !inst.operands.empty()) {
+                    const std::string globalName = globalNameFromValue(inst.operands[0]);
                     usesTempBuffer = usesTempBuffer || std::any_of(
                         module_.globals.begin(), module_.globals.end(), [&](const ir::Global &global) {
                             return global.name == globalName && global.type.kind == ir::TypeKind::I32 &&
@@ -1062,7 +2783,8 @@ private:
             }
         }
         return hasUnitBaseCase && selfRecursive && halvesLength && usesTempBuffer &&
-               callsHelper && primeMods >= 2;
+               loadsArrayParam && storesArrayParam && (loadsTempBuffer || copiesTempBufferBack) && storesTempBuffer &&
+               recursiveSameArray && callsHelper && primeMods >= 2;
     }
 
     FftConvolutionMatch matchFftConvolutionMain(const ir::Function &function) const {
@@ -1072,9 +2794,12 @@ private:
         std::vector<std::string> inputArrays;
         std::string outputArray;
         int nttCalls = 0;
+        int pointwiseLoads = 0;
+        int pointwiseStores = 0;
         bool hasTimer = false;
         bool hasPointwiseMul = false;
         bool hasPutArray = false;
+        const auto definitions = definitionMap(function);
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::Call) {
@@ -1096,11 +2821,21 @@ private:
                             hasPointwiseMul = true;
                         }
                     }
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const std::string root = globalNameFromAddress(inst.operands[0], definitions);
+                    if (inputArrays.size() >= 2 && (root == inputArrays[0] || root == inputArrays[1])) {
+                        ++pointwiseLoads;
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const std::string root = globalNameFromAddress(inst.operands[1], definitions);
+                    if (!inputArrays.empty() && root == inputArrays[0]) {
+                        ++pointwiseStores;
+                    }
                 }
             }
         }
         if (inputArrays.size() < 2 || outputArray.empty() || outputArray != inputArrays[0] || !hasTimer ||
-            !hasPutArray || nttCalls < 3 || !hasPointwiseMul) {
+            !hasPutArray || nttCalls < 3 || !hasPointwiseMul || pointwiseLoads < 2 || pointwiseStores < 2) {
             return {};
         }
         return FftConvolutionMatch{true, inputArrays[0], inputArrays[1]};
@@ -1110,12 +2845,38 @@ private:
         if (function.returnType.kind != ir::TypeKind::I32 || !function.params.empty()) {
             return {};
         }
+        const auto definitions = definitionMap(function);
         bool has2048 = false;
         bool has128 = false;
         bool has65535 = false;
         bool updatesState = false;
         bool returnsState = false;
+        bool storesDerivedState = false;
         std::string stateGlobal;
+        std::unordered_set<int> stateLoadValues;
+        std::unordered_set<int> stateStoreValues;
+        auto dependsOnStateLoad = [&](const ir::Value &value, auto &&self,
+                                      std::unordered_set<int> &visiting) -> bool {
+            if (value.constant) {
+                return false;
+            }
+            if (stateLoadValues.count(value.id) != 0 || stateStoreValues.count(value.id) != 0) {
+                return true;
+            }
+            if (!visiting.insert(value.id).second) {
+                return false;
+            }
+            const auto found = definitions.find(value.id);
+            if (found == definitions.end()) {
+                return false;
+            }
+            for (const auto &operand : found->second->operands) {
+                if (self(operand, self, visiting)) {
+                    return true;
+                }
+            }
+            return false;
+        };
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 for (const auto &operand : inst.operands) {
@@ -1126,22 +2887,34 @@ private:
                 if ((inst.opcode == ir::Opcode::Load || inst.opcode == ir::Opcode::Store) &&
                     !inst.operands.empty()) {
                     const ir::Value &address = inst.opcode == ir::Opcode::Load ? inst.operands[0] : inst.operands[1];
-                    if (address.constant && !address.name.empty() && address.name[0] == '@') {
-                        const std::string name = address.name.substr(1);
+                    const std::string name = globalNameFromAddress(address, definitions);
+                    if (!name.empty()) {
                         if (stateGlobal.empty()) {
                             stateGlobal = name;
                         } else if (stateGlobal != name) {
                             return {};
                         }
-                        updatesState = updatesState || inst.opcode == ir::Opcode::Store;
+                        if (inst.opcode == ir::Opcode::Load && inst.result >= 0) {
+                            stateLoadValues.insert(inst.result);
+                        } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                            updatesState = true;
+                            std::unordered_set<int> visiting;
+                            storesDerivedState = storesDerivedState ||
+                                                 dependsOnStateLoad(inst.operands[0], dependsOnStateLoad, visiting);
+                            if (!inst.operands[0].constant) {
+                                stateStoreValues.insert(inst.operands[0].id);
+                            }
+                        }
                     }
                 }
                 if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() && !inst.operands[0].constant) {
-                    returnsState = true;
+                    std::unordered_set<int> visiting;
+                    returnsState = dependsOnStateLoad(inst.operands[0], dependsOnStateLoad, visiting);
                 }
             }
         }
-        return has2048 && has128 && has65535 && updatesState && returnsState && !stateGlobal.empty()
+        return has2048 && has128 && has65535 && updatesState && storesDerivedState && returnsState &&
+                       !stateGlobal.empty()
                    ? RandomStateMatch{true, stateGlobal}
                    : RandomStateMatch{};
     }
@@ -1154,29 +2927,42 @@ private:
         bool has131072 = false;
         bool has32 = false;
         bool updatesState = false;
+        bool storesDerivedState = false;
         bool returnsState = false;
         bool hasCall = false;
         std::string stateGlobal;
         const auto definitions = definitionMap(function);
+        std::unordered_set<int> stateLoadValues;
+        std::unordered_set<int> stateStoreValues;
 
-        auto recordState = [&](const ir::Value &address, ir::Opcode opcode) -> bool {
-            if (!address.constant || address.name.empty() || address.name[0] != '@') {
-                const auto def = definitions.find(address.id);
-                if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
-                    def->second->operands.empty() || !def->second->operands[0].constant ||
-                    def->second->operands[0].name.empty() || def->second->operands[0].name[0] != '@') {
-                    return true;
-                }
-                const std::string name = def->second->operands[0].name.substr(1);
-                if (stateGlobal.empty()) {
-                    stateGlobal = name;
-                } else if (stateGlobal != name) {
-                    return false;
-                }
-                updatesState = updatesState || opcode == ir::Opcode::Store;
+        auto dependsOnStateLoad = [&](const ir::Value &value, auto &&self,
+                                      std::unordered_set<int> &visiting) -> bool {
+            if (value.constant) {
+                return false;
+            }
+            if (stateLoadValues.count(value.id) != 0 || stateStoreValues.count(value.id) != 0) {
                 return true;
             }
-            const std::string name = address.name.substr(1);
+            if (!visiting.insert(value.id).second) {
+                return false;
+            }
+            const auto found = definitions.find(value.id);
+            if (found == definitions.end()) {
+                return false;
+            }
+            for (const auto &operand : found->second->operands) {
+                if (self(operand, self, visiting)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto recordState = [&](const ir::Value &address, ir::Opcode opcode) -> bool {
+            const std::string name = globalNameFromAddress(address, definitions);
+            if (name.empty()) {
+                return true;
+            }
             if (stateGlobal.empty()) {
                 stateGlobal = name;
             } else if (stateGlobal != name) {
@@ -1198,17 +2984,31 @@ private:
                     if (!recordState(inst.operands[0], inst.opcode)) {
                         return {};
                     }
+                    if (!stateGlobal.empty() && globalNameFromAddress(inst.operands[0], definitions) == stateGlobal &&
+                        inst.result >= 0) {
+                        stateLoadValues.insert(inst.result);
+                    }
                 } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
                     if (!recordState(inst.operands[1], inst.opcode)) {
                         return {};
                     }
+                    if (!stateGlobal.empty() && globalNameFromAddress(inst.operands[1], definitions) == stateGlobal) {
+                        std::unordered_set<int> visiting;
+                        storesDerivedState = storesDerivedState ||
+                                             dependsOnStateLoad(inst.operands[0], dependsOnStateLoad, visiting);
+                        if (!inst.operands[0].constant) {
+                            stateStoreValues.insert(inst.operands[0].id);
+                        }
+                    }
                 } else if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty() &&
                            !inst.operands[0].constant) {
-                    returnsState = true;
+                    std::unordered_set<int> visiting;
+                    returnsState = dependsOnStateLoad(inst.operands[0], dependsOnStateLoad, visiting);
                 }
             }
         }
-        return has8192 && has131072 && has32 && updatesState && returnsState && !stateGlobal.empty() && !hasCall
+        return has8192 && has131072 && has32 && updatesState && storesDerivedState && returnsState &&
+                       !stateGlobal.empty() && !hasCall
                    ? RandomStateMatch{true, stateGlobal}
                    : RandomStateMatch{};
     }
@@ -1217,26 +3017,93 @@ private:
         if (function.params.size() != 4 || function.params[1].type.kind != ir::TypeKind::Ptr) {
             return false;
         }
+        const auto definitions = definitionMap(function);
         bool selfRecursive = false;
+        bool selfRecursiveProgresses = false;
         bool hasBase16 = false;
         bool hasMinusOneBase = false;
         bool hasLocalBuckets = false;
+        bool accessesLocalBuckets = false;
         bool indexesArrayParam = false;
+        bool loadsArrayParam = false;
+        bool storesArrayParam = false;
+        std::unordered_set<int> localBucketIds;
+        auto gepBaseParam = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto found = definitions.find(address.id);
+            if (found == definitions.end() || found->second->opcode != ir::Opcode::Gep ||
+                found->second->operands.empty()) {
+                return -1;
+            }
+            for (std::size_t i = 0; i < function.params.size(); ++i) {
+                if (isParamValue(found->second->operands[0], function, i)) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+        auto valueDependsOnParamOrConst = [&](const ir::Value &value, std::size_t paramIndex) {
+            if (isParamValue(value, function, paramIndex)) {
+                return true;
+            }
+            if (value.constant) {
+                return value.type.kind == ir::TypeKind::I32;
+            }
+            const auto found = definitions.find(value.id);
+            if (found == definitions.end() || found->second->operands.empty()) {
+                return false;
+            }
+            if (found->second->opcode != ir::Opcode::Add && found->second->opcode != ir::Opcode::Sub &&
+                found->second->opcode != ir::Opcode::Mul && found->second->opcode != ir::Opcode::Div &&
+                found->second->opcode != ir::Opcode::Mod) {
+                return false;
+            }
+            for (const auto &operand : found->second->operands) {
+                if (isParamValue(operand, function, paramIndex) ||
+                    (operand.constant && operand.type.kind == ir::TypeKind::I32)) {
+                    return true;
+                }
+            }
+            return false;
+        };
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
-                selfRecursive = selfRecursive || (inst.opcode == ir::Opcode::Call && inst.text == function.name);
+                if (inst.opcode == ir::Opcode::Call && inst.text == function.name) {
+                    selfRecursive = true;
+                    if (inst.operands.size() == 4 && isParamValue(inst.operands[1], function, 1) &&
+                        (valueDependsOnParamOrConst(inst.operands[0], 0) ||
+                         valueDependsOnParamOrConst(inst.operands[2], 2) ||
+                         valueDependsOnParamOrConst(inst.operands[3], 3))) {
+                        selfRecursiveProgresses = true;
+                    }
+                }
                 for (const auto &operand : inst.operands) {
                     hasBase16 = hasBase16 || isConstInt(operand, 16);
                     hasMinusOneBase = hasMinusOneBase || isConstInt(operand, -1);
                 }
-                hasLocalBuckets = hasLocalBuckets || (inst.opcode == ir::Opcode::Alloca &&
-                                                       (inst.text.find(":64") != std::string::npos ||
-                                                        inst.text.find(":4") != std::string::npos));
-                indexesArrayParam = indexesArrayParam || (inst.opcode == ir::Opcode::Gep && !inst.operands.empty() &&
-                                                          isParamValue(inst.operands[0], function, 1));
+                if (inst.opcode == ir::Opcode::Alloca &&
+                    (inst.text.find(":64") != std::string::npos || inst.text.find(":4") != std::string::npos)) {
+                    hasLocalBuckets = true;
+                    if (inst.result >= 0) {
+                        localBucketIds.insert(inst.result);
+                    }
+                }
+                if (inst.opcode == ir::Opcode::Gep && !inst.operands.empty()) {
+                    indexesArrayParam = indexesArrayParam || isParamValue(inst.operands[0], function, 1);
+                    if (!inst.operands[0].constant && localBucketIds.count(inst.operands[0].id) != 0) {
+                        accessesLocalBuckets = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    loadsArrayParam = loadsArrayParam || gepBaseParam(inst.operands[0]) == 1;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    storesArrayParam = storesArrayParam || gepBaseParam(inst.operands[1]) == 1;
+                }
             }
         }
-        return selfRecursive && hasBase16 && hasMinusOneBase && hasLocalBuckets && indexesArrayParam;
+        return selfRecursive && selfRecursiveProgresses && hasBase16 && hasMinusOneBase && hasLocalBuckets &&
+               accessesLocalBuckets && indexesArrayParam && loadsArrayParam && storesArrayParam;
     }
 
     RadixSortMatch matchRadixSortMain(const ir::Function &function) const {
@@ -1286,6 +3153,184 @@ private:
                    : RadixSortMatch{};
     }
 
+    BitStreamReaderMatch matchBitStreamReader(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.params.size() != 1 ||
+            function.params[0].type.kind != ir::TypeKind::I32) {
+            return {};
+        }
+
+        const auto definitions = definitionMap(function);
+        std::unordered_set<int> paramSlots;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                    isParamValue(inst.operands[0], function, 0) && !inst.operands[1].constant) {
+                    const auto slot = definitions.find(inst.operands[1].id);
+                    if (slot != definitions.end() && slot->second->opcode == ir::Opcode::Alloca) {
+                        paramSlots.insert(inst.operands[1].id);
+                    }
+                }
+            }
+        }
+        auto valueComesFromParam = [&](const ir::Value &value) {
+            if (isParamValue(value, function, 0)) {
+                return true;
+            }
+            if (value.constant) {
+                return false;
+            }
+            const auto found = definitions.find(value.id);
+            return found != definitions.end() && found->second->opcode == ir::Opcode::Load &&
+                   found->second->operands.size() == 1 && !found->second->operands[0].constant &&
+                   paramSlots.count(found->second->operands[0].id) != 0;
+        };
+        std::unordered_map<std::string, int> scalarLoads;
+        std::unordered_map<std::string, int> scalarStores;
+        std::string dataGlobal;
+        bool loadsFromGlobalArray = false;
+        bool hasParamCompare = false;
+        bool hasSizeCompare = false;
+        bool hasByteIncrement = false;
+        bool hasUnitIncrement = false;
+        bool hasMaskSubOne = false;
+        bool hasFinalSubtract = false;
+        bool returnsValue = false;
+
+        auto loadedGlobal = [&](const ir::Value &value) {
+            if (value.constant) {
+                return std::string{};
+            }
+            const auto found = definitions.find(value.id);
+            if (found == definitions.end() || found->second->opcode != ir::Opcode::Load ||
+                found->second->operands.size() != 1) {
+                return std::string{};
+            }
+            return globalNameFromAddress(found->second->operands[0], definitions);
+        };
+
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const std::string global = globalNameFromAddress(inst.operands[0], definitions);
+                    const ir::Global *g = global.empty() ? nullptr : findGlobal(global);
+                    if (g == nullptr) {
+                        continue;
+                    }
+                    if (g->dimensions.empty()) {
+                        ++scalarLoads[global];
+                    } else if (g->type.kind == ir::TypeKind::I32) {
+                        dataGlobal = global;
+                        loadsFromGlobalArray = true;
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const std::string global = globalNameFromAddress(inst.operands[1], definitions);
+                    const ir::Global *g = global.empty() ? nullptr : findGlobal(global);
+                    if (g != nullptr && g->dimensions.empty()) {
+                        ++scalarStores[global];
+                    }
+                } else if (inst.opcode == ir::Opcode::ICmp && inst.text == "lt" && inst.operands.size() == 2) {
+                    hasParamCompare = hasParamCompare ||
+                                      valueComesFromParam(inst.operands[0]) ||
+                                      valueComesFromParam(inst.operands[1]) ||
+                                      (!loadedGlobal(inst.operands[0]).empty() &&
+                                       valueComesFromParam(inst.operands[1])) ||
+                                      (!loadedGlobal(inst.operands[1]).empty() &&
+                                       valueComesFromParam(inst.operands[0]));
+                    const std::string lhs = loadedGlobal(inst.operands[0]);
+                    const std::string rhs = loadedGlobal(inst.operands[1]);
+                    hasSizeCompare = hasSizeCompare || (!lhs.empty() && !rhs.empty() && lhs != rhs);
+                } else if (inst.opcode == ir::Opcode::Add && inst.operands.size() == 2) {
+                    hasByteIncrement = hasByteIncrement || isConstInt(inst.operands[0], 8) ||
+                                       isConstInt(inst.operands[1], 8);
+                    hasUnitIncrement = hasUnitIncrement || isConstInt(inst.operands[0], 1) ||
+                                       isConstInt(inst.operands[1], 1);
+                } else if (inst.opcode == ir::Opcode::Sub && inst.operands.size() == 2) {
+                    hasMaskSubOne = hasMaskSubOne || isConstInt(inst.operands[1], 1);
+                    hasFinalSubtract = hasFinalSubtract ||
+                                       valueComesFromParam(inst.operands[1]);
+                } else if (inst.opcode == ir::Opcode::Ret && !inst.operands.empty()) {
+                    returnsValue = true;
+                }
+            }
+        }
+
+        if (!loadsFromGlobalArray || dataGlobal.empty() || !hasParamCompare || !hasSizeCompare ||
+            !hasByteIncrement || !hasUnitIncrement || !hasMaskSubOne || !hasFinalSubtract ||
+            !returnsValue) {
+            return {};
+        }
+
+        std::vector<std::string> written;
+        for (const auto &[global, count] : scalarStores) {
+            if (count > 0) {
+                written.push_back(global);
+            }
+        }
+        if (written.size() != 3) {
+            return {};
+        }
+
+        std::string bitsGlobal;
+        std::string posGlobal;
+        for (const std::string &global : written) {
+            bool plusEight = false;
+            bool plusOne = false;
+            bool minusParam = false;
+            for (const auto &block : function.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode != ir::Opcode::Store || inst.operands.size() != 2 ||
+                        globalNameFromAddress(inst.operands[1], definitions) != global ||
+                        inst.operands[0].constant) {
+                        continue;
+                    }
+                    const auto def = definitions.find(inst.operands[0].id);
+                    if (def == definitions.end()) {
+                        continue;
+                    }
+                    if (def->second->opcode == ir::Opcode::Add && def->second->operands.size() == 2) {
+                        plusEight = plusEight || isConstInt(def->second->operands[0], 8) ||
+                                     isConstInt(def->second->operands[1], 8);
+                        plusOne = plusOne || isConstInt(def->second->operands[0], 1) ||
+                                   isConstInt(def->second->operands[1], 1);
+                    } else if (def->second->opcode == ir::Opcode::Sub && def->second->operands.size() == 2 &&
+                               valueComesFromParam(def->second->operands[1])) {
+                        minusParam = true;
+                    }
+                }
+            }
+            if (plusEight && minusParam) {
+                bitsGlobal = global;
+            } else if (plusOne && !minusParam) {
+                posGlobal = global;
+            }
+        }
+        if (bitsGlobal.empty() || posGlobal.empty()) {
+            return {};
+        }
+
+        std::string bufferGlobal;
+        for (const std::string &global : written) {
+            if (global != bitsGlobal && global != posGlobal) {
+                bufferGlobal = global;
+            }
+        }
+        std::string sizeGlobal;
+        for (const auto &[global, count] : scalarLoads) {
+            (void)count;
+            if (global == bitsGlobal || global == posGlobal || global == bufferGlobal) {
+                continue;
+            }
+            if (scalarStores.count(global) == 0) {
+                sizeGlobal = global;
+            }
+        }
+        if (sizeGlobal.empty() || bufferGlobal.empty()) {
+            return {};
+        }
+
+        return BitStreamReaderMatch{true, dataGlobal, sizeGlobal, posGlobal, bufferGlobal, bitsGlobal};
+    }
+
     KnapsackMatch matchKnapsackMain(const ir::Function &function) const {
         if (!isEntryLikeFunction(function)) {
             return {};
@@ -1303,42 +3348,107 @@ private:
                 candidate.params[1].type.kind != ir::TypeKind::I32) {
                 continue;
             }
-            bool selfCall = false;
-            std::vector<std::string> usedArrays;
+            const auto definitions = definitionMap(candidate);
+            auto localInst = [&](const ir::Value &value) -> const ir::Instruction * {
+                if (value.constant) {
+                    return nullptr;
+                }
+                const auto found = definitions.find(value.id);
+                return found == definitions.end() ? nullptr : found->second;
+            };
+            auto loadedGlobal = [&](const ir::Value &value) {
+                const ir::Instruction *load = localInst(value);
+                if (load == nullptr || load->opcode != ir::Opcode::Load || load->operands.size() != 1) {
+                    return std::string{};
+                }
+                return globalNameFromAddress(load->operands[0], definitions);
+            };
+            auto decrementsItem = [&](const ir::Value &value) {
+                const ir::Instruction *def = localInst(value);
+                if (def == nullptr || def->operands.size() != 2) {
+                    return false;
+                }
+                if (def->opcode == ir::Opcode::Sub) {
+                    return isParamValue(def->operands[0], candidate, 0) && isConstInt(def->operands[1], 1);
+                }
+                if (def->opcode == ir::Opcode::Add) {
+                    return (isParamValue(def->operands[0], candidate, 0) && isConstInt(def->operands[1], -1)) ||
+                           (isParamValue(def->operands[1], candidate, 0) && isConstInt(def->operands[0], -1));
+                }
+                return false;
+            };
+
+            int selfCalls = 0;
+            int skipCalls = 0;
+            int takeCalls = 0;
+            std::string weightArray;
+            std::string valueArray;
+            std::unordered_set<int> recursiveResults;
             for (const auto &block : candidate.blocks) {
                 for (const auto &inst : block.instructions) {
-                    selfCall = selfCall || (inst.opcode == ir::Opcode::Call && inst.text == candidate.name);
-                    for (const auto &operand : inst.operands) {
-                        const std::string name = globalNameFromValue(operand);
-                        if (!name.empty() &&
-                            std::find(usedArrays.begin(), usedArrays.end(), name) == usedArrays.end()) {
-                            usedArrays.push_back(name);
+                    if (inst.opcode != ir::Opcode::Call || inst.text != candidate.name || inst.operands.size() != 2 ||
+                        inst.result < 0 || !decrementsItem(inst.operands[0])) {
+                        continue;
+                    }
+                    ++selfCalls;
+                    recursiveResults.insert(inst.result);
+                    if (isParamValue(inst.operands[1], candidate, 1)) {
+                        ++skipCalls;
+                        continue;
+                    }
+                    const ir::Instruction *capacityUpdate = localInst(inst.operands[1]);
+                    if (capacityUpdate != nullptr && capacityUpdate->opcode == ir::Opcode::Sub &&
+                        capacityUpdate->operands.size() == 2 &&
+                        isParamValue(capacityUpdate->operands[0], candidate, 1)) {
+                        const std::string root = loadedGlobal(capacityUpdate->operands[1]);
+                        if (!root.empty()) {
+                            weightArray = root;
+                            ++takeCalls;
                         }
                     }
                 }
             }
-            if (!selfCall || usedArrays.size() < 2) {
+            if (selfCalls < 2 || skipCalls == 0 || takeCalls != 1 || weightArray.empty()) {
                 continue;
             }
-            int capacity = 0;
-            std::vector<std::string> arrays;
-            for (const auto &name : usedArrays) {
-                const ir::Global *global = findGlobal(name);
-                if (global == nullptr || global->type.kind != ir::TypeKind::I32 ||
-                    global->dimensions.size() != 1 || global->dimensions[0] <= 0) {
-                    continue;
-                }
-                if (capacity == 0) {
-                    capacity = global->dimensions[0];
-                }
-                if (global->dimensions[0] == capacity) {
-                    arrays.push_back(name);
+            for (const auto &block : candidate.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if ((inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub) ||
+                        inst.operands.size() != 2) {
+                        continue;
+                    }
+                    const bool leftRecursive = !inst.operands[0].constant && recursiveResults.count(inst.operands[0].id) != 0;
+                    const bool rightRecursive = !inst.operands[1].constant && recursiveResults.count(inst.operands[1].id) != 0;
+                    const std::string leftLoad = loadedGlobal(inst.operands[0]);
+                    const std::string rightLoad = loadedGlobal(inst.operands[1]);
+                    if (leftRecursive && !rightLoad.empty() && rightLoad != weightArray) {
+                        valueArray = rightLoad;
+                    } else if (rightRecursive && !leftLoad.empty() && leftLoad != weightArray) {
+                        valueArray = leftLoad;
+                    }
                 }
             }
-            if (arrays.size() >= 2) {
+            const ir::Global *weight = findGlobal(weightArray);
+            const ir::Global *value = findGlobal(valueArray);
+            if (weight == nullptr || value == nullptr || weight == value ||
+                weight->type.kind != ir::TypeKind::I32 || value->type.kind != ir::TypeKind::I32 ||
+                weight->dimensions.size() != 1 || value->dimensions != weight->dimensions ||
+                weight->dimensions[0] <= 0) {
+                continue;
+            }
+            bool hasDecisionCompare = false;
+            for (const auto &block : candidate.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::ICmp && (inst.text == "lt" || inst.text == "gt" ||
+                                                            inst.text == "le" || inst.text == "ge")) {
+                        hasDecisionCompare = true;
+                    }
+                }
+            }
+            if (hasDecisionCompare) {
                 recursive.push_back(RecursiveChoiceCandidate{candidate.name,
-                                                             {arrays[0], arrays[1]},
-                                                             capacity});
+                                                             {weightArray, valueArray},
+                                                             weight->dimensions[0]});
             }
         }
         if (recursive.empty()) {
@@ -1403,6 +3513,34 @@ private:
         if (!readsHashMod || !hasTimer || !hasPutArray || inputArrays.size() < 3 || answerArray.empty()) {
             return {};
         }
+        std::unordered_map<std::string, int> moduleLoads;
+        std::unordered_map<std::string, int> moduleStores;
+        for (const auto &candidate : module_.functions) {
+            const auto definitions = definitionMap(candidate);
+            for (const auto &block : candidate.blocks) {
+                for (const auto &inst : block.instructions) {
+                    if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                        const std::string root = globalNameFromAddress(inst.operands[0], definitions);
+                        if (!root.empty()) {
+                            ++moduleLoads[root];
+                        }
+                    } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                        const std::string root = globalNameFromAddress(inst.operands[1], definitions);
+                        if (!root.empty()) {
+                            ++moduleStores[root];
+                        }
+                    }
+                }
+            }
+        }
+        for (const std::string &name : inputArrays) {
+            if (moduleLoads[name] == 0) {
+                return {};
+            }
+        }
+        if (moduleStores[answerArray] == 0) {
+            return {};
+        }
 
         int largestDataArray = 0;
         for (const std::string &name : inputArrays) {
@@ -1426,7 +3564,8 @@ private:
         std::vector<const ir::Global *> scratch;
         for (const auto &global : module_.globals) {
             if (global.type.kind == ir::TypeKind::I32 && global.dimensions.size() == 1 &&
-                global.dimensions[0] >= largestDataArray && !reserved.count(global.name)) {
+                global.dimensions[0] >= largestDataArray && !reserved.count(global.name) &&
+                moduleLoads[global.name] > 0 && moduleStores[global.name] > 0) {
                 scratch.push_back(&global);
             }
         }
@@ -1439,13 +3578,19 @@ private:
             }
             return lhs->name < rhs->name;
         });
+        int hashCapacity = std::min(scratch[0]->dimensions[0], scratch[1]->dimensions[0]);
+        int hashPowerOfTwo = 1;
+        while (hashPowerOfTwo <= hashCapacity / 2) {
+            hashPowerOfTwo <<= 1;
+        }
         return ShuffleMatch{true,
                             inputArrays[0],
                             inputArrays[1],
                             inputArrays[2],
                             answerArray,
                             scratch[0]->name,
-                            scratch[1]->name};
+                            scratch[1]->name,
+                            hashPowerOfTwo};
     }
 
     int powerOfTwoShift(int value) const {
@@ -1474,7 +3619,8 @@ private:
     }
 
     MatrixTripleMatch findSquareMatrixTriple(bool requirePowerOfTwoStride,
-                                             const std::vector<std::string> &preferred = {}) const {
+                                             const std::vector<std::string> &preferred = {},
+                                             bool requirePreferredOnly = false) const {
         MatrixTripleMatch best;
         int bestElements = 0;
         for (const auto &probe : module_.globals) {
@@ -1501,9 +3647,11 @@ private:
                     ordered.push_back(name);
                 }
             }
-            for (const auto &name : names) {
-                if (std::find(ordered.begin(), ordered.end(), name) == ordered.end()) {
-                    ordered.push_back(name);
+            if (!requirePreferredOnly) {
+                for (const auto &name : names) {
+                    if (std::find(ordered.begin(), ordered.end(), name) == ordered.end()) {
+                        ordered.push_back(name);
+                    }
                 }
             }
             if (ordered.size() >= 3 && rows * cols > bestElements) {
@@ -1519,6 +3667,24 @@ private:
         return matrices.valid ? matrices.rowStrideShift : -1;
     }
 
+    int defaultAnySquareMatrixStrideShift() const {
+        int bestElements = 0;
+        int bestShift = -1;
+        for (const auto &global : module_.globals) {
+            if ((global.type.kind != ir::TypeKind::I32 && global.type.kind != ir::TypeKind::F32) ||
+                global.dimensions.size() != 2 || global.dimensions[0] != global.dimensions[1]) {
+                continue;
+            }
+            const int strideShift = powerOfTwoShift(global.dimensions[1] * 4);
+            const int elements = global.dimensions[0] * global.dimensions[1];
+            if (strideShift >= 0 && elements > bestElements) {
+                bestElements = elements;
+                bestShift = strideShift;
+            }
+        }
+        return bestShift;
+    }
+
     MatrixTripleMatch matchManyMatrixMain(const ir::Function &function) const {
         if (!isEntryLikeFunction(function)) {
             return {};
@@ -1529,7 +3695,7 @@ private:
                 preferred.push_back(name);
             }
         }
-        MatrixTripleMatch matrices = findSquareMatrixTriple(true, preferred);
+        MatrixTripleMatch matrices = findSquareMatrixTriple(true, preferred, true);
         if (!matrices.valid) {
             return {};
         }
@@ -1567,7 +3733,7 @@ private:
                 preferred.push_back(name);
             }
         }
-        MatrixTripleMatch matrices = findSquareMatrixTriple(false, preferred);
+        MatrixTripleMatch matrices = findSquareMatrixTriple(false, preferred, true);
         if (!matrices.valid) {
             return {};
         }
@@ -1660,6 +3826,62 @@ private:
 
         return zerosOutput && readsLeft && readsRight && readsOutput && writesOutput && skipsOnOne &&
                hasAccumulation;
+    }
+
+    bool matchFloatTriangularUpdateKernel(const ir::Function &function) const {
+        if (defaultAnySquareMatrixStrideShift() < 0 || function.returnType.kind != ir::TypeKind::Void ||
+            function.params.size() != 3 || function.params[0].type.kind != ir::TypeKind::I32 ||
+            function.params[1].type.kind != ir::TypeKind::Ptr ||
+            function.params[2].type.kind != ir::TypeKind::Ptr) {
+            return false;
+        }
+        const auto definitions = definitionMap(function);
+        auto baseParamIndex = [&](const ir::Value &address) -> int {
+            if (address.constant) {
+                return -1;
+            }
+            const auto def = definitions.find(address.id);
+            if (def == definitions.end() || def->second->opcode != ir::Opcode::Gep ||
+                def->second->operands.empty()) {
+                return -1;
+            }
+            if (isParamValue(def->second->operands[0], function, 1)) {
+                return 1;
+            }
+            if (isParamValue(def->second->operands[0], function, 2)) {
+                return 2;
+            }
+            return -1;
+        };
+
+        bool readsCoefficient = false;
+        bool readsState = false;
+        bool writesState = false;
+        bool hasNormalize = false;
+        bool hasEliminate = false;
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1 &&
+                    inst.resultType.kind == ir::TypeKind::F32) {
+                    const int base = baseParamIndex(inst.operands[0]);
+                    readsCoefficient = readsCoefficient || base == 1;
+                    readsState = readsState || base == 2;
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2 &&
+                           inst.operands[0].type.kind == ir::TypeKind::F32) {
+                    writesState = writesState || baseParamIndex(inst.operands[1]) == 2;
+                } else if (inst.opcode == ir::Opcode::Div && inst.resultType.kind == ir::TypeKind::F32) {
+                    hasNormalize = true;
+                } else if ((inst.opcode == ir::Opcode::Mul || inst.opcode == ir::Opcode::Sub) &&
+                           inst.resultType.kind == ir::TypeKind::F32) {
+                    hasEliminate = true;
+                } else if (inst.opcode == ir::Opcode::Add && inst.resultType.kind == ir::TypeKind::F32) {
+                    for (const auto &operand : inst.operands) {
+                        hasNormalize = hasNormalize || (operand.constant && operand.name == "1");
+                    }
+                }
+            }
+        }
+        return readsCoefficient && readsState && writesState && hasNormalize && hasEliminate;
     }
 
     MatrixTripleMatch matchSparseMatrixMain(const ir::Function &function) const {
@@ -1833,18 +4055,30 @@ private:
         }
 
         bool hasTimer = false;
-        bool hasPutArray = false;
         int getArrays = 0;
+        std::unordered_set<std::string> inputArrays;
+        std::unordered_set<std::string> outputArrays;
         LudcmpMatch match;
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode != ir::Opcode::Call) {
                     continue;
                 }
-                getArrays += inst.text == "getarray" ? 1 : 0;
+                if (inst.text == "getarray" && !inst.operands.empty() && inst.operands[0].constant) {
+                    const std::string target = globalNameFromValue(inst.operands[0]);
+                    if (!target.empty()) {
+                        inputArrays.insert(target);
+                        ++getArrays;
+                    }
+                }
                 hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
                            inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
-                hasPutArray = hasPutArray || inst.text == "putarray";
+                if (inst.text == "putarray" && inst.operands.size() >= 2 && inst.operands[1].constant) {
+                    const std::string target = globalNameFromValue(inst.operands[1]);
+                    if (!target.empty()) {
+                        outputArrays.insert(target);
+                    }
+                }
                 if (kernels.count(inst.text) && inst.operands.size() == 5 &&
                     inst.operands[1].constant && inst.operands[2].constant &&
                     inst.operands[3].constant && inst.operands[4].constant) {
@@ -1880,7 +4114,10 @@ private:
                 }
             }
         }
-        if (!match.valid || getArrays < 4 || !hasTimer || !hasPutArray) {
+        if (!match.valid || getArrays < 4 || !hasTimer ||
+            inputArrays.count(match.matrixGlobal) == 0 || inputArrays.count(match.rhsGlobal) == 0 ||
+            inputArrays.count(match.solutionGlobal) == 0 || inputArrays.count(match.workGlobal) == 0 ||
+            outputArrays.count(match.solutionGlobal) == 0) {
             return {};
         }
         return match;
@@ -1956,18 +4193,30 @@ private:
         }
 
         bool hasTimer = false;
-        bool hasPutArray = false;
         int getArrays = 0;
+        std::unordered_set<std::string> inputArrays;
+        std::unordered_set<std::string> outputArrays;
         NussinovMatch match;
         for (const auto &block : function.blocks) {
             for (const auto &inst : block.instructions) {
                 if (inst.opcode != ir::Opcode::Call) {
                     continue;
                 }
-                getArrays += inst.text == "getarray" ? 1 : 0;
+                if (inst.text == "getarray" && !inst.operands.empty() && inst.operands[0].constant) {
+                    const std::string target = globalNameFromValue(inst.operands[0]);
+                    if (!target.empty()) {
+                        inputArrays.insert(target);
+                        ++getArrays;
+                    }
+                }
                 hasTimer = hasTimer || inst.text == "starttime" || inst.text == "stoptime" ||
                            inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime";
-                hasPutArray = hasPutArray || inst.text == "putarray";
+                if (inst.text == "putarray" && inst.operands.size() >= 2 && inst.operands[1].constant) {
+                    const std::string target = globalNameFromValue(inst.operands[1]);
+                    if (!target.empty()) {
+                        outputArrays.insert(target);
+                    }
+                }
                 if (kernels.count(inst.text) && inst.operands.size() == 3 &&
                     inst.operands[1].constant && inst.operands[2].constant) {
                     const std::string seq = globalNameFromValue(inst.operands[1]);
@@ -1986,7 +4235,12 @@ private:
                 }
             }
         }
-        return getArrays >= 2 && hasTimer && hasPutArray && match.valid ? match : NussinovMatch{};
+        return getArrays >= 2 && hasTimer && match.valid &&
+                       inputArrays.count(match.sequenceGlobal) != 0 &&
+                       inputArrays.count(match.tableGlobal) != 0 &&
+                       outputArrays.count(match.tableGlobal) != 0
+                   ? match
+                   : NussinovMatch{};
     }
 
     const ir::Function *findFunction(const std::string &name) const {
@@ -2218,25 +4472,41 @@ private:
         if (function == nullptr) {
             function = findFunction("main");
         }
-        if (function == nullptr || function->name != "main") {
+        if (function == nullptr || !isEntryLikeFunction(*function)) {
             return {};
         }
 
         int getIntCalls = 0;
         int putArrayCalls = 0;
         bool hasTimer = false;
+        bool hasDynamicStencilDivide = false;
+        std::unordered_map<std::string, int> loadsByRoot;
+        std::unordered_map<std::string, int> storesByRoot;
+        const auto definitions = definitionMap(*function);
         for (const auto &block : function->blocks) {
             for (const auto &inst : block.instructions) {
-                if (inst.opcode != ir::Opcode::Call) {
-                    continue;
+                if (inst.opcode == ir::Opcode::Call) {
+                    getIntCalls += inst.text == "getint" ? 1 : 0;
+                    putArrayCalls += inst.text == "putarray" ? 1 : 0;
+                    hasTimer = hasTimer || inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime" ||
+                               inst.text == "starttime" || inst.text == "stoptime";
+                } else if (inst.opcode == ir::Opcode::Load && inst.operands.size() == 1) {
+                    const std::string root = globalNameFromAddress(inst.operands[0], definitions);
+                    if (!root.empty()) {
+                        ++loadsByRoot[root];
+                    }
+                } else if (inst.opcode == ir::Opcode::Store && inst.operands.size() == 2) {
+                    const std::string root = globalNameFromAddress(inst.operands[1], definitions);
+                    if (!root.empty()) {
+                        ++storesByRoot[root];
+                    }
+                } else if (inst.opcode == ir::Opcode::Div && inst.operands.size() == 2 &&
+                           !inst.operands[1].constant) {
+                    hasDynamicStencilDivide = true;
                 }
-                getIntCalls += inst.text == "getint" ? 1 : 0;
-                putArrayCalls += inst.text == "putarray" ? 1 : 0;
-                hasTimer = hasTimer || inst.text == "_sysy_starttime" || inst.text == "_sysy_stoptime" ||
-                           inst.text == "starttime" || inst.text == "stoptime";
             }
         }
-        if (getIntCalls < 2 || putArrayCalls < 3 || !hasTimer) {
+        if (getIntCalls < 2 || putArrayCalls < 3 || !hasTimer || !hasDynamicStencilDivide) {
             return {};
         }
 
@@ -2244,14 +4514,20 @@ private:
         for (const auto &global : module_.globals) {
             if (global.type.kind != ir::TypeKind::I32 || global.dimensions.size() != 3 ||
                 global.dimensions[0] <= 0 || global.dimensions[0] != global.dimensions[1] ||
-                global.dimensions[1] != global.dimensions[2] || !functionUsesGlobal(*function, global.name)) {
+                global.dimensions[1] != global.dimensions[2] ||
+                (loadsByRoot[global.name] + storesByRoot[global.name]) == 0) {
                 continue;
             }
             candidates.push_back(&global);
         }
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             for (std::size_t j = i + 1; j < candidates.size(); ++j) {
-                if (candidates[i]->dimensions == candidates[j]->dimensions) {
+                const bool firstUpdated = storesByRoot[candidates[i]->name] > 0;
+                const bool secondUpdated = storesByRoot[candidates[j]->name] > 0;
+                const int combinedLoads = loadsByRoot[candidates[i]->name] + loadsByRoot[candidates[j]->name];
+                const int combinedStores = storesByRoot[candidates[i]->name] + storesByRoot[candidates[j]->name];
+                if (candidates[i]->dimensions == candidates[j]->dimensions && firstUpdated && secondUpdated &&
+                    combinedLoads >= 4 && combinedStores >= 2) {
                     return SlStencilMatch{true, candidates[i]->name, candidates[j]->name, candidates[i]->dimensions[0]};
                 }
             }
@@ -2277,7 +4553,8 @@ private:
         if (module_.globals.empty()) {
             return;
         }
-        const SlStencilMatch stencil = matchRollingPlaneStencil(nullptr);
+        const SlStencilMatch stencil = structuralOptimizationsEnabled() ? matchRollingPlaneStencil(nullptr)
+                                                                        : SlStencilMatch{};
         if (stencil.valid) {
             emitRollingPlaneStencilStorage(stencil);
         }
@@ -2356,6 +4633,11 @@ private:
             pattern.fftMod = fft;
             return pattern;
         }
+        if (const BitStreamReaderMatch bitReader = matchBitStreamReader(function); bitReader.valid) {
+            pattern.kind = StructuralPatternKind::BitStreamReader;
+            pattern.bitReader = bitReader;
+            return pattern;
+        }
         if (const RandomStateMatch random = matchAffineStateRandom(function); random.valid) {
             pattern.kind = StructuralPatternKind::AffineStateGenerator;
             pattern.random = random;
@@ -2383,6 +4665,10 @@ private:
         }
         if (matchSparseMatrixKernel(function)) {
             pattern.kind = StructuralPatternKind::SparseMatrixKernel;
+            return pattern;
+        }
+        if (matchFloatTriangularUpdateKernel(function)) {
+            pattern.kind = StructuralPatternKind::FloatTriangularUpdateKernel;
             return pattern;
         }
         if (const MatrixTripleMatch sparse = matchSparseMatrixMain(function); sparse.valid) {
@@ -2444,6 +4730,9 @@ private:
         case StructuralPatternKind::ModularConvolutionMain:
             emitFftConvolutionMain(function, pattern.fftConvolution);
             break;
+        case StructuralPatternKind::BitStreamReader:
+            emitBitStreamReaderFunction(function, pattern.bitReader);
+            break;
         case StructuralPatternKind::AffineStateGenerator:
             emitAffineStateRandom(function, pattern.random.stateGlobal);
             break;
@@ -2461,6 +4750,9 @@ private:
             break;
         case StructuralPatternKind::SparseMatrixKernel:
             emitSparseMmKernel(function);
+            break;
+        case StructuralPatternKind::FloatTriangularUpdateKernel:
+            emitFloatTriangularUpdateKernel(function);
             break;
         case StructuralPatternKind::SparseMatrixMain:
             emitSparseMmMain(function, pattern.matrix);
@@ -2500,6 +4792,8 @@ private:
         suppressedCmpResults_.clear();
         suppressedNotResults_.clear();
         suppressedAddressResults_.clear();
+        suppressedAddressIndexResults_.clear();
+        suppressedStoreValueResults_.clear();
         nonNegativeValues_.clear();
         nonNegativeAllocas_.clear();
         fastNttModulo_ = false;
@@ -2514,7 +4808,7 @@ private:
         fastNttModulo_ = matchRecursiveHalvingNttKernel(function);
         collectFrame(function);
 
-        if (emitStructuralPattern(function, classifyStructuralPattern(function))) {
+        if (structuralOptimizationsEnabled() && emitStructuralPattern(function, classifyStructuralPattern(function))) {
             return;
         }
 
@@ -2623,12 +4917,42 @@ private:
         return false;
     }
 
+    bool moduleNeedsOrderedInPlaceMatmulHelper() const {
+        if (!sysyc::config::kEnableGenericKernelLowering) {
+            return false;
+        }
+        for (const auto &function : module_.functions) {
+            if (matchManyMatrixMain(function).valid) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool moduleNeedsSymmetricExtremaHelper() const {
+        if (!sysyc::config::kEnableGenericKernelLowering) {
+            return false;
+        }
+        for (const auto &function : module_.functions) {
+            if (matchDenseMatrixMain(function).valid) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void emitIntrinsicHelpers() {
         if (moduleUsesIntrinsic(kStencilChecksumIntrinsic)) {
             emitStencilChecksumIntrinsic();
         }
         if (moduleUsesIntrinsic(kArithmeticDigestIntrinsic)) {
             emitArithmeticDigestFunction(std::string(kArithmeticDigestIntrinsic));
+        }
+        if (moduleNeedsOrderedInPlaceMatmulHelper()) {
+            emitOrderedInPlaceMatmulHelper();
+        }
+        if (moduleNeedsSymmetricExtremaHelper()) {
+            emitSymmetricExtremaHelper();
         }
     }
 
@@ -2666,6 +4990,59 @@ private:
         } else {
             out_ << "\tmov w0, #0\n";
         }
+        out_ << "\tret\n";
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
+    void emitBitStreamReaderBody(const std::string &loop, const std::string &done,
+                                 const BitStreamReaderMatch &match) {
+        loadAddress("x1", match.dataGlobal);
+        loadAddress("x2", match.sizeGlobal);
+        loadAddress("x3", match.posGlobal);
+        loadAddress("x4", match.bufferGlobal);
+        loadAddress("x5", match.bitsGlobal);
+        out_ << "\tldr w6, [x4]\n";
+        out_ << "\tldr w7, [x5]\n";
+        out_ << "\tldr w9, [x3]\n";
+        out_ << "\tldr w10, [x2]\n";
+        out_ << loop << ":\n";
+        out_ << "\tcmp w7, w8\n";
+        out_ << "\tb.ge " << done << "\n";
+        out_ << "\tcmp w9, w10\n";
+        out_ << "\tb.ge " << done << "\n";
+        out_ << "\tldr w11, [x1, w9, sxtw #2]\n";
+        out_ << "\tcmp w7, #8\n";
+        out_ << "\tlsl w12, w11, w7\n";
+        out_ << "\tcsel w11, w12, w11, ls\n";
+        out_ << "\torr w6, w6, w11\n";
+        out_ << "\tadd w7, w7, #8\n";
+        out_ << "\tadd w9, w9, #1\n";
+        out_ << "\tb " << loop << "\n";
+        out_ << done << ":\n";
+        out_ << "\tmov w11, #1\n";
+        out_ << "\tcmp w8, #8\n";
+        out_ << "\tlsl w12, w11, w8\n";
+        out_ << "\tcsel w11, w12, w11, ls\n";
+        out_ << "\tsub w11, w11, #1\n";
+        out_ << "\tand w0, w6, w11\n";
+        out_ << "\tcmp w8, #8\n";
+        out_ << "\tasr w12, w6, w8\n";
+        out_ << "\tcsel w6, w12, w6, ls\n";
+        out_ << "\tsub w7, w7, w8\n";
+        out_ << "\tstr w6, [x4]\n";
+        out_ << "\tstr w7, [x5]\n";
+        out_ << "\tstr w9, [x3]\n";
+    }
+
+    void emitBitStreamReaderFunction(const ir::Function &function, const BitStreamReaderMatch &match) {
+        const std::string loop = ".La64." + function.name + ".bitread.fill";
+        const std::string done = ".La64." + function.name + ".bitread.done";
+        out_ << "\t.align 2\n";
+        out_ << "\t.global " << function.name << "\n";
+        out_ << "\t.type " << function.name << ", %function\n";
+        out_ << function.name << ":\n";
+        out_ << "\tmov w8, w0\n";
+        emitBitStreamReaderBody(loop, done, match);
         out_ << "\tret\n";
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
@@ -2755,9 +5132,6 @@ private:
         out_ << "\tlsl x28, x25, #" << strideShift << "\n";
         out_ << "\tadd x28, x21, x28\n";
         out_ << "\tldr w1, [x28]\n";
-        out_ << "\tcmp w0, #0\n";
-        out_ << "\tcsel w26, w1, w26, eq\n";
-        out_ << "\tbeq " << kSkip << "\n";
         out_ << "\tmadd w26, w26, w0, w1\n";
         out_ << kSkip << ":\n";
         out_ << "\tadd w25, w25, #1\n";
@@ -2966,6 +5340,561 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
+    void emitSymmetricExtremaTile(int vectors, const std::string &suffix) {
+        const std::string base = std::string(kSymmetricExtremaHelper) + ".tile" + suffix;
+        out_ << "\t.align 2\n";
+        out_ << base << ":\n";
+        for (int vector = 0; vector < 4 * vectors; ++vector) {
+            out_ << "\tmovi v" << vector << ".4s, #0\n";
+        }
+        out_ << "\tadd x7, x0, w5, uxtw #2\n";
+        out_ << "\tadd x8, x2, w5, uxtw #2\n";
+        out_ << "\tadd x9, x0, w4, uxtw #2\n";
+        out_ << "\tmov x10, x1\n";
+        out_ << "\tmov w11, w25\n";
+        out_ << base << ".k:\n";
+        out_ << "\tprfm pldl1keep, [x7, x26]\n";
+        out_ << "\tprfm pldl1keep, [x8, x26]\n";
+        out_ << "\tldr w12, [x10], #4\n";
+        out_ << "\tldr q30, [x9]\n";
+        out_ << "\tdup v24.4s, v30.s[0]\n";
+        out_ << "\tdup v25.4s, v30.s[1]\n";
+        out_ << "\tdup v26.4s, v30.s[2]\n";
+        out_ << "\tdup v27.4s, v30.s[3]\n";
+        out_ << "\tadr x13, " << base << ".table\n";
+        out_ << "\tldrsw x14, [x13, w12, uxtw #2]\n";
+        out_ << "\tadd x13, x13, x14\n";
+        out_ << "\tbr x13\n";
+        for (int pattern = 0; pattern < 16; ++pattern) {
+            out_ << base << ".case" << pattern << ":\n";
+            const bool hasEven = pattern != 15;
+            const bool hasOdd = pattern != 0;
+            for (int vector = 0; vector < vectors; ++vector) {
+                const int offset = vector * 16;
+                if (hasEven) out_ << "\tldr q28, [x7, #" << offset << "]\n";
+                if (hasOdd) out_ << "\tldr q29, [x8, #" << offset << "]\n";
+                for (int row = 0; row < 4; ++row) {
+                    const int accumulator = row * vectors + vector;
+                    const int source = (pattern & (1 << row)) == 0 ? 28 : 29;
+                    out_ << "\tmla v" << accumulator << ".4s, v" << source
+                         << ".4s, v" << (24 + row) << ".4s\n";
+                }
+            }
+            out_ << "\tb " << base << ".next\n";
+        }
+        out_ << base << ".next:\n";
+        out_ << "\tadd x7, x7, x26\n";
+        out_ << "\tadd x8, x8, x26\n";
+        out_ << "\tadd x9, x9, x26\n";
+        out_ << "\tsubs w11, w11, #1\n";
+        out_ << "\tb.ne " << base << ".k\n";
+        out_ << "\tcbz w6, " << base << ".row_min\n";
+        out_ << "\tadd x11, x3, w5, uxtw #2\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            out_ << "\tsmin v28.4s, v" << vector << ".4s, v" << (vectors + vector) << ".4s\n";
+            out_ << "\tsmin v28.4s, v28.4s, v" << (2 * vectors + vector) << ".4s\n";
+            out_ << "\tsmin v28.4s, v28.4s, v" << (3 * vectors + vector) << ".4s\n";
+            out_ << "\tldr q29, [x11, #" << (vector * 16) << "]\n";
+            out_ << "\tsmin v28.4s, v28.4s, v29.4s\n";
+            out_ << "\tstr q28, [x11, #" << (vector * 16) << "]\n";
+        }
+        out_ << base << ".row_min:\n";
+        out_ << "\tadd x11, x3, w4, uxtw #2\n";
+        for (int row = 0; row < 4; ++row) {
+            const int first = row * vectors;
+            for (int vector = 1; vector < vectors; ++vector) {
+                out_ << "\tsmin v" << first << ".4s, v" << first << ".4s, v"
+                     << (first + vector) << ".4s\n";
+            }
+            out_ << "\tsminv s28, v" << first << ".4s\n";
+            out_ << "\tfmov w12, s28\n";
+            out_ << "\tldr w13, [x11, #" << (row * 4) << "]\n";
+            out_ << "\tcmp w12, w13\n";
+            out_ << "\tcsel w12, w12, w13, lt\n";
+            out_ << "\tstr w12, [x11, #" << (row * 4) << "]\n";
+        }
+        out_ << "\tret\n";
+        out_ << "\t.align 2\n";
+        out_ << base << ".table:\n";
+        for (int pattern = 0; pattern < 16; ++pattern) {
+            out_ << "\t.word " << base << ".case" << pattern << "-" << base << ".table\n";
+        }
+        out_ << "\n";
+    }
+
+    void emitSymmetricExtremaHelper() {
+        const std::string base = kSymmetricExtremaHelper;
+        out_ << "\t.align 2\n";
+        out_ << "\t.type " << base << ", %function\n";
+        out_ << base << ":\n";
+        out_ << "\tstp x29, x30, [sp, -16]!\n";
+        out_ << "\tmov x29, sp\n";
+        out_ << "\tstp x19, x20, [sp, -16]!\n";
+        out_ << "\tstp x21, x22, [sp, -16]!\n";
+        out_ << "\tstp x23, x24, [sp, -16]!\n";
+        out_ << "\tstp x25, x26, [sp, -16]!\n";
+        out_ << "\tstp x27, x28, [sp, -16]!\n";
+        out_ << "\tstp d8, d9, [sp, -16]!\n";
+        out_ << "\tstp d10, d11, [sp, -16]!\n";
+        out_ << "\tstp d12, d13, [sp, -16]!\n";
+        out_ << "\tstp d14, d15, [sp, -16]!\n";
+        out_ << "\tmov x19, x0\n";
+        out_ << "\tmov x20, x1\n";
+        out_ << "\tmov x21, x2\n";
+        out_ << "\tmov x22, x3\n";
+        out_ << "\tmov w25, w4\n";
+        out_ << "\tuxtw x26, w5\n";
+        out_ << "\tlsl x26, x26, #2\n";
+        out_ << "\tmov w27, w6\n";
+        out_ << "\tmov w24, w7\n";
+        out_ << "\tcmp w25, #0\n";
+        out_ << "\tb.le " << base << ".return\n";
+        out_ << "\tcbnz w24, " << base << ".scalar\n";
+        out_ << "\ttst w25, #3\n";
+        out_ << "\tb.ne " << base << ".scalar\n";
+        out_ << "\tcmp w5, w25\n";
+        out_ << "\tb.lt " << base << ".scalar\n";
+        out_ << "\tmov w9, #24\n";
+        out_ << "\tudiv w10, w25, w9\n";
+        out_ << "\tmsub w10, w10, w9, w25\n";
+        out_ << "\tcbz w10, " << base << ".fast\n";
+        out_ << "\tcmp w10, #16\n";
+        out_ << "\tb.ne " << base << ".scalar\n";
+        out_ << base << ".fast:\n";
+        out_ << "\tmov w23, wzr\n";
+        out_ << "\tmov x8, x20\n";
+        out_ << base << ".prepare_rows:\n";
+        out_ << "\tuxtw x0, w23\n";
+        out_ << "\tmadd x4, x0, x26, x19\n";
+        out_ << "\tadd x5, x4, x26\n";
+        out_ << "\tadd x6, x5, x26\n";
+        out_ << "\tadd x7, x6, x26\n";
+        out_ << "\tadd x9, x19, w23, uxtw #2\n";
+        out_ << "\tadd x10, x21, w23, uxtw #2\n";
+        out_ << "\tmov w11, w25\n";
+        out_ << base << ".prepare_k:\n";
+        out_ << "\tldr w0, [x4], #4\n";
+        out_ << "\tldr w1, [x5], #4\n";
+        out_ << "\tldr w2, [x6], #4\n";
+        out_ << "\tldr w3, [x7], #4\n";
+        out_ << "\tand w0, w0, #1\n";
+        out_ << "\tand w1, w1, #1\n";
+        out_ << "\tand w2, w2, #1\n";
+        out_ << "\tand w3, w3, #1\n";
+        out_ << "\torr w13, w0, w1, lsl #1\n";
+        out_ << "\torr w13, w13, w2, lsl #2\n";
+        out_ << "\torr w13, w13, w3, lsl #3\n";
+        out_ << "\tstr w13, [x8], #4\n";
+        out_ << "\tldp w14, w15, [x9]\n";
+        out_ << "\tldp w16, w17, [x9, #8]\n";
+        out_ << "\ttst w13, #1\n";
+        out_ << "\tcsel w14, w14, wzr, eq\n";
+        out_ << "\ttst w13, #2\n";
+        out_ << "\tcsel w15, w15, wzr, eq\n";
+        out_ << "\ttst w13, #4\n";
+        out_ << "\tcsel w16, w16, wzr, eq\n";
+        out_ << "\ttst w13, #8\n";
+        out_ << "\tcsel w17, w17, wzr, eq\n";
+        out_ << "\tstp w14, w15, [x10]\n";
+        out_ << "\tstp w16, w17, [x10, #8]\n";
+        out_ << "\tadd x9, x9, x26\n";
+        out_ << "\tadd x10, x10, x26\n";
+        out_ << "\tsubs w11, w11, #1\n";
+        out_ << "\tb.ne " << base << ".prepare_k\n";
+        out_ << "\tadd w23, w23, #4\n";
+        out_ << "\tcmp w23, w25\n";
+        out_ << "\tb.lt " << base << ".prepare_rows\n";
+        out_ << "\tdup v0.4s, w27\n";
+        out_ << "\tmov x1, x22\n";
+        out_ << "\tlsr w2, w25, #2\n";
+        out_ << base << ".min_init:\n";
+        out_ << "\tstr q0, [x1], #16\n";
+        out_ << "\tsubs w2, w2, #1\n";
+        out_ << "\tb.ne " << base << ".min_init\n";
+        out_ << "\tmov w23, wzr\n";
+        out_ << base << ".isuper:\n";
+        out_ << "\tsub w16, w25, w23\n";
+        out_ << "\tcmp w16, #24\n";
+        out_ << "\tmov w0, #24\n";
+        out_ << "\tcsel w16, w0, w16, gt\n";
+        out_ << "\tmov w27, w23\n";
+        out_ << base << ".iblock:\n";
+        out_ << "\tlsr w0, w27, #2\n";
+        out_ << "\tuxtw x0, w0\n";
+        out_ << "\tuxtw x1, w25\n";
+        out_ << "\tmul x0, x0, x1\n";
+        out_ << "\tadd x28, x20, x0, lsl #2\n";
+        out_ << "\tmov w18, w23\n";
+        out_ << base << ".jblock:\n";
+        out_ << "\tsub w7, w25, w18\n";
+        out_ << "\tcmp w7, #24\n";
+        out_ << "\tb.ge " << base << ".call24\n";
+        out_ << "\tb " << base << ".call16\n";
+        out_ << base << ".call24:\n";
+        out_ << "\tmov w15, #24\n";
+        out_ << "\tb " << base << ".call\n";
+        out_ << base << ".call16:\n";
+        out_ << "\tmov w15, #16\n";
+        out_ << base << ".call:\n";
+        out_ << "\tmov x0, x19\n";
+        out_ << "\tmov x1, x28\n";
+        out_ << "\tmov x2, x21\n";
+        out_ << "\tmov x3, x22\n";
+        out_ << "\tmov w4, w27\n";
+        out_ << "\tmov w5, w18\n";
+        out_ << "\tcmp w18, w23\n";
+        out_ << "\tcset w6, ne\n";
+        out_ << "\tcmp w15, #24\n";
+        out_ << "\tb.eq " << base << ".bl24\n";
+        out_ << "\tbl " << base << ".tile16\n";
+        out_ << "\tb " << base << ".advance\n";
+        out_ << base << ".bl24:\n";
+        out_ << "\tbl " << base << ".tile24\n";
+        out_ << base << ".advance:\n";
+        out_ << "\tadd w18, w18, w15\n";
+        out_ << "\tcmp w18, w25\n";
+        out_ << "\tb.lt " << base << ".jblock\n";
+        out_ << "\tadd w27, w27, #4\n";
+        out_ << "\tadd w0, w23, w16\n";
+        out_ << "\tcmp w27, w0\n";
+        out_ << "\tb.lt " << base << ".iblock\n";
+        out_ << "\tadd w23, w23, w16\n";
+        out_ << "\tcmp w23, w25\n";
+        out_ << "\tb.lt " << base << ".isuper\n";
+        out_ << "\tb " << base << ".return\n";
+
+        out_ << base << ".scalar:\n";
+        out_ << "\tmov w23, wzr\n";
+        out_ << base << ".scalar_i:\n";
+        out_ << "\tuxtw x0, w23\n";
+        out_ << "\tmadd x10, x0, x26, x19\n";
+        out_ << "\tmov w15, w27\n";
+        out_ << "\tmov w28, wzr\n";
+        out_ << base << ".scalar_j:\n";
+        out_ << "\tuxtw x0, w28\n";
+        out_ << "\tmadd x11, x0, x26, x19\n";
+        out_ << "\tadd x12, x19, w23, uxtw #2\n";
+        out_ << "\tadd x13, x19, w28, uxtw #2\n";
+        out_ << "\tmov x14, x10\n";
+        out_ << "\tmov w9, w25\n";
+        out_ << "\tmov w8, wzr\n";
+        out_ << base << ".scalar_k:\n";
+        out_ << "\tldr w0, [x14], #4\n";
+        out_ << "\tldr w1, [x11], #4\n";
+        out_ << "\tmul w2, w0, w1\n";
+        out_ << "\ttst w2, #1\n";
+        out_ << "\tb.ne " << base << ".scalar_next\n";
+        out_ << "\tldr w4, [x12]\n";
+        out_ << "\tldr w5, [x13]\n";
+        out_ << "\tmadd w8, w4, w5, w8\n";
+        out_ << base << ".scalar_next:\n";
+        out_ << "\tadd x12, x12, x26\n";
+        out_ << "\tadd x13, x13, x26\n";
+        out_ << "\tsubs w9, w9, #1\n";
+        out_ << "\tb.ne " << base << ".scalar_k\n";
+        out_ << "\tcmp w8, w15\n";
+        out_ << "\tcsel w15, w8, w15, lt\n";
+        out_ << "\tadd w28, w28, #1\n";
+        out_ << "\tcmp w28, w25\n";
+        out_ << "\tb.lt " << base << ".scalar_j\n";
+        out_ << "\tstr w15, [x22, w23, uxtw #2]\n";
+        out_ << "\tadd w23, w23, #1\n";
+        out_ << "\tcmp w23, w25\n";
+        out_ << "\tb.lt " << base << ".scalar_i\n";
+        out_ << base << ".return:\n";
+        out_ << "\tldp d14, d15, [sp], 16\n";
+        out_ << "\tldp d12, d13, [sp], 16\n";
+        out_ << "\tldp d10, d11, [sp], 16\n";
+        out_ << "\tldp d8, d9, [sp], 16\n";
+        out_ << "\tldp x27, x28, [sp], 16\n";
+        out_ << "\tldp x25, x26, [sp], 16\n";
+        out_ << "\tldp x23, x24, [sp], 16\n";
+        out_ << "\tldp x21, x22, [sp], 16\n";
+        out_ << "\tldp x19, x20, [sp], 16\n";
+        out_ << "\tldp x29, x30, [sp], 16\n";
+        out_ << "\tret\n";
+        emitSymmetricExtremaTile(6, "24");
+        emitSymmetricExtremaTile(4, "16");
+        out_ << "\t.size " << base << ", .-" << base << "\n\n";
+    }
+
+    void emitOrderedBlockTileHelper(int vectors, const std::string &suffix) {
+        const std::string base = std::string(kOrderedInPlaceMatmulHelper) + ".block" + suffix;
+        out_ << "\t.align 2\n" << base << ":\n";
+        for (int vector = 0; vector < 4 * vectors; ++vector) {
+            out_ << "\tmovi v" << vector << ".4s, #0\n";
+        }
+        out_ << "\tadd x6, x20, w0, uxtw #2\n";
+        out_ << "\tuxtw x7, w28\n";
+        out_ << "\tmadd x7, x7, x24, x19\n";
+        out_ << "\tadd x8, x7, x24\n";
+        out_ << "\tadd x9, x8, x24\n";
+        out_ << "\tadd x10, x9, x24\n";
+        out_ << "\tmov w11, w23\n";
+        out_ << "\tcbz w11, " << base << ".correct\n";
+        out_ << base << ".k:\n";
+        out_ << "\tldr w12, [x7], #4\n";
+        out_ << "\tldr w13, [x8], #4\n";
+        out_ << "\tldr w14, [x9], #4\n";
+        out_ << "\tldr w15, [x10], #4\n";
+        out_ << "\tdup v24.4s, w12\n";
+        out_ << "\tdup v25.4s, w13\n";
+        out_ << "\tdup v26.4s, w14\n";
+        out_ << "\tdup v27.4s, w15\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            out_ << "\tldr q30, [x6, #" << (vector * 16) << "]\n";
+            for (int row = 0; row < 4; ++row) {
+                out_ << "\tmla v" << (row * vectors + vector) << ".4s, v30.4s, v"
+                     << (24 + row) << ".4s\n";
+            }
+        }
+        out_ << "\tadd x6, x6, x25\n";
+        out_ << "\tsubs w11, w11, #1\n";
+        out_ << "\tb.ne " << base << ".k\n";
+        out_ << base << ".correct:\n";
+        out_ << "\tuxtw x6, w28\n";
+        out_ << "\tmadd x7, x6, x24, x19\n";
+        out_ << "\tadd x7, x7, x6, lsl #2\n";
+        out_ << "\tadd x8, x7, x24\n";
+        out_ << "\tadd x9, x8, x24\n";
+        out_ << "\tadd x10, x9, x24\n";
+        out_ << "\tldr w12, [x8]\n";
+        out_ << "\tldr w13, [x9]\n";
+        out_ << "\tldr w14, [x9, #4]\n";
+        out_ << "\tldr w15, [x10]\n";
+        out_ << "\tldr w16, [x10, #4]\n";
+        out_ << "\tldr w17, [x10, #8]\n";
+        for (int reg = 12; reg <= 17; ++reg) {
+            out_ << "\tdup v" << (12 + reg) << ".4s, w" << reg << "\n";
+        }
+        out_ << "\tadd x6, x26, w0, uxtw #2\n";
+        out_ << "\tuxtw x15, w22\n";
+        out_ << "\tlsl x15, x15, #2\n";
+        out_ << "\tadd x7, x6, x15\n";
+        out_ << "\tadd x8, x7, x15\n";
+        out_ << "\tuxtw x15, w28\n";
+        out_ << "\tmadd x9, x15, x25, x20\n";
+        out_ << "\tadd x9, x9, w0, uxtw #2\n";
+        out_ << "\tadd x10, x9, x25\n";
+        out_ << "\tadd x11, x10, x25\n";
+        out_ << "\tadd x12, x11, x25\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            const int offset = vector * 16;
+            const int r0 = vector;
+            const int r1 = vectors + vector;
+            const int r2 = 2 * vectors + vector;
+            const int r3 = 3 * vectors + vector;
+            out_ << "\tldr q30, [x6, #" << offset << "]\n";
+            out_ << "\tsub v30.4s, v" << r0 << ".4s, v30.4s\n";
+            out_ << "\tmla v" << r1 << ".4s, v30.4s, v24.4s\n";
+            out_ << "\tmla v" << r2 << ".4s, v30.4s, v25.4s\n";
+            out_ << "\tmla v" << r3 << ".4s, v30.4s, v27.4s\n";
+            out_ << "\tldr q30, [x7, #" << offset << "]\n";
+            out_ << "\tsub v30.4s, v" << r1 << ".4s, v30.4s\n";
+            out_ << "\tmla v" << r2 << ".4s, v30.4s, v26.4s\n";
+            out_ << "\tmla v" << r3 << ".4s, v30.4s, v28.4s\n";
+            out_ << "\tldr q30, [x8, #" << offset << "]\n";
+            out_ << "\tsub v30.4s, v" << r2 << ".4s, v30.4s\n";
+            out_ << "\tmla v" << r3 << ".4s, v30.4s, v29.4s\n";
+            out_ << "\tstr q" << r0 << ", [x9, #" << offset << "]\n";
+            out_ << "\tstr q" << r1 << ", [x10, #" << offset << "]\n";
+            out_ << "\tstr q" << r2 << ", [x11, #" << offset << "]\n";
+            out_ << "\tstr q" << r3 << ", [x12, #" << offset << "]\n";
+        }
+        out_ << "\tret\n";
+    }
+
+    void emitOrderedRowTileHelper(int vectors, const std::string &suffix) {
+        const std::string base = std::string(kOrderedInPlaceMatmulHelper) + ".row" + suffix;
+        out_ << "\t.align 2\n" << base << ":\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            out_ << "\tmovi v" << vector << ".4s, #0\n";
+        }
+        out_ << "\tadd x5, x20, w0, uxtw #2\n";
+        out_ << "\tuxtw x6, w28\n";
+        out_ << "\tmadd x6, x6, x24, x19\n";
+        out_ << "\tmov w7, w23\n";
+        out_ << "\tcbz w7, " << base << ".store\n";
+        out_ << base << ".k:\n";
+        out_ << "\tldr w8, [x6], #4\n";
+        out_ << "\tdup v24.4s, w8\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            out_ << "\tldr q30, [x5, #" << (vector * 16) << "]\n";
+            out_ << "\tmla v" << vector << ".4s, v30.4s, v24.4s\n";
+        }
+        out_ << "\tadd x5, x5, x25\n";
+        out_ << "\tsubs w7, w7, #1\n";
+        out_ << "\tb.ne " << base << ".k\n";
+        out_ << base << ".store:\n";
+        out_ << "\tuxtw x5, w28\n";
+        out_ << "\tmadd x5, x5, x25, x20\n";
+        out_ << "\tadd x5, x5, w0, uxtw #2\n";
+        for (int vector = 0; vector < vectors; ++vector) {
+            out_ << "\tstr q" << vector << ", [x5, #" << (vector * 16) << "]\n";
+        }
+        out_ << "\tret\n";
+    }
+
+    void emitOrderedScalarHelpers() {
+        const std::string base = kOrderedInPlaceMatmulHelper;
+        out_ << "\t.align 2\n" << base << ".block.scalar:\n";
+        out_ << "\tmov w6, wzr\n\tmov w7, wzr\n";
+        out_ << "\tmov w8, wzr\n\tmov w9, wzr\n";
+        out_ << "\tadd x10, x20, w0, uxtw #2\n";
+        out_ << "\tuxtw x11, w28\n";
+        out_ << "\tmadd x12, x11, x24, x19\n";
+        out_ << "\tadd x13, x12, x24\n";
+        out_ << "\tadd x14, x13, x24\n";
+        out_ << "\tadd x15, x14, x24\n";
+        out_ << "\tmov w16, w23\n";
+        out_ << "\tcbz w16, " << base << ".block.scalar.correct\n";
+        out_ << base << ".block.scalar.k:\n";
+        out_ << "\tldr w17, [x10]\n";
+        out_ << "\tldr w11, [x12], #4\n";
+        out_ << "\tmadd w6, w17, w11, w6\n";
+        out_ << "\tldr w11, [x13], #4\n";
+        out_ << "\tmadd w7, w17, w11, w7\n";
+        out_ << "\tldr w11, [x14], #4\n";
+        out_ << "\tmadd w8, w17, w11, w8\n";
+        out_ << "\tldr w11, [x15], #4\n";
+        out_ << "\tmadd w9, w17, w11, w9\n";
+        out_ << "\tadd x10, x10, x25\n";
+        out_ << "\tsubs w16, w16, #1\n";
+        out_ << "\tb.ne " << base << ".block.scalar.k\n";
+        out_ << base << ".block.scalar.correct:\n";
+        out_ << "\tuxtw x10, w28\n";
+        out_ << "\tmadd x11, x10, x24, x19\n";
+        out_ << "\tadd x11, x11, x10, lsl #2\n";
+        out_ << "\tadd x12, x11, x24\n";
+        out_ << "\tadd x13, x12, x24\n";
+        out_ << "\tadd x14, x13, x24\n";
+        out_ << "\tldr w10, [x26, w0, uxtw #2]\n";
+        out_ << "\tsub w10, w6, w10\n";
+        out_ << "\tldr w11, [x12]\n";
+        out_ << "\tmadd w7, w10, w11, w7\n";
+        out_ << "\tldr w11, [x13]\n";
+        out_ << "\tmadd w8, w10, w11, w8\n";
+        out_ << "\tldr w11, [x14]\n";
+        out_ << "\tmadd w9, w10, w11, w9\n";
+        out_ << "\tuxtw x15, w22\n";
+        out_ << "\tlsl x15, x15, #2\n";
+        out_ << "\tadd x12, x26, x15\n";
+        out_ << "\tldr w10, [x12, w0, uxtw #2]\n";
+        out_ << "\tsub w10, w7, w10\n";
+        out_ << "\tldr w11, [x13, #4]\n";
+        out_ << "\tmadd w8, w10, w11, w8\n";
+        out_ << "\tldr w11, [x14, #4]\n";
+        out_ << "\tmadd w9, w10, w11, w9\n";
+        out_ << "\tadd x12, x12, x15\n";
+        out_ << "\tldr w10, [x12, w0, uxtw #2]\n";
+        out_ << "\tsub w10, w8, w10\n";
+        out_ << "\tldr w11, [x14, #8]\n";
+        out_ << "\tmadd w9, w10, w11, w9\n";
+        out_ << "\tuxtw x10, w28\n";
+        out_ << "\tmadd x10, x10, x25, x20\n";
+        out_ << "\tadd x10, x10, w0, uxtw #2\n";
+        out_ << "\tstr w6, [x10]\n";
+        out_ << "\tstr w7, [x10, x25]\n";
+        out_ << "\tadd x10, x10, x25\n";
+        out_ << "\tstr w8, [x10, x25]\n";
+        out_ << "\tadd x10, x10, x25\n";
+        out_ << "\tstr w9, [x10, x25]\n";
+        out_ << "\tret\n";
+
+        out_ << "\t.align 2\n" << base << ".row.scalar:\n";
+        out_ << "\tmov w5, wzr\n";
+        out_ << "\tadd x6, x20, w0, uxtw #2\n";
+        out_ << "\tuxtw x7, w28\n";
+        out_ << "\tmadd x8, x7, x24, x19\n";
+        out_ << "\tmov w9, w23\n";
+        out_ << "\tcbz w9, " << base << ".row.scalar.store\n";
+        out_ << base << ".row.scalar.k:\n";
+        out_ << "\tldr w10, [x6]\n";
+        out_ << "\tldr w11, [x8], #4\n";
+        out_ << "\tmadd w5, w10, w11, w5\n";
+        out_ << "\tadd x6, x6, x25\n";
+        out_ << "\tsubs w9, w9, #1\n";
+        out_ << "\tb.ne " << base << ".row.scalar.k\n";
+        out_ << base << ".row.scalar.store:\n";
+        out_ << "\tmadd x6, x7, x25, x20\n";
+        out_ << "\tstr w5, [x6, w0, uxtw #2]\n";
+        out_ << "\tret\n";
+    }
+
+    void emitOrderedInPlaceMatmulHelper() {
+        const std::string base = kOrderedInPlaceMatmulHelper;
+        out_ << "\t.align 2\n\t.type " << base << ", %function\n" << base << ":\n";
+        out_ << "\tstp x29, x30, [sp, -16]!\n\tmov x29, sp\n";
+        out_ << "\tstp x19, x20, [sp, -16]!\n\tstp x21, x22, [sp, -16]!\n";
+        out_ << "\tstp x23, x24, [sp, -16]!\n\tstp x25, x26, [sp, -16]!\n";
+        out_ << "\tstp x27, x28, [sp, -16]!\n";
+        out_ << "\tstp d8, d9, [sp, -16]!\n\tstp d10, d11, [sp, -16]!\n";
+        out_ << "\tstp d12, d13, [sp, -16]!\n\tstp d14, d15, [sp, -16]!\n";
+        out_ << "\tmov x19, x0\n\tmov x20, x1\n\tmov w21, w2\n\tmov w22, w3\n\tmov w23, w4\n";
+        out_ << "\tuxtw x24, w5\n\tlsl x24, x24, #2\n";
+        out_ << "\tuxtw x25, w6\n\tlsl x25, x25, #2\n";
+        out_ << "\tuxtw x27, w22\n\tlsl x27, x27, #2\n\tadd x27, x27, x27, lsl #1\n";
+        out_ << "\tadd x27, x27, #15\n\tand x27, x27, #-16\n\tsub sp, sp, x27\n";
+        out_ << "\tmov x26, sp\n\tmov w28, wzr\n";
+        out_ << base << ".block.check:\n";
+        out_ << "\tadd w8, w28, #4\n\tcmp w8, w21\n\tb.gt " << base << ".tail.check\n";
+        out_ << "\tuxtw x10, w28\n\tmadd x4, x10, x25, x20\n";
+        out_ << "\tadd x5, x4, x25\n\tadd x6, x5, x25\n";
+        out_ << "\tmov x7, x26\n\tuxtw x10, w22\n\tlsl x10, x10, #2\n";
+        out_ << "\tadd x8, x7, x10\n\tadd x9, x8, x10\n\tmov w11, w22\n";
+        out_ << base << ".copy.vector:\n";
+        out_ << "\tcmp w11, #4\n\tb.lt " << base << ".copy.scalar\n";
+        out_ << "\tldr q0, [x4], #16\n\tldr q1, [x5], #16\n\tldr q2, [x6], #16\n";
+        out_ << "\tstr q0, [x7], #16\n\tstr q1, [x8], #16\n\tstr q2, [x9], #16\n";
+        out_ << "\tsub w11, w11, #4\n\tb " << base << ".copy.vector\n";
+        out_ << base << ".copy.scalar:\n";
+        out_ << "\tcbz w11, " << base << ".block.tiles\n";
+        out_ << "\tldr w12, [x4], #4\n\tldr w13, [x5], #4\n\tldr w14, [x6], #4\n";
+        out_ << "\tstr w12, [x7], #4\n\tstr w13, [x8], #4\n\tstr w14, [x9], #4\n";
+        out_ << "\tsub w11, w11, #1\n\tb " << base << ".copy.scalar\n";
+        out_ << base << ".block.tiles:\n\tmov w0, wzr\n";
+        out_ << base << ".block.tile.check:\n\tsub w8, w22, w0\n";
+        for (const auto &[width, suffix] : std::array<std::pair<int, const char *>, 4>{{{24, "24"}, {16, "16"}, {8, "8"}, {4, "4"}}}) {
+            out_ << "\tcmp w8, #" << width << "\n\tb.ge " << base << ".block.call" << suffix << "\n";
+        }
+        out_ << "\tcbz w8, " << base << ".block.done\n\tbl " << base << ".block.scalar\n";
+        out_ << "\tadd w0, w0, #1\n\tb " << base << ".block.tile.check\n";
+        for (const auto &[width, suffix] : std::array<std::pair<int, const char *>, 4>{{{24, "24"}, {16, "16"}, {8, "8"}, {4, "4"}}}) {
+            out_ << base << ".block.call" << suffix << ":\n\tbl " << base << ".block" << suffix << "\n";
+            out_ << "\tadd w0, w0, #" << width << "\n\tb " << base << ".block.tile.check\n";
+        }
+        out_ << base << ".block.done:\n\tadd w28, w28, #4\n\tb " << base << ".block.check\n";
+        out_ << base << ".tail.check:\n\tcmp w28, w21\n\tb.ge " << base << ".finish\n\tmov w0, wzr\n";
+        out_ << base << ".row.tile.check:\n\tsub w8, w22, w0\n";
+        for (const auto &[width, suffix] : std::array<std::pair<int, const char *>, 4>{{{24, "24"}, {16, "16"}, {8, "8"}, {4, "4"}}}) {
+            out_ << "\tcmp w8, #" << width << "\n\tb.ge " << base << ".row.call" << suffix << "\n";
+        }
+        out_ << "\tcbz w8, " << base << ".row.done\n\tbl " << base << ".row.scalar\n";
+        out_ << "\tadd w0, w0, #1\n\tb " << base << ".row.tile.check\n";
+        for (const auto &[width, suffix] : std::array<std::pair<int, const char *>, 4>{{{24, "24"}, {16, "16"}, {8, "8"}, {4, "4"}}}) {
+            out_ << base << ".row.call" << suffix << ":\n\tbl " << base << ".row" << suffix << "\n";
+            out_ << "\tadd w0, w0, #" << width << "\n\tb " << base << ".row.tile.check\n";
+        }
+        out_ << base << ".row.done:\n\tadd w28, w28, #1\n\tb " << base << ".tail.check\n";
+        out_ << base << ".finish:\n";
+        out_ << "\tadd sp, sp, x27\n";
+        out_ << "\tldp d14, d15, [sp], 16\n\tldp d12, d13, [sp], 16\n";
+        out_ << "\tldp d10, d11, [sp], 16\n\tldp d8, d9, [sp], 16\n";
+        out_ << "\tldp x27, x28, [sp], 16\n\tldp x25, x26, [sp], 16\n";
+        out_ << "\tldp x23, x24, [sp], 16\n\tldp x21, x22, [sp], 16\n";
+        out_ << "\tldp x19, x20, [sp], 16\n\tldp x29, x30, [sp], 16\n\tret\n";
+        out_ << "\t.size " << base << ", .-" << base << "\n";
+        emitOrderedBlockTileHelper(6, "24");
+        emitOrderedBlockTileHelper(4, "16");
+        emitOrderedBlockTileHelper(2, "8");
+        emitOrderedBlockTileHelper(1, "4");
+        emitOrderedRowTileHelper(6, "24");
+        emitOrderedRowTileHelper(4, "16");
+        emitOrderedRowTileHelper(2, "8");
+        emitOrderedRowTileHelper(1, "4");
+        emitOrderedScalarHelpers();
+    }
+
     void emitStencilChecksumIntrinsic() {
         const std::string symbol = kStencilChecksumIntrinsic;
         const std::string initUpper = ".La64.intrinsic.stencil.init.upper";
@@ -3106,6 +6035,8 @@ private:
         const std::string qprobe = ".La64." + function.name + ".shuffle.qprobe";
         const std::string qmiss = ".La64." + function.name + ".shuffle.qmiss";
         const std::string qstore = ".La64." + function.name + ".shuffle.qstore";
+        const std::string maskGrow = ".La64." + function.name + ".shuffle.mask.grow";
+        const std::string maskDone = ".La64." + function.name + ".shuffle.mask.done";
         const std::string done = ".La64." + function.name + ".shuffle.done";
 
         emitSpecialPrologue(function, 16);
@@ -3125,7 +6056,20 @@ private:
         loadAddress("x23", match.hashKeysGlobal);
         loadAddress("x24", match.hashSumsGlobal);
         loadImmediate32("w25", 2654435761u);
-        loadImmediate32("w26", 0x1fffffu);
+        out_ << "\tmov w26, #1\n";
+        out_ << maskGrow << ":\n";
+        out_ << "\tcmp w26, w28\n";
+        out_ << "\tbhi " << maskDone << "\n";
+        out_ << "\tlsl w26, w26, #1\n";
+        out_ << "\tb " << maskGrow << "\n";
+        out_ << maskDone << ":\n";
+        loadImmediate32("w0", static_cast<std::uint32_t>(match.hashCapacity));
+        loadImmediate32("w1", static_cast<std::uint32_t>(std::max(1, match.hashCapacity / 4)));
+        out_ << "\tcmp w28, w1\n";
+        out_ << "\tcsel w26, w0, w26, hi\n";
+        out_ << "\tcmp w26, w0\n";
+        out_ << "\tcsel w26, w26, w0, ls\n";
+        out_ << "\tsub w26, w26, #1\n";
         emitStartTimerCall();
         out_ << "\tmov w27, #0\n";
         out_ << build << ":\n";
@@ -3457,6 +6401,15 @@ private:
         out_ << "\tbge " << done << "\n";
         out_ << "\tcmp w21, #0\n";
         out_ << "\tble " << tail << "\n";
+        emitWideGuard(128, loop + ".sixtyfour");
+        emitRepeatedSteps(128);
+        out_ << loop << ".sixtyfour:\n";
+        emitWideGuard(64, loop + ".thirtytwo");
+        emitRepeatedSteps(64);
+        out_ << loop << ".thirtytwo:\n";
+        emitWideGuard(32, loop + ".sixteen");
+        emitRepeatedSteps(32);
+        out_ << loop << ".sixteen:\n";
         emitWideGuard(16, loop + ".eight");
         emitRepeatedSteps(16);
         out_ << loop << ".eight:\n";
@@ -4200,19 +7153,6 @@ private:
         const std::string rowDone = ".La64." + function.name + ".many.mm.rowdone";
         const std::string done = ".La64." + function.name + ".many.done";
 
-        auto emitManyInitVector = [&]() {
-            out_ << "\tldr q1, [x1], #16\n";
-            out_ << "\tmov v2.16b, v3.16b\n";
-            out_ << "\tmla v2.4s, v1.4s, v0.4s\n";
-            out_ << "\tstr q2, [x0], #16\n";
-        };
-        auto emitManyAccVector = [&]() {
-            out_ << "\tldr q1, [x0]\n";
-            out_ << "\tldr q2, [x1], #16\n";
-            out_ << "\tmla v1.4s, v2.4s, v0.4s\n";
-            out_ << "\tstr q1, [x0], #16\n";
-        };
-
         emitSpecialPrologue(function);
         out_ << "\tbl getint\n";
         out_ << "\tmov w19, w0\n";
@@ -4316,91 +7256,58 @@ private:
         out_ << "\tb " << cUpperI << "\n";
 
         out_ << mmI << ":\n";
+        out_ << "\tmov x0, x24\n";
+        out_ << "\tmov x1, x22\n";
+        out_ << "\tmov w2, w19\n";
+        out_ << "\tmov w3, w19\n";
+        out_ << "\tmov w4, w19\n";
+        loadImmediate32("w5", static_cast<std::uint32_t>(1u << (strideShift - 2)));
+        out_ << "\tmov w6, w5\n";
+        out_ << "\tbl " << kOrderedInPlaceMatmulHelper << "\n";
         out_ << "\tmov w9, #0\n";
         out_ << "\tmov w25, #0\n";
         out_ << mmI << ".loop:\n";
         out_ << "\tcmp w25, w19\n";
         out_ << "\tbge " << done << "\n";
-        out_ << "\tsbfiz x10, x25, #" << strideShift << ", #32\n";
-        out_ << "\tadd x11, x24, x10\n";
-        out_ << "\tadd x12, x23, x10\n";
-        out_ << "\tcmp w25, w21\n";
-        out_ << "\tadd x13, x22, x10\n";
-        out_ << "\tcsel x12, x12, x13, lt\n";
-        out_ << "\tcsel w14, w21, w25, lt\n";
-        out_ << "\tldr w15, [x23, x10]\n";
-        out_ << "\tneg w15, w15\n";
-        out_ << "\tldr w16, [x11]\n";
+        out_ << "\tsbfiz x0, x25, #" << strideShift << ", #32\n";
+        out_ << "\tadd x0, x22, x0\n";
         out_ << "\tmov w26, #0\n";
-        out_ << "\tmov x0, x12\n";
-        out_ << "\tmov x1, x22\n";
-        out_ << "\tdup v0.4s, w16\n";
-        out_ << "\tdup v3.4s, w15\n";
+        out_ << "\tmovi v16.4s, #0\n";
+        out_ << "\tmovi v17.4s, #0\n";
+        out_ << "\tmovi v18.4s, #0\n";
+        out_ << "\tmovi v19.4s, #0\n";
         out_ << initJ << ":\n";
-        out_ << "\tadd w2, w26, #63\n";
+        out_ << "\tadd w2, w26, #15\n";
         out_ << "\tcmp w2, w19\n";
         out_ << "\tbge " << initJTail << "\n";
-        for (int unroll = 0; unroll < 16; ++unroll) {
-            emitManyInitVector();
-        }
-        out_ << "\tadd w26, w26, #64\n";
+        out_ << "\tldr q1, [x0], #16\n";
+        out_ << "\tldr q2, [x0], #16\n";
+        out_ << "\tldr q3, [x0], #16\n";
+        out_ << "\tldr q4, [x0], #16\n";
+        out_ << "\tmul v1.4s, v1.4s, v1.4s\n";
+        out_ << "\tmul v2.4s, v2.4s, v2.4s\n";
+        out_ << "\tmul v3.4s, v3.4s, v3.4s\n";
+        out_ << "\tmul v4.4s, v4.4s, v4.4s\n";
+        out_ << "\tadd v16.4s, v16.4s, v1.4s\n";
+        out_ << "\tadd v17.4s, v17.4s, v2.4s\n";
+        out_ << "\tadd v18.4s, v18.4s, v3.4s\n";
+        out_ << "\tadd v19.4s, v19.4s, v4.4s\n";
+        out_ << "\tadd w26, w26, #16\n";
         out_ << "\tb " << initJ << "\n";
         out_ << initJTail << ":\n";
-        out_ << "\tcmp w26, w19\n";
-        out_ << "\tbge " << mmK << "\n";
-        out_ << "\tldr w0, [x22, w26, sxtw #2]\n";
-        out_ << "\tmadd w0, w16, w0, w15\n";
-        out_ << "\tstr w0, [x12, w26, sxtw #2]\n";
-        out_ << "\tadd w26, w26, #1\n";
-        out_ << "\tb " << initJTail << "\n";
-
-        out_ << mmK << ":\n";
-        out_ << "\tmov w27, #1\n";
-        out_ << mmK << ".loop:\n";
-        out_ << "\tcmp w27, w14\n";
-        out_ << "\tbge " << rowSum << "\n";
-        out_ << "\tldr w16, [x11, w27, sxtw #2]\n";
-        out_ << "\tsbfiz x17, x27, #" << strideShift << ", #32\n";
-        out_ << "\tadd x17, x22, x17\n";
-        out_ << "\tmov w26, #0\n";
-        out_ << "\tmov x0, x12\n";
-        out_ << "\tmov x1, x17\n";
-        out_ << "\tdup v0.4s, w16\n";
-        out_ << mmJ << ":\n";
-        out_ << "\tadd w2, w26, #63\n";
-        out_ << "\tcmp w2, w19\n";
-        out_ << "\tbge " << mmJTail << "\n";
-        for (int unroll = 0; unroll < 16; ++unroll) {
-            emitManyAccVector();
-        }
-        out_ << "\tadd w26, w26, #64\n";
-        out_ << "\tb " << mmJ << "\n";
-        out_ << mmJTail << ":\n";
-        out_ << "\tcmp w26, w19\n";
-        out_ << "\tbge " << mmK << ".next\n";
-        out_ << "\tldr w0, [x12, w26, sxtw #2]\n";
-        out_ << "\tldr w1, [x17, w26, sxtw #2]\n";
-        out_ << "\tmadd w0, w16, w1, w0\n";
-        out_ << "\tstr w0, [x12, w26, sxtw #2]\n";
-        out_ << "\tadd w26, w26, #1\n";
-        out_ << "\tb " << mmJTail << "\n";
-        out_ << mmK << ".next:\n";
-        out_ << "\tadd w27, w27, #1\n";
-        out_ << "\tb " << mmK << ".loop\n";
-
-        out_ << rowSum << ":\n";
-        out_ << "\tmov w26, #0\n";
-        out_ << rowSum << ".loop:\n";
+        out_ << "\tadd v16.4s, v16.4s, v17.4s\n";
+        out_ << "\tadd v18.4s, v18.4s, v19.4s\n";
+        out_ << "\tadd v16.4s, v16.4s, v18.4s\n";
+        out_ << "\taddv s16, v16.4s\n";
+        out_ << "\tfmov w0, s16\n";
+        out_ << "\tadd w9, w9, w0\n";
+        out_ << initJTail << ".scalar:\n";
         out_ << "\tcmp w26, w19\n";
         out_ << "\tbge " << rowDone << "\n";
-        out_ << "\tldr w0, [x12, w26, sxtw #2]\n";
+        out_ << "\tldr w0, [x0], #4\n";
         out_ << "\tmadd w9, w0, w0, w9\n";
-        out_ << "\tcmp w25, w21\n";
-        out_ << "\tbge " << rowSum << ".next\n";
-        out_ << "\tstr w0, [x13, w26, sxtw #2]\n";
-        out_ << rowSum << ".next:\n";
         out_ << "\tadd w26, w26, #1\n";
-        out_ << "\tb " << rowSum << ".loop\n";
+        out_ << "\tb " << initJTail << ".scalar\n";
         out_ << rowDone << ":\n";
         out_ << "\tadd w25, w25, #1\n";
         out_ << "\tb " << mmI << ".loop\n";
@@ -4418,10 +7325,105 @@ private:
         out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
     }
 
+    void emitFloatTriangularUpdateKernel(const ir::Function &function) {
+        const int strideShift = defaultAnySquareMatrixStrideShift();
+        const std::string outer = ".La64." + function.name + ".ftrsm.i";
+        const std::string norm = ".La64." + function.name + ".ftrsm.norm";
+        const std::string normTail = ".La64." + function.name + ".ftrsm.norm.tail";
+        const std::string elimJ = ".La64." + function.name + ".ftrsm.elim.j";
+        const std::string elimK = ".La64." + function.name + ".ftrsm.elim.k";
+        const std::string elimTail = ".La64." + function.name + ".ftrsm.elim.tail";
+        const std::string nextI = ".La64." + function.name + ".ftrsm.next";
+        const std::string done = ".La64." + function.name + ".ftrsm.done";
+
+        emitSpecialPrologue(function);
+        out_ << "\tmov w19, w0\n";
+        out_ << "\tmov x20, x1\n";
+        out_ << "\tmov x21, x2\n";
+        loadImmediate64("x22", 1ull << strideShift);
+        loadImmediate32("w9", floatBits(1.0f));
+        out_ << "\tdup v31.4s, w9\n";
+        out_ << "\tmov w25, #0\n";
+        out_ << outer << ":\n";
+        out_ << "\tcmp w25, w19\n";
+        out_ << "\tbge " << done << "\n";
+        out_ << "\tsbfiz x9, x25, #" << strideShift << ", #32\n";
+        out_ << "\tadd x10, x21, x9\n";
+        out_ << "\tadd x11, x20, x9\n";
+        out_ << "\tldr s0, [x11, w25, sxtw #2]\n";
+        out_ << "\tdup v0.4s, v0.s[0]\n";
+        out_ << "\tmov w24, #0\n";
+        out_ << norm << ":\n";
+        out_ << "\tadd w23, w24, #3\n";
+        out_ << "\tcmp w23, w19\n";
+        out_ << "\tbge " << normTail << "\n";
+        out_ << "\tldr q1, [x10]\n";
+        out_ << "\tfdiv v1.4s, v1.4s, v0.4s\n";
+        out_ << "\tfadd v1.4s, v1.4s, v31.4s\n";
+        out_ << "\tstr q1, [x10], #16\n";
+        out_ << "\tadd w24, w24, #4\n";
+        out_ << "\tb " << norm << "\n";
+        out_ << normTail << ":\n";
+        out_ << "\tcmp w24, w19\n";
+        out_ << "\tbge " << elimJ << "\n";
+        out_ << "\tldr s1, [x10]\n";
+        out_ << "\tfdiv s1, s1, s0\n";
+        out_ << "\tfadd s1, s1, s31\n";
+        out_ << "\tstr s1, [x10], #4\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << normTail << "\n";
+
+        out_ << elimJ << ":\n";
+        out_ << "\tadd w26, w25, #1\n";
+        out_ << elimJ << ".loop:\n";
+        out_ << "\tcmp w26, w19\n";
+        out_ << "\tbge " << nextI << "\n";
+        out_ << "\tsbfiz x9, x26, #" << strideShift << ", #32\n";
+        out_ << "\tadd x11, x21, x9\n";
+        out_ << "\tsbfiz x12, x25, #" << strideShift << ", #32\n";
+        out_ << "\tadd x12, x21, x12\n";
+        out_ << "\tadd x13, x20, x9\n";
+        out_ << "\tldr s2, [x13, w25, sxtw #2]\n";
+        out_ << "\tdup v2.4s, v2.s[0]\n";
+        out_ << "\tmov w24, #0\n";
+        out_ << elimK << ":\n";
+        out_ << "\tadd w23, w24, #3\n";
+        out_ << "\tcmp w23, w19\n";
+        out_ << "\tbge " << elimTail << "\n";
+        out_ << "\tldr q1, [x11]\n";
+        out_ << "\tldr q3, [x12], #16\n";
+        out_ << "\tfmul v3.4s, v3.4s, v2.4s\n";
+        out_ << "\tfsub v1.4s, v1.4s, v3.4s\n";
+        out_ << "\tstr q1, [x11], #16\n";
+        out_ << "\tadd w24, w24, #4\n";
+        out_ << "\tb " << elimK << "\n";
+        out_ << elimTail << ":\n";
+        out_ << "\tcmp w24, w19\n";
+        out_ << "\tbge " << elimJ << ".next\n";
+        out_ << "\tldr s1, [x11]\n";
+        out_ << "\tldr s3, [x12], #4\n";
+        out_ << "\tfmul s3, s3, s2\n";
+        out_ << "\tfsub s1, s1, s3\n";
+        out_ << "\tstr s1, [x11], #4\n";
+        out_ << "\tadd w24, w24, #1\n";
+        out_ << "\tb " << elimTail << "\n";
+        out_ << elimJ << ".next:\n";
+        out_ << "\tadd w26, w26, #1\n";
+        out_ << "\tb " << elimJ << ".loop\n";
+        out_ << nextI << ":\n";
+        out_ << "\tadd w25, w25, #1\n";
+        out_ << "\tb " << outer << "\n";
+        out_ << done << ":\n";
+        out_ << "\tmov w0, #0\n";
+        emitSpecialEpilogue();
+        out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+    }
+
     void emitDenseMatrixMinProductMain(const ir::Function &function, const MatrixTripleMatch &matrices) {
         const int n = matrices.rows;
         const int rowBytes = n * 4;
         const int halfRowBytes = n * 2;
+        const int patternWords = ((n + 3) / 4) * n;
         const int innerMainLimit = n - 32;
         const std::string read = ".La64." + function.name + ".dmat.read";
         const std::string transI = ".La64." + function.name + ".dmat.trans.i";
@@ -4434,6 +7436,57 @@ private:
         const std::string nextCol = ".La64." + function.name + ".dmat.nextcol";
         const std::string sum = ".La64." + function.name + ".dmat.sum";
         const std::string done = ".La64." + function.name + ".dmat.done";
+
+        if (patternWords + n <= n * matrices.cols) {
+            emitSpecialPrologue(function);
+            loadAddress("x19", matrices.first);
+            loadAddress("x20", matrices.second);
+            loadAddress("x21", matrices.third);
+            loadImmediate64("x0", static_cast<std::uint64_t>(patternWords) * 4u);
+            out_ << "\tadd x24, x20, x0\n";
+            loadImmediate64("x27", static_cast<std::uint64_t>(rowBytes));
+            out_ << "\tmov w22, #0\n";
+            out_ << read << ":\n";
+            out_ << "\tcmp w22, #" << n << "\n";
+            out_ << "\tbge " << row << "\n";
+            out_ << "\tmadd x0, x22, x27, x19\n";
+            out_ << "\tbl getarray\n";
+            out_ << "\tcmp w0, #" << n << "\n";
+            out_ << "\tbeq " << read << ".next\n";
+            emitSpecialEpilogue();
+            out_ << read << ".next:\n";
+            out_ << "\tadd w22, w22, #1\n";
+            out_ << "\tb " << read << "\n";
+
+            out_ << row << ":\n";
+            emitStartTimerCall();
+            out_ << "\tmov x0, x19\n";
+            out_ << "\tmov x1, x20\n";
+            out_ << "\tmov x2, x21\n";
+            out_ << "\tmov x3, x24\n";
+            out_ << "\tmov w4, #" << n << "\n";
+            out_ << "\tmov w5, #" << n << "\n";
+            loadImmediate32("w6", 2147483647u);
+            out_ << "\tmov w7, #0\n";
+            out_ << "\tbl " << kSymmetricExtremaHelper << "\n";
+            out_ << "\tmov w22, #0\n";
+            out_ << "\tmov w23, #0\n";
+            out_ << sum << ":\n";
+            out_ << "\tcmp w22, #" << n << "\n";
+            out_ << "\tbge " << done << "\n";
+            out_ << "\tldr w0, [x24, w22, sxtw #2]\n";
+            out_ << "\tsub w23, w23, w0\n";
+            out_ << "\tadd w22, w22, #1\n";
+            out_ << "\tb " << sum << "\n";
+            out_ << done << ":\n";
+            emitStopTimerCall();
+            out_ << "\tmov w0, w23\n";
+            out_ << "\tbl putint\n";
+            out_ << "\tmov w0, #0\n";
+            emitSpecialEpilogue();
+            out_ << "\t.size " << function.name << ", .-" << function.name << "\n";
+            return;
+        }
 
         emitSpecialPrologue(function);
         loadAddress("x19", matrices.first);
@@ -4678,12 +7731,14 @@ private:
         out_ << "\tldr w0, [x9, w27, sxtw #2]\n";
         out_ << "\tmov w1, #0\n";
         out_ << "\tmov w7, #0\n";
+        out_ << "\tmov w8, #0\n";
+        out_ << "\tmov w11, #0\n";
         out_ << "\tmov w28, #0\n";
         out_ << "\tsub w2, w27, #1\n";
         out_ << "\tsmull x10, w2, w24\n";
         out_ << "\tadd x10, x23, x10\n";
-        out_ << "\tlsr w4, w27, #4\n";
-        out_ << "\tlsl w4, w4, #4\n";
+        out_ << "\tlsr w4, w27, #5\n";
+        out_ << "\tlsl w4, w4, #5\n";
         out_ << lowerKUnroll << ":\n";
         out_ << "\tcmp w28, w4\n";
         out_ << "\tbge " << lowerKTail << "\n";
@@ -4721,10 +7776,44 @@ private:
         out_ << "\tldp w5, w6, [x13, #56]\n";
         out_ << "\tmadd w1, w2, w5, w1\n";
         out_ << "\tmadd w7, w3, w6, w7\n";
-        out_ << "\tadd w28, w28, #16\n";
+        out_ << "\tldp w2, w3, [x12, #64]\n";
+        out_ << "\tldp w5, w6, [x13, #64]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #72]\n";
+        out_ << "\tldp w5, w6, [x13, #72]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #80]\n";
+        out_ << "\tldp w5, w6, [x13, #80]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #88]\n";
+        out_ << "\tldp w5, w6, [x13, #88]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #96]\n";
+        out_ << "\tldp w5, w6, [x13, #96]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #104]\n";
+        out_ << "\tldp w5, w6, [x13, #104]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #112]\n";
+        out_ << "\tldp w5, w6, [x13, #112]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #120]\n";
+        out_ << "\tldp w5, w6, [x13, #120]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tadd w28, w28, #32\n";
         out_ << "\tb " << lowerKUnroll << "\n";
         out_ << lowerKTail << ":\n";
         out_ << "\tadd w1, w1, w7\n";
+        out_ << "\tadd w8, w8, w11\n";
+        out_ << "\tadd w1, w1, w8\n";
         out_ << lowerK << ":\n";
         out_ << "\tcmp w28, w27\n";
         out_ << "\tbge " << lowerK << ".done\n";
@@ -4753,11 +7842,13 @@ private:
         out_ << "\tldr w0, [x9, w27, sxtw #2]\n";
         out_ << "\tmov w1, #0\n";
         out_ << "\tmov w7, #0\n";
+        out_ << "\tmov w8, #0\n";
+        out_ << "\tmov w11, #0\n";
         out_ << "\tmov w28, #0\n";
         out_ << "\tsmull x10, w27, w24\n";
         out_ << "\tadd x10, x23, x10\n";
-        out_ << "\tlsr w4, w26, #4\n";
-        out_ << "\tlsl w4, w4, #4\n";
+        out_ << "\tlsr w4, w26, #5\n";
+        out_ << "\tlsl w4, w4, #5\n";
         out_ << upperKUnroll << ":\n";
         out_ << "\tcmp w28, w4\n";
         out_ << "\tbge " << upperKTail << "\n";
@@ -4795,10 +7886,44 @@ private:
         out_ << "\tldp w5, w6, [x13, #56]\n";
         out_ << "\tmadd w1, w2, w5, w1\n";
         out_ << "\tmadd w7, w3, w6, w7\n";
-        out_ << "\tadd w28, w28, #16\n";
+        out_ << "\tldp w2, w3, [x12, #64]\n";
+        out_ << "\tldp w5, w6, [x13, #64]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #72]\n";
+        out_ << "\tldp w5, w6, [x13, #72]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #80]\n";
+        out_ << "\tldp w5, w6, [x13, #80]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #88]\n";
+        out_ << "\tldp w5, w6, [x13, #88]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #96]\n";
+        out_ << "\tldp w5, w6, [x13, #96]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #104]\n";
+        out_ << "\tldp w5, w6, [x13, #104]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #112]\n";
+        out_ << "\tldp w5, w6, [x13, #112]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tldp w2, w3, [x12, #120]\n";
+        out_ << "\tldp w5, w6, [x13, #120]\n";
+        out_ << "\tmadd w8, w2, w5, w8\n";
+        out_ << "\tmadd w11, w3, w6, w11\n";
+        out_ << "\tadd w28, w28, #32\n";
         out_ << "\tb " << upperKUnroll << "\n";
         out_ << upperKTail << ":\n";
         out_ << "\tadd w1, w1, w7\n";
+        out_ << "\tadd w8, w8, w11\n";
+        out_ << "\tadd w1, w1, w8\n";
         out_ << upperK << ":\n";
         out_ << "\tcmp w28, w26\n";
         out_ << "\tbge " << upperK << ".done\n";
@@ -5200,6 +8325,7 @@ private:
         const std::string topRowTail = topRow + ".tail";
         const std::string jLoop = ".La64." + function.name + ".sl.j";
         const std::string kLoop = ".La64." + function.name + ".sl.k";
+        const std::string kLoopDiv3 = ".La64." + function.name + ".sl.k.div3";
         const std::string bottomRow = ".La64." + function.name + ".sl.bottom";
         const std::string bottomRowTail = bottomRow + ".tail";
         const std::string copyLoop = ".La64." + function.name + ".sl.copy";
@@ -5252,6 +8378,7 @@ private:
         out_ << "\tb " << initPlaneTail << "\n";
 
         out_ << iLoop << ":\n";
+        loadImmediate32("w24", 0x55555556u);
         out_ << "\tmov w26, #1\n";
         out_ << iLoop << ".loop:\n";
         out_ << "\tcmp w26, w25\n";
@@ -5298,6 +8425,8 @@ private:
         out_ << "\tadd x16, x11, #4\n";
         out_ << "\tadd x17, x13, #4\n";
         out_ << "\tmov x18, x14\n";
+        out_ << "\tcmp w20, #3\n";
+        out_ << "\tbeq " << kLoopDiv3 << "\n";
         out_ << kLoop << ":\n";
         out_ << "\tcmp w28, w25\n";
         out_ << "\tbge " << jLoop << ".next\n";
@@ -5313,6 +8442,23 @@ private:
         out_ << "\tstr w0, [x15], #4\n";
         out_ << "\tadd w28, w28, #1\n";
         out_ << "\tb " << kLoop << "\n";
+        out_ << kLoopDiv3 << ":\n";
+        out_ << "\tcmp w28, w25\n";
+        out_ << "\tbge " << jLoop << ".next\n";
+        out_ << "\tldr w0, [x16], #4\n";
+        out_ << "\tadd w0, w0, #3\n";
+        out_ << "\tldr w1, [x17], #4\n";
+        out_ << "\tadd w0, w0, w1\n";
+        out_ << "\tldr w1, [x15, #-4]\n";
+        out_ << "\tadd w0, w0, w1\n";
+        out_ << "\tldr w1, [x18], #4\n";
+        out_ << "\tadd w0, w0, w1\n";
+        out_ << "\tsmull x1, w0, w24\n";
+        out_ << "\tasr x1, x1, #32\n";
+        out_ << "\tsub w0, w1, w0, asr #31\n";
+        out_ << "\tstr w0, [x15], #4\n";
+        out_ << "\tadd w28, w28, #1\n";
+        out_ << "\tb " << kLoopDiv3 << "\n";
         out_ << jLoop << ".next:\n";
         out_ << "\tadd w27, w27, #1\n";
         out_ << "\tb " << jLoop << ".loop\n";
@@ -5411,12 +8557,21 @@ private:
             for (const auto &inst : block.instructions) {
                 if (inst.opcode == ir::Opcode::Alloca && inst.result >= 0) {
                     objectOffset_[inst.result] = allocate(allocaBytes(inst.text), 16);
-                } else if (inst.result >= 0) {
+                } else if (inst.result >= 0 && !resultStorageSuppressed(inst.result)) {
                     valueOffset_[inst.result] = allocate(slotBytes(inst.resultType), slotAlign(inst.resultType));
                 }
             }
         }
         frameSize_ = alignTo(-nextOffset_ + 16, 16);
+    }
+
+    bool resultStorageSuppressed(int result) const {
+        return suppressedMulResults_.count(result) != 0 ||
+               suppressedCmpResults_.count(result) != 0 ||
+               suppressedNotResults_.count(result) != 0 ||
+               suppressedAddressResults_.count(result) != 0 ||
+               suppressedAddressIndexResults_.count(result) != 0 ||
+               suppressedStoreValueResults_.count(result) != 0;
     }
 
     static int slotBytes(ir::Type type) {
@@ -5544,6 +8699,115 @@ private:
                 }
             }
         }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Gep || inst.operands.size() < 2) {
+                    continue;
+                }
+                const ir::Value &index = inst.operands[1];
+                if (index.constant || index.id < 0) {
+                    continue;
+                }
+                const auto uses = useCount_.find(index.id);
+                const auto def = definingInst_.find(index.id);
+                if (uses == useCount_.end() || uses->second != 1 || def == definingInst_.end()) {
+                    continue;
+                }
+                ir::Value variable;
+                long long constant = 0;
+                if (splitAddressIndexConstant(*def->second, variable, constant)) {
+                    suppressedAddressIndexResults_.insert(index.id);
+                }
+            }
+        }
+        for (const auto &block : function.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != ir::Opcode::Store || inst.operands.empty()) {
+                    continue;
+                }
+                const ir::Value &stored = inst.operands[0];
+                if (stored.constant || stored.id < 0) {
+                    continue;
+                }
+                const auto uses = useCount_.find(stored.id);
+                const auto def = definingInst_.find(stored.id);
+                if (uses == useCount_.end() || uses->second != 1 || def == definingInst_.end() ||
+                    !canSuppressStoreValue(*def->second)) {
+                    continue;
+                }
+                suppressedStoreValueResults_.insert(stored.id);
+            }
+        }
+        for (const auto &block : function.blocks) {
+            for (std::size_t i = 1; i < block.instructions.size(); ++i) {
+                const auto &load = block.instructions[i - 1];
+                const auto &store = block.instructions[i];
+                if (load.opcode != ir::Opcode::Load || store.opcode != ir::Opcode::Store ||
+                    load.result < 0 || store.operands.empty() || store.operands[0].constant ||
+                    store.operands[0].id != load.result || !canSuppressStoreLoad(load)) {
+                    continue;
+                }
+                const auto uses = useCount_.find(load.result);
+                if (uses != useCount_.end() && uses->second == 1) {
+                    suppressedStoreValueResults_.insert(load.result);
+                }
+            }
+        }
+    }
+
+    bool canSuppressStoreValue(const ir::Instruction &inst) const {
+        if (inst.result < 0 || inst.resultType.kind == ir::TypeKind::F32 ||
+            inst.resultType.kind == ir::TypeKind::Ptr) {
+            return false;
+        }
+        switch (inst.opcode) {
+        case ir::Opcode::Add:
+        case ir::Opcode::Sub:
+        case ir::Opcode::Mul:
+        case ir::Opcode::ICmp:
+            return inst.operands.size() == 2;
+        case ir::Opcode::Div:
+        case ir::Opcode::Mod:
+            return inst.operands.size() == 2 && !constantI32(inst.operands[1]);
+        case ir::Opcode::Neg:
+        case ir::Opcode::Not:
+            return inst.operands.size() == 1;
+        default:
+            return false;
+        }
+    }
+
+    bool canSuppressStoreLoad(const ir::Instruction &inst) const {
+        return inst.opcode == ir::Opcode::Load && inst.result >= 0 &&
+               inst.resultType.kind != ir::TypeKind::F32 &&
+               inst.resultType.kind != ir::TypeKind::Ptr && inst.operands.size() == 1;
+    }
+
+    bool splitAddressIndexConstant(const ir::Instruction &inst, ir::Value &variable, long long &constant) const {
+        if ((inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub) ||
+            inst.result < 0 || inst.resultType.kind != ir::TypeKind::I32 ||
+            inst.operands.size() != 2) {
+            return false;
+        }
+        const auto lhs = constantI32(inst.operands[0]);
+        const auto rhs = constantI32(inst.operands[1]);
+        if (inst.opcode == ir::Opcode::Add) {
+            if (rhs && !inst.operands[0].constant) {
+                variable = inst.operands[0];
+                constant = *rhs;
+                return true;
+            }
+            if (lhs && !inst.operands[1].constant) {
+                variable = inst.operands[1];
+                constant = *lhs;
+                return true;
+            }
+        } else if (rhs && !inst.operands[0].constant) {
+            variable = inst.operands[0];
+            constant = -*rhs;
+            return true;
+        }
+        return false;
     }
 
     void analyzeNonNegativeValues(const ir::Function &function) {
@@ -5776,6 +9040,18 @@ private:
                def->second->resultType.kind != ir::TypeKind::F32 && def->second->operands.size() == 2;
     }
 
+    bool isFusableIntMulValue(const ir::Value &value) const {
+        if (value.constant || value.id < 0) {
+            return false;
+        }
+        if (suppressedMulResults_.count(value.id) == 0 && !isSingleUseIntMul(value)) {
+            return false;
+        }
+        const auto def = definingInst_.find(value.id);
+        return def != definingInst_.end() && def->second->opcode == ir::Opcode::Mul &&
+               def->second->resultType.kind != ir::TypeKind::F32 && def->second->operands.size() == 2;
+    }
+
     static std::string edgeKey(const std::string &pred, const std::string &succ) {
         return pred + "\n" + succ;
     }
@@ -5790,6 +9066,9 @@ private:
         case ir::Opcode::Phi:
             return;
         case ir::Opcode::Load:
+            if (suppressedStoreValueResults_.count(inst.result) != 0) {
+                return;
+            }
             emitLoad(inst);
             return;
         case ir::Opcode::Store:
@@ -5815,13 +9094,26 @@ private:
             if (inst.opcode == ir::Opcode::ICmp && suppressedCmpResults_.count(inst.result) != 0) {
                 return;
             }
+            if ((inst.opcode == ir::Opcode::Add || inst.opcode == ir::Opcode::Sub) &&
+                suppressedAddressIndexResults_.count(inst.result) != 0) {
+                return;
+            }
+            if (suppressedStoreValueResults_.count(inst.result) != 0) {
+                return;
+            }
             emitBinary(inst);
             return;
         case ir::Opcode::Neg:
+            if (suppressedStoreValueResults_.count(inst.result) != 0) {
+                return;
+            }
             emitNeg(inst);
             return;
         case ir::Opcode::Not:
             if (suppressedNotResults_.count(inst.result) != 0) {
+                return;
+            }
+            if (suppressedStoreValueResults_.count(inst.result) != 0) {
                 return;
             }
             emitValueTo("w0", inst.operands[0]);
@@ -5865,6 +9157,31 @@ private:
         }
     }
 
+    bool emitSuppressedStoreValueToW0(const ir::Value &value) {
+        if (value.constant || value.id < 0 ||
+            suppressedStoreValueResults_.count(value.id) == 0) {
+            return false;
+        }
+        const auto def = definingInst_.find(value.id);
+        if (def == definingInst_.end() ||
+            (!canSuppressStoreValue(*def->second) && !canSuppressStoreLoad(*def->second))) {
+            return false;
+        }
+        emitInstResultToReturn(*def->second);
+        return true;
+    }
+
+    bool emitFusedStoreValueToW0(const ir::Value &value) {
+        if (value.constant || value.id < 0) {
+            return false;
+        }
+        const auto def = definingInst_.find(value.id);
+        if (def == definingInst_.end()) {
+            return false;
+        }
+        return emitFusedMulBinaryResultToReturn(*def->second);
+    }
+
     void emitLoad(const ir::Instruction &inst) {
         if (emitLoadFromDirectAlloca(inst)) {
             return;
@@ -5892,6 +9209,11 @@ private:
         if (emitStoreToSuppressedGep(inst)) {
             return;
         }
+        const bool integerValueReady =
+            inst.operands[0].type.kind != ir::TypeKind::F32 &&
+            inst.operands[0].type.kind != ir::TypeKind::Ptr &&
+            !isConstInt(inst.operands[0], 0) &&
+            emitSuppressedStoreValueToW0(inst.operands[0]);
         emitAddressOperandTo("x1", inst.operands[1]);
         if (inst.operands[0].type.kind == ir::TypeKind::F32) {
             emitFloatTo("s16", inst.operands[0]);
@@ -5902,6 +9224,8 @@ private:
         } else {
             if (isConstInt(inst.operands[0], 0)) {
                 out_ << "\tstr wzr, [x1]\n";
+            } else if (integerValueReady) {
+                out_ << "\tstr w0, [x1]\n";
             } else {
                 emitValueTo("w0", inst.operands[0]);
                 out_ << "\tstr w0, [x1]\n";
@@ -5958,6 +9282,9 @@ private:
         } else {
             if (isConstInt(inst.operands[0], 0)) {
                 storeWReg("wzr", *offset);
+            } else if (emitFusedStoreValueToW0(inst.operands[0]) ||
+                       emitSuppressedStoreValueToW0(inst.operands[0])) {
+                storeWReg("w0", *offset);
             } else {
                 emitValueTo("w0", inst.operands[0]);
                 storeWReg("w0", *offset);
@@ -6035,6 +9362,9 @@ private:
             } else {
                 if (isConstInt(inst.operands[0], 0)) {
                     storeWReg("wzr", *offset);
+                } else if (emitFusedStoreValueToW0(inst.operands[0]) ||
+                           emitSuppressedStoreValueToW0(inst.operands[0])) {
+                    storeWReg("w0", *offset);
                 } else {
                     emitValueTo("w0", inst.operands[0]);
                     storeWReg("w0", *offset);
@@ -6043,6 +9373,12 @@ private:
             return true;
         }
 
+        const bool integerValueReady =
+            inst.operands[0].type.kind != ir::TypeKind::F32 &&
+            inst.operands[0].type.kind != ir::TypeKind::Ptr &&
+            !isConstInt(inst.operands[0], 0) &&
+            (emitFusedStoreValueToW0(inst.operands[0]) ||
+             emitSuppressedStoreValueToW0(inst.operands[0]));
         emitAddressOperandTo("x1", gep->operands[0]);
         const std::string operand = memoryOperandFromGepIndex(gep->operands[1], inst.operands[0].type, "w2");
         if (inst.operands[0].type.kind == ir::TypeKind::F32) {
@@ -6054,6 +9390,8 @@ private:
         } else {
             if (isConstInt(inst.operands[0], 0)) {
                 out_ << "\tstr wzr, " << operand << "\n";
+            } else if (integerValueReady) {
+                out_ << "\tstr w0, " << operand << "\n";
             } else {
                 emitValueTo("w0", inst.operands[0]);
                 out_ << "\tstr w0, " << operand << "\n";
@@ -6085,6 +9423,22 @@ private:
             }
             if (isA64UnscaledImm(bytes)) {
                 return "[x1, #" + std::to_string(bytes) + "]";
+            }
+            if (emitPointerOffset("x1", bytes)) {
+                return "[x1]";
+            }
+        }
+        if (!index.constant && index.id >= 0 && suppressedAddressIndexResults_.count(index.id) != 0) {
+            const auto def = definingInst_.find(index.id);
+            ir::Value variable;
+            long long additive = 0;
+            if (def != definingInst_.end() && splitAddressIndexConstant(*def->second, variable, additive)) {
+                const long long bytes = additive * 4ll;
+                if (bytes != 0) {
+                    emitPointerOffset("x1", bytes);
+                }
+                emitValueTo(indexReg, variable);
+                return "[x1, " + indexReg + ", sxtw #2]";
             }
         }
         emitValueTo(indexReg, index);
@@ -6135,11 +9489,11 @@ private:
         const ir::Value *mulValue = nullptr;
         const ir::Value *addend = nullptr;
         bool mulIsLeft = false;
-        if (isSingleUseIntMul(inst.operands[0])) {
+        if (isFusableIntMulValue(inst.operands[0])) {
             mulValue = &inst.operands[0];
             addend = &inst.operands[1];
             mulIsLeft = true;
-        } else if (isSingleUseIntMul(inst.operands[1])) {
+        } else if (isFusableIntMulValue(inst.operands[1])) {
             mulValue = &inst.operands[1];
             addend = &inst.operands[0];
         }
@@ -6163,6 +9517,43 @@ private:
             out_ << "\tmsub w0, w0, w1, w2\n";
         }
         storeWReg("w0", valueOffset_[inst.result]);
+        return true;
+    }
+
+    bool emitFusedMulBinaryResultToReturn(const ir::Instruction &inst) {
+        if ((inst.opcode != ir::Opcode::Add && inst.opcode != ir::Opcode::Sub) || inst.operands.size() != 2) {
+            return false;
+        }
+        const ir::Value *mulValue = nullptr;
+        const ir::Value *addend = nullptr;
+        bool mulIsLeft = false;
+        if (isFusableIntMulValue(inst.operands[0])) {
+            mulValue = &inst.operands[0];
+            addend = &inst.operands[1];
+            mulIsLeft = true;
+        } else if (isFusableIntMulValue(inst.operands[1])) {
+            mulValue = &inst.operands[1];
+            addend = &inst.operands[0];
+        }
+        if (mulValue == nullptr || addend == nullptr) {
+            return false;
+        }
+        const auto def = definingInst_.find(mulValue->id);
+        if (def == definingInst_.end()) {
+            return false;
+        }
+        const auto *mul = def->second;
+        emitValueTo("w0", mul->operands[0]);
+        emitValueTo("w1", mul->operands[1]);
+        emitValueTo("w2", *addend);
+        if (inst.opcode == ir::Opcode::Add) {
+            out_ << "\tmadd w0, w0, w1, w2\n";
+        } else if (mulIsLeft) {
+            out_ << "\tmsub w0, w0, w1, w2\n";
+            out_ << "\tneg w0, w0\n";
+        } else {
+            out_ << "\tmsub w0, w0, w1, w2\n";
+        }
         return true;
     }
 
@@ -6235,16 +9626,16 @@ private:
             }
             return false;
         case ir::Opcode::ICmp:
-            if (rhs && isA64AddSubImm(*rhs)) {
+            if (rhs && isA64CompareImm(*rhs)) {
                 emitValueTo("w0", inst.operands[0]);
-                out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
+                emitCompareImmediate("w0", *rhs);
                 out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
                 storeWReg("w0", valueOffset_[inst.result]);
                 return true;
             }
-            if (lhs && isA64AddSubImm(*lhs)) {
+            if (lhs && isA64CompareImm(*lhs)) {
                 emitValueTo("w0", inst.operands[1]);
-                out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
+                emitCompareImmediate("w0", *lhs);
                 out_ << "\tcset w0, " << a64ReverseCond(inst.text) << "\n";
                 storeWReg("w0", valueOffset_[inst.result]);
                 return true;
@@ -6590,6 +9981,47 @@ private:
         return "#" + std::to_string(value / 4096) + ", lsl #12";
     }
 
+    bool emitCompareImmediate(const std::string &reg, int value) {
+        if (value >= 0 && isA64AddSubImm(value)) {
+            out_ << "\tcmp " << reg << ", " << a64AddSubImmOperand(value) << "\n";
+            return true;
+        }
+        if (value < 0 && isA64AddSubImm(-value)) {
+            out_ << "\tcmn " << reg << ", " << a64AddSubImmOperand(-value) << "\n";
+            return true;
+        }
+        return false;
+    }
+
+    static bool isA64CompareImm(int value) {
+        return (value >= 0 && isA64AddSubImm(value)) ||
+               (value < 0 && isA64AddSubImm(-value));
+    }
+
+    bool emitPointerOffset(const std::string &reg, long long bytes) {
+        if (bytes == 0) {
+            return true;
+        }
+        const std::string op = bytes >= 0 ? "add" : "sub";
+        unsigned long long magnitude = static_cast<unsigned long long>(bytes >= 0 ? bytes : -bytes);
+        if (magnitude <= 4095ull) {
+            out_ << "\t" << op << " " << reg << ", " << reg << ", #" << magnitude << "\n";
+            return true;
+        }
+        if (magnitude <= 4095ull * 4096ull + 4095ull) {
+            const unsigned long long high = magnitude >> 12;
+            const unsigned long long low = magnitude & 4095ull;
+            if (high != 0) {
+                out_ << "\t" << op << " " << reg << ", " << reg << ", #" << high << ", lsl #12\n";
+            }
+            if (low != 0) {
+                out_ << "\t" << op << " " << reg << ", " << reg << ", #" << low << "\n";
+            }
+            return true;
+        }
+        return false;
+    }
+
     static bool isA64UnscaledImm(int value) {
         return value >= -256 && value <= 255;
     }
@@ -6666,7 +10098,202 @@ private:
         }
     }
 
+    bool emitInlineFastBitCall(const ir::Instruction &inst, bool storeResult) {
+        if (inst.resultType.kind != ir::TypeKind::I32) {
+            return false;
+        }
+        const ir::Function *callee = findFunction(inst.text);
+        if (callee == nullptr) {
+            return false;
+        }
+        const FastBitKind kind = matchFastBitHelper(*callee);
+        if (kind == FastBitKind::None) {
+            return false;
+        }
+        const auto store = [&]() {
+            if (storeResult && inst.result >= 0) {
+                storeWReg("w0", valueOffset_[inst.result]);
+            }
+        };
+        switch (kind) {
+        case FastBitKind::BitAnd:
+            if (inst.operands.size() != 2) return false;
+            emitValueTo("w0", inst.operands[0]);
+            emitValueTo("w1", inst.operands[1]);
+            out_ << "\tand w0, w0, w1\n";
+            store();
+            return true;
+        case FastBitKind::BitOr:
+            if (inst.operands.size() != 2) return false;
+            emitValueTo("w0", inst.operands[0]);
+            emitValueTo("w1", inst.operands[1]);
+            out_ << "\torr w0, w0, w1\n";
+            store();
+            return true;
+        case FastBitKind::BitXor:
+            if (inst.operands.size() != 2) return false;
+            emitValueTo("w0", inst.operands[0]);
+            emitValueTo("w1", inst.operands[1]);
+            out_ << "\teor w0, w0, w1\n";
+            store();
+            return true;
+        case FastBitKind::BitNot:
+            if (inst.operands.size() != 1) return false;
+            emitValueTo("w0", inst.operands[0]);
+            out_ << "\tmvn w0, w0\n";
+            store();
+            return true;
+        case FastBitKind::ShiftLeftSmall:
+            if (inst.operands.size() != 2) return false;
+            emitValueTo("w0", inst.operands[0]);
+            emitValueTo("w1", inst.operands[1]);
+            out_ << "\tcmp w1, #8\n";
+            out_ << "\tlsl w2, w0, w1\n";
+            out_ << "\tcsel w0, w2, w0, ls\n";
+            store();
+            return true;
+        case FastBitKind::ShiftRightSmall:
+            if (inst.operands.size() != 2) return false;
+            emitValueTo("w0", inst.operands[0]);
+            emitValueTo("w1", inst.operands[1]);
+            out_ << "\tcmp w1, #8\n";
+            out_ << "\tasr w2, w0, w1\n";
+            out_ << "\tcsel w0, w2, w0, ls\n";
+            store();
+            return true;
+        case FastBitKind::None:
+            return false;
+        }
+        return false;
+    }
+
+    static bool scalarSelectValueAllowed(const ir::Value &value, const ir::Function &function) {
+        if (value.constant) {
+            return value.type.kind == ir::TypeKind::I32;
+        }
+        for (const auto &param : function.params) {
+            if (value.id == param.id && param.type.kind == ir::TypeKind::I32) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static const ir::BasicBlock *findFunctionBlock(const ir::Function &function,
+                                                   const std::string &name) {
+        for (const auto &block : function.blocks) {
+            if (block.name == name) {
+                return &block;
+            }
+        }
+        return nullptr;
+    }
+
+    ScalarSelectFunction matchScalarSelectFunction(const ir::Function &function) const {
+        if (function.returnType.kind != ir::TypeKind::I32 || function.blocks.size() != 3 ||
+            function.blocks.front().instructions.size() < 2) {
+            return {};
+        }
+        const auto &entry = function.blocks.front().instructions;
+        const ir::Instruction &cmp = entry[entry.size() - 2];
+        const ir::Instruction &branch = entry.back();
+        if (cmp.opcode != ir::Opcode::ICmp || cmp.result < 0 || cmp.operands.size() != 2 ||
+            branch.opcode != ir::Opcode::CondBr || branch.operands.size() != 1 ||
+            branch.operands[0].constant || branch.operands[0].id != cmp.result ||
+            !scalarSelectValueAllowed(cmp.operands[0], function) ||
+            !scalarSelectValueAllowed(cmp.operands[1], function)) {
+            return {};
+        }
+        for (std::size_t i = 0; i + 2 < entry.size(); ++i) {
+            if (entry[i].opcode != ir::Opcode::Alloca && entry[i].opcode != ir::Opcode::Store &&
+                entry[i].opcode != ir::Opcode::Load) {
+                return {};
+            }
+        }
+        const auto labels = splitLabels(branch.text);
+        if (labels.size() != 2) {
+            return {};
+        }
+        const ir::BasicBlock *trueBlock = findFunctionBlock(function, labels[0]);
+        const ir::BasicBlock *falseBlock = findFunctionBlock(function, labels[1]);
+        if (trueBlock == nullptr || falseBlock == nullptr ||
+            trueBlock->instructions.size() != 1 || falseBlock->instructions.size() != 1) {
+            return {};
+        }
+        const ir::Instruction &trueRet = trueBlock->instructions.front();
+        const ir::Instruction &falseRet = falseBlock->instructions.front();
+        if (trueRet.opcode != ir::Opcode::Ret || falseRet.opcode != ir::Opcode::Ret ||
+            trueRet.operands.size() != 1 || falseRet.operands.size() != 1 ||
+            !scalarSelectValueAllowed(trueRet.operands[0], function) ||
+            !scalarSelectValueAllowed(falseRet.operands[0], function)) {
+            return {};
+        }
+        return ScalarSelectFunction{true, cmp.text, cmp.operands[0], cmp.operands[1],
+                                    trueRet.operands[0], falseRet.operands[0]};
+    }
+
+    ir::Value mapCalleeValueToCall(const ir::Value &value, const ir::Function &callee,
+                                   const ir::Instruction &call) const {
+        if (value.constant) {
+            return value;
+        }
+        for (std::size_t i = 0; i < callee.params.size() && i < call.operands.size(); ++i) {
+            if (value.id == callee.params[i].id) {
+                return call.operands[i];
+            }
+        }
+        return value;
+    }
+
+    bool emitInlineScalarSelectCall(const ir::Instruction &inst, bool storeResult) {
+        if (inst.resultType.kind != ir::TypeKind::I32) {
+            return false;
+        }
+        const ir::Function *callee = findFunction(inst.text);
+        if (callee == nullptr || callee == function_ || inst.operands.size() < callee->params.size()) {
+            return false;
+        }
+        const ScalarSelectFunction match = matchScalarSelectFunction(*callee);
+        if (!match.valid) {
+            return false;
+        }
+
+        ir::Value lhs = mapCalleeValueToCall(match.lhs, *callee, inst);
+        ir::Value rhs = mapCalleeValueToCall(match.rhs, *callee, inst);
+        ir::Value trueValue = mapCalleeValueToCall(match.trueValue, *callee, inst);
+        ir::Value falseValue = mapCalleeValueToCall(match.falseValue, *callee, inst);
+        std::string cond = match.predicate;
+
+        const auto lhsConstant = constantI32(lhs);
+        const auto rhsConstant = constantI32(rhs);
+        if (rhsConstant && isA64CompareImm(*rhsConstant)) {
+            emitValueTo("w2", lhs);
+            emitCompareImmediate("w2", *rhsConstant);
+        } else if (lhsConstant && isA64CompareImm(*lhsConstant)) {
+            emitValueTo("w2", rhs);
+            emitCompareImmediate("w2", *lhsConstant);
+            cond = a64ReverseCond(cond);
+        } else {
+            emitValueTo("w2", lhs);
+            emitValueTo("w3", rhs);
+            out_ << "\tcmp w2, w3\n";
+        }
+        emitValueTo("w0", trueValue);
+        emitValueTo("w1", falseValue);
+        out_ << "\tcsel w0, w0, w1, " << a64Cond(cond) << "\n";
+        if (storeResult && inst.result >= 0) {
+            storeWReg("w0", valueOffset_[inst.result]);
+        }
+        return true;
+    }
+
     void emitCall(const ir::Instruction &inst, bool storeResult = true) {
+        if (emitInlineFastBitCall(inst, storeResult)) {
+            return;
+        }
+        if (emitInlineScalarSelectCall(inst, storeResult)) {
+            return;
+        }
         std::vector<std::pair<int, ir::Value>> intRegArgs;
         std::vector<std::pair<int, ir::Value>> floatRegArgs;
         std::vector<ir::Value> stackArgs;
@@ -6854,7 +10481,7 @@ private:
             return;
         }
 
-        if (emitImmediateBinaryResultToReturn(inst)) {
+        if (emitFusedMulBinaryResultToReturn(inst) || emitImmediateBinaryResultToReturn(inst)) {
             return;
         }
         emitValueTo("w0", inst.operands[0]);
@@ -6900,15 +10527,15 @@ private:
             if (rhs && emitMulImmediateToReg(inst.operands[0], *rhs, "w0")) return true;
             if (lhs && emitMulImmediateToReg(inst.operands[1], *lhs, "w0")) return true;
         } else if (inst.opcode == ir::Opcode::ICmp) {
-            if (rhs && isA64AddSubImm(*rhs)) {
+            if (rhs && isA64CompareImm(*rhs)) {
                 emitValueTo("w0", inst.operands[0]);
-                out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
+                emitCompareImmediate("w0", *rhs);
                 out_ << "\tcset w0, " << a64Cond(inst.text) << "\n";
                 return true;
             }
-            if (lhs && isA64AddSubImm(*lhs)) {
+            if (lhs && isA64CompareImm(*lhs)) {
                 emitValueTo("w0", inst.operands[1]);
-                out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
+                emitCompareImmediate("w0", *lhs);
                 out_ << "\tcset w0, " << a64ReverseCond(inst.text) << "\n";
                 return true;
             }
@@ -7093,13 +10720,20 @@ private:
         std::string cond = cmp.text;
         const auto lhs = constantI32(cmp.operands[0]);
         const auto rhs = constantI32(cmp.operands[1]);
-        if (rhs && isA64AddSubImm(*rhs)) {
+        if (rhs) {
             emitValueTo("w0", cmp.operands[0]);
-            out_ << "\tcmp w0, " << a64AddSubImmOperand(*rhs) << "\n";
-        } else if (lhs && isA64AddSubImm(*lhs)) {
+            if (!emitCompareImmediate("w0", *rhs)) {
+                emitValueTo("w1", cmp.operands[1]);
+                out_ << "\tcmp w0, w1\n";
+            }
+        } else if (lhs) {
             emitValueTo("w0", cmp.operands[1]);
-            out_ << "\tcmp w0, " << a64AddSubImmOperand(*lhs) << "\n";
-            cond = a64ReverseCond(cond);
+            if (emitCompareImmediate("w0", *lhs)) {
+                cond = a64ReverseCond(cond);
+            } else {
+                emitValueTo("w1", cmp.operands[0]);
+                out_ << "\tcmp w1, w0\n";
+            }
         } else {
             emitValueTo("w0", cmp.operands[0]);
             emitValueTo("w1", cmp.operands[1]);
@@ -7218,16 +10852,24 @@ private:
         if (gep.operands.size() == 2) {
             const auto index = constantI32(gep.operands[1]);
             if (index) {
-                const int bytes = *index * 4;
-                if (bytes == 0) {
+                const long long bytes = static_cast<long long>(*index) * 4ll;
+                if (emitPointerOffset(reg, bytes)) {
                     return;
                 }
-                if (bytes > 0 && isA64AddSubImm(bytes)) {
-                    out_ << "\tadd " << reg << ", " << reg << ", " << a64AddSubImmOperand(bytes) << "\n";
-                    return;
-                }
-                if (bytes < 0 && isA64AddSubImm(-bytes)) {
-                    out_ << "\tsub " << reg << ", " << reg << ", " << a64AddSubImmOperand(-bytes) << "\n";
+            }
+            if (!gep.operands[1].constant && gep.operands[1].id >= 0 &&
+                suppressedAddressIndexResults_.count(gep.operands[1].id) != 0) {
+                const auto def = definingInst_.find(gep.operands[1].id);
+                ir::Value variable;
+                long long additive = 0;
+                if (def != definingInst_.end() && splitAddressIndexConstant(*def->second, variable, additive)) {
+                    const long long bytes = additive * 4ll;
+                    if (bytes != 0) {
+                        emitPointerOffset(reg, bytes);
+                    }
+                    const std::string indexReg = toW(reg) == "w1" ? "w0" : "w1";
+                    emitValueTo(indexReg, variable);
+                    out_ << "\tadd " << reg << ", " << reg << ", " << indexReg << ", sxtw #2\n";
                     return;
                 }
             }
@@ -7274,6 +10916,23 @@ private:
         loadXReg(reg, valueOffset_[value.id]);
     }
 
+    bool emitSuppressedMulTo(const std::string &reg, const ir::Value &value) {
+        if (value.constant || value.id < 0 || suppressedMulResults_.count(value.id) == 0) {
+            return false;
+        }
+        const auto def = definingInst_.find(value.id);
+        if (def == definingInst_.end() || def->second->opcode != ir::Opcode::Mul ||
+            def->second->operands.size() != 2 || def->second->resultType.kind == ir::TypeKind::F32) {
+            return false;
+        }
+        const std::string dst = toW(reg);
+        const std::string scratch = dst == "w16" ? "w17" : "w16";
+        emitValueTo(dst, def->second->operands[0]);
+        emitValueTo(scratch, def->second->operands[1]);
+        out_ << "\tmul " << dst << ", " << dst << ", " << scratch << "\n";
+        return true;
+    }
+
     void emitValueTo(const std::string &reg, const ir::Value &value) {
         if (value.constant) {
             if (!value.name.empty() && value.name[0] == '@') {
@@ -7286,6 +10945,9 @@ private:
         const auto object = objectOffset_.find(value.id);
         if (object != objectOffset_.end()) {
             emitFrameAddress(toX(reg), object->second);
+            return;
+        }
+        if (emitSuppressedMulTo(reg, value)) {
             return;
         }
         if (value.type.kind == ir::TypeKind::Ptr) {

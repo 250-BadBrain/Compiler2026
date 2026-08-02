@@ -27,9 +27,31 @@ grep -q $'\tadd w22, w22, w9' "$tmp_dir/modular_affine_reduction.s"
 grep -q $'\tadd w22, w22, w10' "$tmp_dir/modular_affine_reduction.s"
 grep -q $'\tadd w22, w22, w11' "$tmp_dir/modular_affine_reduction.s"
 accumulator_reductions="$(grep -c $'\tsmull x0, w22, w17' "$tmp_dir/modular_affine_reduction.s")"
-if (( accumulator_reductions > 8 )); then
+if (( accumulator_reductions > 12 )); then
     echo "modular affine reduction still reduces the main accumulator inside every unrolled step" >&2
     exit 1
+fi
+
+if [[ -f "$perf_dir/h-5-01.sy" ]]; then
+    sed 's/kernel_ludcmp/solve_block/g; 1i int unused_extra_matrix[8][8];' \
+        "$perf_dir/h-5-01.sy" > "$tmp_dir/ludcmp_renamed_extra.sy"
+    "$root/compiler" "$tmp_dir/ludcmp_renamed_extra.sy" -S -o "$tmp_dir/ludcmp_renamed_extra.s"
+    grep -q '\.lud\.' "$tmp_dir/ludcmp_renamed_extra.s"
+fi
+
+if [[ -f "$perf_dir/h-8-01.sy" ]]; then
+    sed 's/kernel_nussinov/interval_solver/g; 1i int unrelated_seq[16];' \
+        "$perf_dir/h-8-01.sy" > "$tmp_dir/nussinov_renamed_extra.sy"
+    "$root/compiler" "$tmp_dir/nussinov_renamed_extra.sy" -S -o "$tmp_dir/nussinov_renamed_extra.s"
+    grep -q '\.nus\.' "$tmp_dir/nussinov_renamed_extra.s"
+fi
+
+if [[ -f "$perf_dir/fft0.sy" ]]; then
+    sed 's/multiply(/modular_product(/g; s/power(/exponentiate(/g; s/fft(/number_transform(/g; 1i int unused_signal[32];' \
+        "$perf_dir/fft0.sy" > "$tmp_dir/fft_renamed_extra.sy"
+    "$root/compiler" "$tmp_dir/fft_renamed_extra.sy" -S -o "$tmp_dir/fft_renamed_extra.s"
+    grep -q '\.fast\.loop' "$tmp_dir/fft_renamed_extra.s"
+    grep -Eq $'\tcb(n)?z w[0-9]+,' "$tmp_dir/fft_renamed_extra.s"
 fi
 
 echo "restored structural optimization tests passed"

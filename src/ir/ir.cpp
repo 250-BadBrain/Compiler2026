@@ -1,6 +1,8 @@
 #include "ir.hpp"
+#include "../support/optimization_config.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1082,10 +1084,17 @@ bool eliminatePureCallCommonSubexpressions(Module &module) {
 
     bool changed = false;
     for (auto &function : module.functions) {
+        if (function.blocks.empty()) {
+            continue;
+        }
         std::unordered_map<int, Value> replacements;
+        const auto predecessors = computePredecessors(function);
+        const auto dominators = computeDominators(function, predecessors);
+        const auto domTree = computeDominatorTree(function, dominators);
 
-        for (auto &block : function.blocks) {
-            std::unordered_map<std::string, Value> available;
+        std::function<void(int, std::unordered_map<std::string, Value>)> visit =
+            [&](int blockIndex, std::unordered_map<std::string, Value> available) {
+            auto &block = function.blocks[static_cast<std::size_t>(blockIndex)];
             std::vector<Instruction> kept;
             kept.reserve(block.instructions.size());
 
@@ -1107,14 +1116,16 @@ bool eliminatePureCallCommonSubexpressions(Module &module) {
                     continue;
                 }
 
-                if (inst.opcode == Opcode::Call) {
-                    available.clear();
-                }
                 kept.push_back(std::move(inst));
             }
 
             block.instructions = std::move(kept);
-        }
+            for (int child : domTree[static_cast<std::size_t>(blockIndex)]) {
+                visit(child, available);
+            }
+        };
+
+        visit(0, {});
 
         if (!replacements.empty()) {
             for (auto &block : function.blocks) {
@@ -1630,6 +1641,16 @@ bool forwardCrossBlockMemory(Function &function) {
 
 std::string exactMemoryAddressKey(const Value &address,
                                   const std::unordered_map<int, Instruction> &definitions);
+std::string memoryAddressRoot(const Value &address,
+                              const std::unordered_map<int, Instruction> &definitions);
+std::string memoryAddressRootWithParams(
+    const Value &address,
+    const std::unordered_map<int, Instruction> &definitions,
+    const std::unordered_map<int, int> &paramIndexById);
+std::string paramPairKey(int lhs, int rhs);
+void invalidateMemoryForStore(std::unordered_map<std::string, Value> &knownMemory,
+                              const std::string &storeKey,
+                              const std::string &storeRoot);
 
 bool forwardCrossBlockExactMemory(Function &function,
                                   const std::unordered_set<std::string> &nonClobberingCalls) {
@@ -1677,7 +1698,8 @@ bool forwardCrossBlockExactMemory(Function &function,
                 }
                 if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
                     const std::string key = exactMemoryAddressKey(inst.operands[1], definitions);
-                    nextOut.clear();
+                    const std::string root = memoryAddressRoot(inst.operands[1], definitions);
+                    invalidateMemoryForStore(nextOut, key, root);
                     if (!key.empty()) {
                         nextOut[key] = inst.operands[0];
                     }
@@ -1720,7 +1742,8 @@ bool forwardCrossBlockExactMemory(Function &function,
                 current.clear();
             } else if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
                 const std::string key = exactMemoryAddressKey(inst.operands[1], definitions);
-                current.clear();
+                const std::string root = memoryAddressRoot(inst.operands[1], definitions);
+                invalidateMemoryForStore(current, key, root);
                 if (!key.empty()) {
                     current[key] = inst.operands[0];
                 }
@@ -1769,7 +1792,73 @@ bool isHoistableOpcode(Opcode opcode) {
     return false;
 }
 
-bool hoistLoopInvariants(Function &function) {
+bool rootsMayAlias(const std::string &lhs,
+                   const std::string &rhs,
+                   const std::unordered_set<std::string> &noAliasParamPairs) {
+    if (lhs.empty() || rhs.empty()) {
+        return true;
+    }
+    if (lhs == rhs) {
+        return true;
+    }
+    const auto lhsParam = lhs.rfind("param:", 0) == 0
+                              ? std::optional<int>{static_cast<int>(std::strtol(lhs.c_str() + 6, nullptr, 10))}
+                              : std::nullopt;
+    const auto rhsParam = rhs.rfind("param:", 0) == 0
+                              ? std::optional<int>{static_cast<int>(std::strtol(rhs.c_str() + 6, nullptr, 10))}
+                              : std::nullopt;
+    if (lhsParam && rhsParam) {
+        return noAliasParamPairs.count(paramPairKey(*lhsParam, *rhsParam)) == 0;
+    }
+    if (lhsParam || rhsParam) {
+        return true;
+    }
+    return false;
+}
+
+bool valueAvailableBeforeLoop(const Value &value,
+                              const std::unordered_map<int, int> &defBlock,
+                              const std::unordered_set<int> &loopBlocks,
+                              const std::unordered_set<int> &hoistedValues) {
+    if (value.constant || value.id < 0) {
+        return true;
+    }
+    const auto def = defBlock.find(value.id);
+    return def == defBlock.end() || !loopBlocks.count(def->second) || hoistedValues.count(value.id) != 0;
+}
+
+bool loadSafeToHoistFromLoop(const Instruction &load,
+                             const std::vector<BasicBlock> &blocks,
+                             const std::unordered_set<int> &loopBlocks,
+                             const std::unordered_map<int, Instruction> &definitions,
+                             const std::unordered_map<int, int> &paramIndexById,
+                             const std::unordered_set<std::string> &noAliasParamPairs) {
+    if (load.opcode != Opcode::Load || load.result < 0 || load.operands.size() != 1) {
+        return false;
+    }
+    const std::string loadRoot = memoryAddressRootWithParams(load.operands[0], definitions, paramIndexById);
+    if (loadRoot.empty()) {
+        return false;
+    }
+    for (int blockId : loopBlocks) {
+        for (const auto &inst : blocks[static_cast<std::size_t>(blockId)].instructions) {
+            if (inst.opcode == Opcode::Call) {
+                return false;
+            }
+            if (inst.opcode != Opcode::Store || inst.operands.size() != 2) {
+                continue;
+            }
+            const std::string storeRoot = memoryAddressRootWithParams(inst.operands[1], definitions, paramIndexById);
+            if (rootsMayAlias(loadRoot, storeRoot, noAliasParamPairs)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool hoistLoopInvariants(Function &function,
+                         const std::unordered_set<std::string> &noAliasParamPairs) {
     if (function.blocks.size() < 2 || hugeFunction(function)) {
         return false;
     }
@@ -1781,10 +1870,16 @@ bool hoistLoopInvariants(Function &function) {
     }
 
     std::unordered_map<int, int> defBlock;
+    std::unordered_map<int, Instruction> definitions;
+    std::unordered_map<int, int> paramIndexById;
+    for (std::size_t i = 0; i < function.params.size(); ++i) {
+        paramIndexById[function.params[i].id] = static_cast<int>(i);
+    }
     for (std::size_t i = 0; i < function.blocks.size(); ++i) {
         for (const auto &inst : function.blocks[i].instructions) {
             if (inst.result >= 0) {
                 defBlock[inst.result] = static_cast<int>(i);
+                definitions[inst.result] = inst;
             }
         }
     }
@@ -1856,20 +1951,22 @@ bool hoistLoopInvariants(Function &function) {
                     std::vector<Instruction> kept;
                     kept.reserve(instructions.size());
                     for (auto &inst : instructions) {
-                        if (inst.result < 0 || !isHoistableOpcode(inst.opcode)) {
+                        if (inst.result < 0 ||
+                            (!isHoistableOpcode(inst.opcode) && inst.opcode != Opcode::Load)) {
                             kept.push_back(std::move(inst));
                             continue;
                         }
                         bool invariant = true;
                         for (const auto &operand : inst.operands) {
-                            if (operand.constant || operand.id < 0) {
-                                continue;
-                            }
-                            const auto def = defBlock.find(operand.id);
-                            if (def != defBlock.end() && loopBlocks.count(def->second) && !hoistedValues.count(operand.id)) {
+                            if (!valueAvailableBeforeLoop(operand, defBlock, loopBlocks, hoistedValues)) {
                                 invariant = false;
                                 break;
                             }
+                        }
+                        if (invariant && inst.opcode == Opcode::Load &&
+                            !loadSafeToHoistFromLoop(inst, function.blocks, loopBlocks, definitions,
+                                                     paramIndexById, noAliasParamPairs)) {
+                            invariant = false;
                         }
                         if (!invariant) {
                             kept.push_back(std::move(inst));
@@ -1920,6 +2017,259 @@ bool foldConstants(Function &function) {
             kept.push_back(std::move(inst));
         }
         block.instructions = std::move(kept);
+    }
+    return changed;
+}
+
+enum class ConstantLatticeKind {
+    Undefined,
+    Constant,
+    Overdefined,
+};
+
+struct ConstantLatticeValue {
+    ConstantLatticeKind kind = ConstantLatticeKind::Undefined;
+    Value value;
+};
+
+ConstantLatticeValue undefinedLattice() {
+    return ConstantLatticeValue{ConstantLatticeKind::Undefined, {}};
+}
+
+ConstantLatticeValue overdefinedLattice() {
+    return ConstantLatticeValue{ConstantLatticeKind::Overdefined, {}};
+}
+
+ConstantLatticeValue constantLattice(Value value) {
+    value.id = -1;
+    value.constant = true;
+    return ConstantLatticeValue{ConstantLatticeKind::Constant, std::move(value)};
+}
+
+ConstantLatticeValue mergeLattice(const ConstantLatticeValue &lhs,
+                                  const ConstantLatticeValue &rhs) {
+    if (lhs.kind == ConstantLatticeKind::Undefined) {
+        return rhs;
+    }
+    if (rhs.kind == ConstantLatticeKind::Undefined) {
+        return lhs;
+    }
+    if (lhs.kind == ConstantLatticeKind::Overdefined ||
+        rhs.kind == ConstantLatticeKind::Overdefined) {
+        return overdefinedLattice();
+    }
+    return sameValue(lhs.value, rhs.value) ? lhs : overdefinedLattice();
+}
+
+bool sameLattice(const ConstantLatticeValue &lhs, const ConstantLatticeValue &rhs) {
+    if (lhs.kind != rhs.kind) {
+        return false;
+    }
+    return lhs.kind != ConstantLatticeKind::Constant || sameValue(lhs.value, rhs.value);
+}
+
+ConstantLatticeValue latticeOfValue(const Value &value,
+                                    const std::unordered_map<int, ConstantLatticeValue> &values) {
+    if (value.constant) {
+        return constantLattice(value);
+    }
+    if (value.id < 0) {
+        return overdefinedLattice();
+    }
+    const auto found = values.find(value.id);
+    return found == values.end() ? overdefinedLattice() : found->second;
+}
+
+std::vector<std::string> phiPredecessorLabels(const Instruction &phi) {
+    const std::size_t space = phi.text.find(' ');
+    if (space == std::string::npos) {
+        return {};
+    }
+    std::vector<std::string> labels;
+    std::size_t start = 0;
+    const std::string text = phi.text.substr(0, space);
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::size_t end = comma == std::string::npos ? text.size() : comma;
+        labels.push_back(trimBranchLabel(text.substr(start, end - start)));
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return labels;
+}
+
+ConstantLatticeValue evaluateSccpInstruction(
+    const Instruction &inst,
+    const std::unordered_map<int, ConstantLatticeValue> &values,
+    const std::unordered_set<std::string> *executableIncoming = nullptr) {
+    if (inst.opcode == Opcode::Phi) {
+        ConstantLatticeValue result = undefinedLattice();
+        const std::vector<std::string> labels = phiPredecessorLabels(inst);
+        for (std::size_t i = 0; i < inst.operands.size(); ++i) {
+            if (executableIncoming != nullptr &&
+                (i >= labels.size() || !executableIncoming->count(labels[i]))) {
+                continue;
+            }
+            result = mergeLattice(result, latticeOfValue(inst.operands[i], values));
+            if (result.kind == ConstantLatticeKind::Overdefined) {
+                break;
+            }
+        }
+        return result;
+    }
+
+    Instruction foldedInst = inst;
+    for (auto &operand : foldedInst.operands) {
+        const ConstantLatticeValue lattice = latticeOfValue(operand, values);
+        if (lattice.kind == ConstantLatticeKind::Overdefined) {
+            return overdefinedLattice();
+        }
+        if (lattice.kind == ConstantLatticeKind::Undefined) {
+            return undefinedLattice();
+        }
+        operand = lattice.value;
+    }
+
+    Value folded;
+    if (foldInteger(foldedInst, folded) || foldFloat(foldedInst, folded) ||
+        foldCast(foldedInst, folded) || simplifyAlgebra(foldedInst, folded)) {
+        folded.type = folded.type.kind == TypeKind::Void ? inst.resultType : folded.type;
+        return constantLattice(folded);
+    }
+
+    if (isPure(inst.opcode)) {
+        return overdefinedLattice();
+    }
+    return overdefinedLattice();
+}
+
+bool sparseConditionalConstantPropagation(Function &function) {
+    if (function.blocks.empty()) {
+        return false;
+    }
+
+    std::unordered_map<std::string, int> blockIndex;
+    for (std::size_t i = 0; i < function.blocks.size(); ++i) {
+        blockIndex[function.blocks[i].name] = static_cast<int>(i);
+    }
+
+    std::unordered_map<int, ConstantLatticeValue> values;
+    for (const auto &param : function.params) {
+        if (param.id >= 0) {
+            values[param.id] = overdefinedLattice();
+        }
+    }
+    for (const auto &block : function.blocks) {
+        for (const auto &inst : block.instructions) {
+            if (inst.result >= 0) {
+                values.emplace(inst.result, undefinedLattice());
+            }
+        }
+    }
+
+    std::unordered_set<int> executableBlocks{0};
+    std::unordered_set<std::string> executableEdges;
+    const std::vector<std::vector<int>> predecessors = computePredecessors(function);
+    const auto edgeKey = [&](int from, int to) {
+        return std::to_string(from) + "->" + std::to_string(to);
+    };
+    const auto markEdge = [&](int from, const std::string &toLabel) {
+        const auto found = blockIndex.find(toLabel);
+        if (found == blockIndex.end()) {
+            return false;
+        }
+        bool changed = executableBlocks.insert(found->second).second;
+        changed = executableEdges.insert(edgeKey(from, found->second)).second || changed;
+        return changed;
+    };
+
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (std::size_t blockId = 0; blockId < function.blocks.size(); ++blockId) {
+            if (!executableBlocks.count(static_cast<int>(blockId))) {
+                continue;
+            }
+            BasicBlock &block = function.blocks[blockId];
+            std::unordered_set<std::string> executableIncomingLabels;
+            for (int pred : predecessors[blockId]) {
+                if (executableEdges.count(edgeKey(pred, static_cast<int>(blockId)))) {
+                    executableIncomingLabels.insert(function.blocks[static_cast<std::size_t>(pred)].name);
+                }
+            }
+
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    const ConstantLatticeValue evaluated =
+                        evaluateSccpInstruction(inst, values, &executableIncomingLabels);
+                    const ConstantLatticeValue merged = mergeLattice(values[inst.result], evaluated);
+                    if (!sameLattice(values[inst.result], merged)) {
+                        values[inst.result] = merged;
+                        progress = true;
+                    }
+                }
+
+                if (inst.opcode == Opcode::Br) {
+                    progress = markEdge(static_cast<int>(blockId), inst.text) || progress;
+                } else if (inst.opcode == Opcode::CondBr && !inst.operands.empty()) {
+                    const std::size_t comma = inst.text.find(',');
+                    if (comma == std::string::npos) {
+                        continue;
+                    }
+                    const std::string trueLabel = trimBranchLabel(inst.text.substr(0, comma));
+                    const std::string falseLabel = trimBranchLabel(inst.text.substr(comma + 1));
+                    const ConstantLatticeValue cond = latticeOfValue(inst.operands[0], values);
+                    if (cond.kind == ConstantLatticeKind::Constant) {
+                        const bool takeTrue = std::strtoll(cond.value.name.c_str(), nullptr, 0) != 0;
+                        progress = markEdge(static_cast<int>(blockId), takeTrue ? trueLabel : falseLabel) || progress;
+                    } else if (cond.kind == ConstantLatticeKind::Overdefined) {
+                        progress = markEdge(static_cast<int>(blockId), trueLabel) || progress;
+                        progress = markEdge(static_cast<int>(blockId), falseLabel) || progress;
+                    }
+                }
+            }
+        }
+    }
+
+    std::unordered_map<int, Value> replacements;
+    for (const auto &[id, lattice] : values) {
+        if (lattice.kind == ConstantLatticeKind::Constant) {
+            replacements[id] = lattice.value;
+        }
+    }
+    if (replacements.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (auto &block : function.blocks) {
+        for (auto &inst : block.instructions) {
+            for (auto &operand : inst.operands) {
+                const Value replacement = resolve(operand, replacements);
+                if (!sameValue(operand, replacement)) {
+                    operand = replacement;
+                    changed = true;
+                }
+            }
+            if (inst.opcode == Opcode::CondBr && !inst.operands.empty() &&
+                inst.operands[0].constant) {
+                const std::size_t comma = inst.text.find(',');
+                if (comma == std::string::npos) {
+                    continue;
+                }
+                const std::string trueLabel = trimBranchLabel(inst.text.substr(0, comma));
+                const std::string falseLabel = trimBranchLabel(inst.text.substr(comma + 1));
+                const bool takeTrue = std::strtoll(inst.operands[0].name.c_str(), nullptr, 0) != 0;
+                inst.opcode = Opcode::Br;
+                inst.operands.clear();
+                inst.text = takeTrue ? trueLabel : falseLabel;
+                inst.result = -1;
+                inst.resultType = Type{TypeKind::Void};
+                changed = true;
+            }
+        }
     }
     return changed;
 }
@@ -2538,6 +2888,200 @@ std::string exactMemoryAddressKey(const Value &address,
     return base + ":i32:" + std::to_string(*index);
 }
 
+std::string memoryAddressRoot(const Value &address,
+                              const std::unordered_map<int, Instruction> &definitions) {
+    if (address.constant) {
+        return !address.name.empty() && address.name[0] == '@' ? "global:" + address.name : std::string{};
+    }
+    if (address.id < 0) {
+        return {};
+    }
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end()) {
+        return {};
+    }
+    const Instruction &def = found->second;
+    if (def.opcode == Opcode::Alloca) {
+        return "alloca:" + std::to_string(address.id);
+    }
+    if (def.opcode == Opcode::Gep && !def.operands.empty()) {
+        return memoryAddressRoot(def.operands[0], definitions);
+    }
+    return {};
+}
+
+std::string memoryAddressRootWithParams(
+    const Value &address,
+    const std::unordered_map<int, Instruction> &definitions,
+    const std::unordered_map<int, int> &paramIndexById) {
+    if (address.constant) {
+        return !address.name.empty() && address.name[0] == '@' ? "global:" + address.name : std::string{};
+    }
+    if (address.id < 0) {
+        return {};
+    }
+    if (const auto param = paramIndexById.find(address.id); param != paramIndexById.end()) {
+        return "param:" + std::to_string(param->second);
+    }
+    const auto found = definitions.find(address.id);
+    if (found == definitions.end()) {
+        return {};
+    }
+    const Instruction &def = found->second;
+    if (def.opcode == Opcode::Alloca) {
+        return "alloca:" + std::to_string(address.id);
+    }
+    if (def.opcode == Opcode::Gep && !def.operands.empty()) {
+        return memoryAddressRootWithParams(def.operands[0], definitions, paramIndexById);
+    }
+    return {};
+}
+
+std::string callArgumentRoot(const Value &value,
+                             const std::unordered_map<int, Instruction> &definitions,
+                             const std::string &functionName) {
+    if (value.constant) {
+        return !value.name.empty() && value.name[0] == '@' ? "global:" + value.name : std::string{};
+    }
+    if (value.id < 0) {
+        return {};
+    }
+    const auto found = definitions.find(value.id);
+    if (found == definitions.end()) {
+        return {};
+    }
+    const Instruction &def = found->second;
+    if (def.opcode == Opcode::Alloca) {
+        return "local:" + functionName + ":" + std::to_string(value.id);
+    }
+    if (def.opcode == Opcode::Gep && !def.operands.empty()) {
+        return callArgumentRoot(def.operands[0], definitions, functionName);
+    }
+    return {};
+}
+
+std::string paramPairKey(int lhs, int rhs) {
+    if (lhs > rhs) {
+        std::swap(lhs, rhs);
+    }
+    return std::to_string(lhs) + ":" + std::to_string(rhs);
+}
+
+std::unordered_map<std::string, std::unordered_set<std::string>>
+inferNoAliasPointerParamPairs(const Module &module) {
+    std::unordered_map<std::string, const Function *> functions;
+    for (const auto &function : module.functions) {
+        functions[function.name] = &function;
+    }
+
+    std::unordered_map<std::string, std::vector<std::vector<std::string>>> calls;
+    for (const auto &caller : module.functions) {
+        std::unordered_map<int, Instruction> definitions;
+        for (const auto &block : caller.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.result >= 0) {
+                    definitions[inst.result] = inst;
+                }
+            }
+        }
+        for (const auto &block : caller.blocks) {
+            for (const auto &inst : block.instructions) {
+                if (inst.opcode != Opcode::Call || functions.count(inst.text) == 0) {
+                    continue;
+                }
+                std::vector<std::string> roots;
+                roots.reserve(inst.operands.size());
+                for (const auto &operand : inst.operands) {
+                    roots.push_back(callArgumentRoot(operand, definitions, caller.name));
+                }
+                calls[inst.text].push_back(std::move(roots));
+            }
+        }
+    }
+
+    std::unordered_map<std::string, std::unordered_set<std::string>> result;
+    for (const auto &function : module.functions) {
+        const auto callSites = calls.find(function.name);
+        if (callSites == calls.end() || callSites->second.empty()) {
+            continue;
+        }
+        for (std::size_t i = 0; i < function.params.size(); ++i) {
+            if (function.params[i].type.kind != TypeKind::Ptr) {
+                continue;
+            }
+            for (std::size_t j = i + 1; j < function.params.size(); ++j) {
+                if (function.params[j].type.kind != TypeKind::Ptr) {
+                    continue;
+                }
+                bool noAlias = true;
+                for (const auto &roots : callSites->second) {
+                    if (i >= roots.size() || j >= roots.size() ||
+                        roots[i].empty() || roots[j].empty() || roots[i] == roots[j]) {
+                        noAlias = false;
+                        break;
+                    }
+                }
+                if (noAlias) {
+                    result[function.name].insert(paramPairKey(static_cast<int>(i), static_cast<int>(j)));
+                }
+            }
+        }
+    }
+    return result;
+}
+
+bool preciseConstantAddressKey(const std::string &key, const std::string &root) {
+    if (key.empty() || root.empty() || key.rfind(root, 0) != 0) {
+        return false;
+    }
+    if (key.size() == root.size()) {
+        return false;
+    }
+    std::size_t pos = root.size();
+    while (pos < key.size()) {
+        if (key.compare(pos, 5, ":i32:") != 0) {
+            return false;
+        }
+        pos += 5;
+        if (pos >= key.size()) {
+            return false;
+        }
+        if (key[pos] == '-') {
+            ++pos;
+        }
+        const std::size_t start = pos;
+        while (pos < key.size() && std::isdigit(static_cast<unsigned char>(key[pos]))) {
+            ++pos;
+        }
+        if (start == pos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void invalidateMemoryForStore(std::unordered_map<std::string, Value> &knownMemory,
+                              const std::string &storeKey,
+                              const std::string &storeRoot) {
+    if (storeRoot.empty()) {
+        knownMemory.clear();
+        return;
+    }
+    const bool storePrecise = preciseConstantAddressKey(storeKey, storeRoot);
+    for (auto it = knownMemory.begin(); it != knownMemory.end();) {
+        if (it->first.rfind(storeRoot, 0) != 0) {
+            ++it;
+            continue;
+        }
+        if (storePrecise && it->first != storeKey &&
+            preciseConstantAddressKey(it->first, storeRoot)) {
+            ++it;
+            continue;
+        }
+        it = knownMemory.erase(it);
+    }
+}
+
 std::string directNonAliasingAddressKey(
     const Value &address,
     const std::unordered_map<int, const Instruction *> &definitions) {
@@ -3021,10 +3565,10 @@ bool forwardLocalMemory(Function &function,
             if (inst.opcode == Opcode::Store && inst.operands.size() == 2) {
                 const Value &address = inst.operands[1];
                 const std::string key = exactMemoryAddressKey(address, definitions);
+                const std::string root = memoryAddressRoot(address, definitions);
+                invalidateMemoryForStore(knownMemory, key, root);
                 if (!key.empty()) {
                     knownMemory[key] = inst.operands[0];
-                } else {
-                    knownMemory.clear();
                 }
                 kept.push_back(std::move(inst));
                 continue;
@@ -3799,11 +4343,14 @@ bool lowerArithmeticDigestToIntrinsic(Module &module) {
 bool optimize(Module &module) {
     bool changed = false;
     bool again = true;
-    if (lowerStencilChecksumToIntrinsic(module)) {
+    const auto noAliasParamPairs = inferNoAliasPointerParamPairs(module);
+    if ((sysyc::config::kEnableStructuralSpecializations || sysyc::config::kEnableGenericKernelLowering) &&
+        lowerStencilChecksumToIntrinsic(module)) {
         changed = true;
         again = true;
     }
-    if (lowerArithmeticDigestToIntrinsic(module)) {
+    if ((sysyc::config::kEnableStructuralSpecializations || sysyc::config::kEnableGenericKernelLowering) &&
+        lowerArithmeticDigestToIntrinsic(module)) {
         changed = true;
         again = true;
     }
@@ -3875,6 +4422,10 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
+            if (sparseConditionalConstantPropagation(function)) {
+                changed = true;
+                again = true;
+            }
             if (eliminateCommonSubexpressions(function)) {
                 changed = true;
                 again = true;
@@ -3903,7 +4454,9 @@ bool optimize(Module &module) {
                 changed = true;
                 again = true;
             }
-            if (hoistLoopInvariants(function)) {
+            const auto noAlias = noAliasParamPairs.find(function.name);
+            const std::unordered_set<std::string> emptyNoAlias;
+            if (hoistLoopInvariants(function, noAlias == noAliasParamPairs.end() ? emptyNoAlias : noAlias->second)) {
                 changed = true;
                 again = true;
             }
@@ -3970,6 +4523,10 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
+            if (sparseConditionalConstantPropagation(function)) {
+                changed = true;
+                ssaAgain = true;
+            }
             if (eliminateCommonSubexpressions(function)) {
                 changed = true;
                 ssaAgain = true;
@@ -4010,7 +4567,9 @@ bool optimize(Module &module) {
                 changed = true;
                 ssaAgain = true;
             }
-            if (hoistLoopInvariants(function)) {
+            const auto noAlias = noAliasParamPairs.find(function.name);
+            const std::unordered_set<std::string> emptyNoAlias;
+            if (hoistLoopInvariants(function, noAlias == noAliasParamPairs.end() ? emptyNoAlias : noAlias->second)) {
                 changed = true;
                 ssaAgain = true;
             }
@@ -4020,7 +4579,8 @@ bool optimize(Module &module) {
             ssaAgain = true;
         }
     }
-    if (lowerArithmeticDigestToIntrinsic(module)) {
+    if ((sysyc::config::kEnableStructuralSpecializations || sysyc::config::kEnableGenericKernelLowering) &&
+        lowerArithmeticDigestToIntrinsic(module)) {
         changed = true;
     }
     return changed;

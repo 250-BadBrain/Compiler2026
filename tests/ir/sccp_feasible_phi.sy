@@ -1,0 +1,13 @@
+int choose(int input) {
+  int value;
+  if (1) {
+    value = 4;
+  } else {
+    value = input;
+  }
+  return value + 3;
+}
+
+int main() {
+  return choose(99);
+}

@@ -80,6 +80,10 @@ grep -q 'ret %' "$tmp_dir/boolean_inverse_return_branch.ir"
 "$root/compiler" -O1 --dump-ir "$root/tests/ir/linear_i32_simplify.sy" >"$tmp_dir/linear_i32_simplify.ir"
 grep -q 'ret 0' "$tmp_dir/linear_i32_simplify.ir"
 
+"$root/compiler" -O1 --dump-ir "$root/tests/ir/sccp_feasible_phi.sy" >"$tmp_dir/sccp_feasible_phi.ir"
+grep -q 'ret 7' "$tmp_dir/sccp_feasible_phi.ir"
+! grep -q 'condbr' "$tmp_dir/sccp_feasible_phi.ir"
+
 "$root/compiler" -O1 --dump-ir "$root/tests/ir/linear_negate_value.sy" >"$tmp_dir/linear_negate_value.ir"
 grep -q ' = neg ' "$tmp_dir/linear_negate_value.ir"
 ! grep -q 'sub 0' "$tmp_dir/linear_negate_value.ir"
